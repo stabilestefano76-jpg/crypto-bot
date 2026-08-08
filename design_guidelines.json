@@ -1,0 +1,145 @@
+{
+  "app_name": "KuSignal Bot",
+  "personality": "7 Dark-First Utility",
+  "personality_one_liner": "A sharp, tactical, dark-first command center built for instant glanceability and high-performance crypto analysis.",
+  "color": {
+    "surface": "#0b0e14",
+    "onSurface": "#ffffff",
+    "surfaceSecondary": "#161a25",
+    "onSurfaceSecondary": "#9ba1ad",
+    "surfaceTertiary": "#1e2330",
+    "onSurfaceTertiary": "#7c8393",
+    "surfaceInverse": "#ffffff",
+    "onSurfaceInverse": "#0b0e14",
+    "brand": "#F5B300",
+    "brandPrimary": "#F5B300",
+    "onBrandPrimary": "#000000",
+    "brandSecondary": "#c28e00",
+    "onBrandSecondary": "#ffffff",
+    "brandTertiary": "#332700",
+    "onBrandTertiary": "#F5B300",
+    "success": "#00C076",
+    "onSuccess": "#002816",
+    "warning": "#F5B300",
+    "onWarning": "#000000",
+    "error": "#FF554A",
+    "onError": "#3b0805",
+    "info": "#2a3142",
+    "onInfo": "#ffffff",
+    "border": "#212736",
+    "borderStrong": "#353d52",
+    "divider": "#1e2330"
+  },
+  "typography": {
+    "displayFontFamily": "Rajdhani",
+    "textFontFamily": "IBM Plex Sans",
+    "scale": {
+      "sm": 12,
+      "base": 14,
+      "lg": 16,
+      "xl": 20,
+      "2xl": 24
+    }
+  },
+  "spacing": {
+    "rule": "Use tight, rigid spacing to create a dashboard feel. Padding should frame content but maintain high data density.",
+    "xs": 4,
+    "sm": 8,
+    "md": 12,
+    "lg": 16,
+    "xl": 24,
+    "2xl": 32,
+    "3xl": 48
+  },
+  "radius_tokens": {
+    "sm": 4,
+    "md": 8,
+    "lg": 12,
+    "pill": 999
+  },
+  "shadow_tier": "0",
+  "navigation": "bottom_tabs",
+  "icon_set": "Phosphor",
+  "glassmorphism": {
+    "enabled": "false",
+    "do's": [
+      "Use solid surfaceSecondary and surfaceTertiary for elevation instead of glass, maintaining utility and performance."
+    ],
+    "dont's": [
+      "Do not use blur or glassmorphism on dense data screens, signal cards, or charts."
+    ]
+  },
+  "platform_libraries": {
+    "glass": {
+      "ios": "expo-blur",
+      "android": "solid surfaceSecondary",
+      "low_end_android_fallback": "solid surfaceSecondary"
+    },
+    "image": "expo-image",
+    "blur": "expo-blur",
+    "bottom_sheet": "@gorhom/bottom-sheet",
+    "animation": "react-native-reanimated",
+    "gesture": "react-native-gesture-handler"
+  },
+  "screens": [
+    {
+      "name": "Signals (Home)",
+      "purpose": "Dashboard listing active cryptocurrency trading signals sorted by strength.",
+      "states": {
+        "loading": "Centered dark spinner with 'Scanning markets...'",
+        "empty": "Phosphor target icon (size 48) with 'No active signals. Waiting for criteria match.'",
+        "error": "Message 'Connection lost' with a Retry button."
+      },
+      "layout": "Top header: 'KuSignal Bot' title + Bot Status indicator (Running - green dot). A segmented control for filtering 'All | Long | Short'. Scrollable list of Signal Cards. Signal Card layout: Top row: Pair name (e.g., BTC/USDT) + Timeframe tag (1H) + Signal type (LONG in success color, SHORT in error color). Middle row: Entry Price vs Current Price. Bottom row: 'Confirmations' stacked chips (e.g., 'RSI Div', 'FVG'). Right side: Confidence score or RR ratio. Cards use surfaceSecondary with border."
+    },
+    {
+      "name": "Detail",
+      "purpose": "Deep dive into a specific signal with chart analysis and exact trade parameters.",
+      "states": {
+        "loading": "Skeleton of a candlestick chart and data rows.",
+        "empty": "N/A - Accessible only from active/history signals.",
+        "error": "Message 'Unable to load pair data' with a Retry button."
+      },
+      "layout": "Header: Back button, Pair name, Current Price, 24h change. Main area: Large Candlestick chart placeholder (use image or empty state block with grid lines) occupying top 40%. Below chart: Timeframe selector row [15m, 1H, 4H, 1D]. Below that, a 2-column data grid for Entry, Stop Loss, TP1, TP2. A section titled 'Technical Context' listing active triggers (e.g., RSI Divergence detected at 28). A prominent action button 'View on KuCoin' pinned to the bottom."
+    },
+    {
+      "name": "History",
+      "purpose": "Log of past signals showing win/loss outcomes.",
+      "states": {
+        "loading": "Skeleton list rows.",
+        "empty": "Phosphor archive icon with 'No past signals yet.'",
+        "error": "Message 'Failed to load history' with a Retry button."
+      },
+      "layout": "Header: 'Signal History' with a win-rate summary metric (e.g., 'Win Rate: 68%'). List of compact cards. Each card: Pair, Date, Type (Long/Short), and Outcome (WON in success color, LOST in error color). Keep it dense and scannable."
+    },
+    {
+      "name": "Settings",
+      "purpose": "Configure technical parameters, risk/reward, and active pairs.",
+      "states": {
+        "loading": "Skeleton configuration forms.",
+        "empty": "N/A",
+        "error": "N/A"
+      },
+      "layout": "Scrollable form with section headers ('border-bottom' dividers). Section 1: 'Technical Indicators' - toggles for RSI Divergences, FVG, MA Crossover. Section 2: 'Parameters' - numeric inputs for RSI Overbought/Oversold levels, Min R:R Ratio. Section 3: 'Timeframes' - multi-select chips for 15m, 1H, 4H. Section 4: 'Alerts' - toggle for in-app push notifications. A sticky 'Save Configuration' primary button at the bottom."
+    }
+  ],
+  "images": {
+    "btc_logo": {
+      "url": "https://images.unsplash.com/photo-1628151015968-3a4429e9ef04?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NTY2Njl8MHwxfHNlYXJjaHwxfHxCaXRjb2luJTIwQlRDJTIwbG9nbyUyMHRyYW5zcGFyZW50fGVufDB8fHx8MTc4NjE4MjA4OXww&ixlib=rb-4.1.0&q=85",
+      "alt": "Bitcoin BTC logo"
+    },
+    "candlestick_chart_bg": {
+      "url": "https://images.unsplash.com/photo-1745509267699-1b1db256601e?crop=entropy&cs=srgb&fm=jpg&ixid=M3w3NTY2Njl8MHwxfHNlYXJjaHwxfHxhYnN0cmFjdCUyMGNyeXB0byUyMHRyYWRpbmclMjBjaGFydCUyMGdsb3dpbmclMjBkYXJrJTIwYmFja2dyb3VuZHxlbnwwfHx8fDE3ODM0Mjk1MjB8MA&ixlib=rb-4.1.0&q=85",
+      "alt": "Abstract candlestick crypto chart"
+    }
+  },
+  "instructions_to_main_agent": [
+    "Strictly follow the Dark-First Utility personality. The app must feel like a professional command center, not a consumer fintech app.",
+    "Use Rajdhani for all metrics, prices, and numbers to give it a tactical, dashboard feel. Use IBM Plex Sans for general labels.",
+    "Color constraints: DO NOT use any blue, purple, or indigo. Use the provided deep obsidian base (#0b0e14) and graphite (#161a25). Accents are Amber (#F5B300), Success Green (#00C076), and Error Red (#FF554A).",
+    "For the Chart in the Detail screen, use `candlestick_chart_bg` with a heavy dark overlay, or build a mockup grid with CSS/View lines to simulate a trading view.",
+    "Signal cards must be dense. Use borders (borderStrong) rather than shadows to define edges.",
+    "Ensure the disclaimer is visible on the Home/Dashboard or Settings screen.",
+    "Ensure 'Long' and 'Short' badges prominently use the success and error colors respectively."
+  ]
+}
