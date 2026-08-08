@@ -1,4 +1,5 @@
 import { useEffect, useState } from "react";
+import React from "react";
 import {
   ActivityIndicator,
   Pressable,
@@ -236,9 +237,8 @@ function PriceChart({
         const yO = scaleY(c.o);
         const yC = scaleY(c.c);
         return (
-          <>
+          <React.Fragment key={`k${i}`}>
             <Line
-              key={`w${i}`}
               x1={x + barW / 2}
               x2={x + barW / 2}
               y1={yHigh}
@@ -247,14 +247,13 @@ function PriceChart({
               strokeWidth={1}
             />
             <Rect
-              key={`b${i}`}
               x={x}
               y={Math.min(yO, yC)}
               width={barW}
               height={Math.max(1, Math.abs(yC - yO))}
               fill={color}
             />
-          </>
+          </React.Fragment>
         );
       })}
 
