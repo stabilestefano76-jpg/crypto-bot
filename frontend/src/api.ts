@@ -63,6 +63,61 @@ export type ScanState = {
 
 export type Candle = { t: number; o: number; c: number; h: number; l: number; v: number };
 
+export type PaperConfig = {
+  initial_capital: number;
+  risk_per_trade_pct: number;
+  auto_execute: boolean;
+  max_open_positions: number;
+};
+
+export type PaperPosition = {
+  id: string;
+  signal_id: string;
+  symbol: string;
+  timeframe: string;
+  side: "long" | "short";
+  entry: number;
+  stop_loss: number;
+  take_profit: number;
+  quantity: number;
+  risk_usdt: number;
+  opened_at: string;
+  current_price: number;
+  unrealized_pnl: number;
+  unrealized_pnl_pct: number;
+};
+
+export type PaperTrade = {
+  id: string;
+  signal_id: string;
+  symbol: string;
+  side: "long" | "short";
+  entry: number;
+  exit: number;
+  quantity: number;
+  pnl_usdt: number;
+  pnl_pct: number;
+  outcome: "win" | "loss";
+  opened_at: string;
+  closed_at: string;
+};
+
+export type Portfolio = {
+  initial_capital: number;
+  cash: number;
+  equity: number;
+  unrealized_pnl: number;
+  realized_pnl: number;
+  total_return_pct: number;
+  open_positions_count: number;
+  closed_trades_count: number;
+  wins: number;
+  losses: number;
+  win_rate: number;
+  auto_execute: boolean;
+  positions: PaperPosition[];
+};
+
 export const api = {
   status: () => req<ScanState>("/status"),
   getConfig: () => req<Config>("/config"),
@@ -85,4 +140,14 @@ export const api = {
     req<{ total: number; active: number; wins: number; losses: number; win_rate: number }>(
       "/history/stats"
     ),
+  paperConfig: () => req<PaperConfig>("/paper/config"),
+  savePaperConfig: (cfg: PaperConfig) =>
+    req<PaperConfig>("/paper/config", { method: "PUT", body: JSON.stringify(cfg) }),
+  portfolio: () => req<Portfolio>("/paper/portfolio"),
+  paperTrades: () => req<{ trades: PaperTrade[]; count: number }>("/paper/trades"),
+  paperExecute: (signalId: string) =>
+    req<{ position: PaperPosition }>(`/paper/execute/${signalId}`, { method: "POST" }),
+  paperClose: (positionId: string) =>
+    req<{ trade: PaperTrade }>(`/paper/positions/${positionId}/close`, { method: "POST" }),
+  paperReset: () => req<{ ok: boolean; cash: number }>("/paper/reset", { method: "POST" }),
 };

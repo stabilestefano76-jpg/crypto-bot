@@ -13,7 +13,7 @@ import {
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
-import { api, Config } from "@/src/api";
+import { api, Config, PaperConfig } from "@/src/api";
 import { colors, font, radius, spacing } from "@/src/theme";
 
 const TIMEFRAMES = ["15m", "1h", "4h", "1d"];
@@ -21,14 +21,16 @@ const TIMEFRAMES = ["15m", "1h", "4h", "1d"];
 export default function SettingsScreen() {
   const insets = useSafeAreaInsets();
   const [cfg, setCfg] = useState<Config | null>(null);
+  const [pcfg, setPcfg] = useState<PaperConfig | null>(null);
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
 
   const load = useCallback(async () => {
     try {
-      const c = await api.getConfig();
+      const [c, p] = await Promise.all([api.getConfig(), api.paperConfig()]);
       setCfg(c);
+      setPcfg(p);
     } catch {
       // ignore
     } finally {
@@ -45,12 +47,21 @@ export default function SettingsScreen() {
     setSaved(false);
   };
 
+  const updatePaper = (patch: Partial<PaperConfig>) => {
+    setPcfg((prev) => (prev ? { ...prev, ...patch } : prev));
+    setSaved(false);
+  };
+
   const save = async () => {
-    if (!cfg) return;
+    if (!cfg || !pcfg) return;
     setSaving(true);
     try {
-      const updated = await api.saveConfig(cfg);
+      const [updated, updatedP] = await Promise.all([
+        api.saveConfig(cfg),
+        api.savePaperConfig(pcfg),
+      ]);
       setCfg(updated);
+      setPcfg(updatedP);
       setSaved(true);
       setTimeout(() => setSaved(false), 2500);
     } finally {
@@ -66,7 +77,7 @@ export default function SettingsScreen() {
     update({ timeframes: list });
   };
 
-  if (loading || !cfg) {
+  if (loading || !cfg || !pcfg) {
     return (
       <View style={[styles.root, styles.center, { paddingTop: insets.top }]}>
         <ActivityIndicator color={colors.brand} />
@@ -224,6 +235,34 @@ export default function SettingsScreen() {
               onChange={(v) => update({ sl_padding_pct: v })}
               step={0.05}
               testID="input-sl-padding"
+            />
+          </Section>
+
+          <Section title="Paper Trading">
+            <ToggleRow
+              label="Auto-execute new signals"
+              value={pcfg.auto_execute}
+              onChange={(v) => updatePaper({ auto_execute: v })}
+              testID="toggle-auto-execute"
+            />
+            <NumRow
+              label="Initial capital (USDT)"
+              value={pcfg.initial_capital}
+              onChange={(v) => updatePaper({ initial_capital: v })}
+              testID="input-initial-capital"
+            />
+            <NumRow
+              label="Risk per trade (%)"
+              value={pcfg.risk_per_trade_pct}
+              onChange={(v) => updatePaper({ risk_per_trade_pct: v })}
+              step={0.1}
+              testID="input-risk-pct"
+            />
+            <NumRow
+              label="Max open positions"
+              value={pcfg.max_open_positions}
+              onChange={(v) => updatePaper({ max_open_positions: v })}
+              testID="input-max-positions"
             />
           </Section>
 

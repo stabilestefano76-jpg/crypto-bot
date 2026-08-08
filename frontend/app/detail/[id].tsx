@@ -28,6 +28,8 @@ export default function DetailScreen() {
   const [chartWidth, setChartWidth] = useState(360);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
+  const [executing, setExecuting] = useState(false);
+  const [executeMsg, setExecuteMsg] = useState<string | null>(null);
 
   useEffect(() => {
     (async () => {
@@ -165,6 +167,68 @@ export default function DetailScreen() {
           </Text>
         </View>
       </ScrollView>
+
+      {/* Sticky execute button */}
+      <View style={[styles.executeBar, { paddingBottom: Math.max(insets.bottom, 12) }]}>
+        {executeMsg && (
+          <Text
+            style={[
+              styles.executeMsg,
+              {
+                color: executeMsg.startsWith("Position")
+                  ? colors.success
+                  : colors.error,
+              },
+            ]}
+          >
+            {executeMsg}
+          </Text>
+        )}
+        <Pressable
+          onPress={async () => {
+            if (!signal || executing) return;
+            setExecuting(true);
+            setExecuteMsg(null);
+            try {
+              const res = await fetch(
+                `${process.env.EXPO_PUBLIC_BACKEND_URL}/api/paper/execute/${signal.id}`,
+                { method: "POST" }
+              );
+              if (!res.ok) {
+                const err = await res.json().catch(() => ({}));
+                setExecuteMsg(err.detail || `Failed (${res.status})`);
+              } else {
+                setExecuteMsg("Position opened in paper portfolio");
+              }
+            } catch (e: any) {
+              setExecuteMsg(e.message || "Network error");
+            } finally {
+              setExecuting(false);
+              setTimeout(() => setExecuteMsg(null), 4000);
+            }
+          }}
+          disabled={executing}
+          style={({ pressed }) => [
+            styles.executeBtn,
+            {
+              backgroundColor: isLong ? colors.success : colors.error,
+              opacity: pressed ? 0.7 : 1,
+            },
+          ]}
+          testID="paper-execute-button"
+        >
+          {executing ? (
+            <ActivityIndicator color="#fff" />
+          ) : (
+            <>
+              <Ionicons name="flash" size={18} color="#fff" />
+              <Text style={styles.executeText}>
+                Execute Paper {isLong ? "LONG" : "SHORT"}
+              </Text>
+            </>
+          )}
+        </Pressable>
+      </View>
     </View>
   );
 }
@@ -397,7 +461,7 @@ const styles = StyleSheet.create({
     borderRadius: radius.sm,
   },
   sideText: { color: "#fff", fontWeight: "800", fontSize: font.sm, letterSpacing: 0.5 },
-  body: { padding: spacing.lg, gap: spacing.md, paddingBottom: spacing.xxl },
+  body: { padding: spacing.lg, gap: spacing.md, paddingBottom: 120 },
   chartCard: {
     backgroundColor: colors.surfaceSecondary,
     borderRadius: radius.md,
@@ -449,4 +513,25 @@ const styles = StyleSheet.create({
     marginTop: spacing.sm,
   },
   disclaimerText: { color: colors.onSurfaceSecondary, fontSize: 11, flex: 1 },
+  executeBar: {
+    position: "absolute",
+    left: 0,
+    right: 0,
+    bottom: 0,
+    padding: spacing.md,
+    backgroundColor: colors.surface,
+    borderTopWidth: 1,
+    borderTopColor: colors.border,
+    gap: spacing.sm,
+  },
+  executeMsg: { fontSize: font.sm, fontWeight: "700", textAlign: "center" },
+  executeBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: spacing.sm,
+    paddingVertical: 14,
+    borderRadius: radius.md,
+  },
+  executeText: { color: "#fff", fontWeight: "800", fontSize: font.lg, letterSpacing: 0.5 },
 });

@@ -101,6 +101,45 @@ class ScanState(BaseModel):
 
 
 # ---------------------------------------------------------------------------
+# Paper trading models
+# ---------------------------------------------------------------------------
+class PaperConfig(BaseModel):
+    initial_capital: float = 10000.0
+    risk_per_trade_pct: float = 1.0  # % of equity risked per position
+    auto_execute: bool = False
+    max_open_positions: int = 5
+
+
+class PaperPosition(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    signal_id: str
+    symbol: str
+    timeframe: str
+    side: str  # long | short
+    entry: float
+    stop_loss: float
+    take_profit: float
+    quantity: float
+    risk_usdt: float
+    opened_at: str
+
+
+class PaperTrade(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    signal_id: str
+    symbol: str
+    side: str
+    entry: float
+    exit: float
+    quantity: float
+    pnl_usdt: float
+    pnl_pct: float
+    outcome: str  # win | loss
+    opened_at: str
+    closed_at: str
+
+
+# ---------------------------------------------------------------------------
 # Technical analysis helpers (numpy free — pure python for MVP simplicity)
 # ---------------------------------------------------------------------------
 def rsi_wilder(closes: list[float], period: int = 14) -> list[Optional[float]]:
@@ -333,6 +372,151 @@ async def save_config(cfg: Config) -> Config:
 
 
 # ---------------------------------------------------------------------------
+# Paper trading helpers
+# ---------------------------------------------------------------------------
+PAPER_CFG_ID = "singleton"
+PAPER_STATE_ID = "singleton"
+
+
+async def get_paper_config() -> PaperConfig:
+    doc = await db.paper_config.find_one({"_id": PAPER_CFG_ID}, {"_id": 0})
+    if not doc:
+        cfg = PaperConfig()
+        await db.paper_config.update_one(
+            {"_id": PAPER_CFG_ID}, {"$set": cfg.model_dump()}, upsert=True
+        )
+        return cfg
+    return PaperConfig(**doc)
+
+
+async def save_paper_config(cfg: PaperConfig) -> PaperConfig:
+    await db.paper_config.update_one(
+        {"_id": PAPER_CFG_ID}, {"$set": cfg.model_dump()}, upsert=True
+    )
+    return cfg
+
+
+async def get_paper_cash() -> float:
+    """Return current cash (initial + realized PnL)."""
+    doc = await db.paper_state.find_one({"_id": PAPER_STATE_ID}, {"_id": 0})
+    if doc and "cash" in doc:
+        return float(doc["cash"])
+    cfg = await get_paper_config()
+    await db.paper_state.update_one(
+        {"_id": PAPER_STATE_ID},
+        {"$set": {"cash": cfg.initial_capital}},
+        upsert=True,
+    )
+    return cfg.initial_capital
+
+
+async def set_paper_cash(cash: float) -> None:
+    await db.paper_state.update_one(
+        {"_id": PAPER_STATE_ID}, {"$set": {"cash": cash}}, upsert=True
+    )
+
+
+async def open_paper_position(signal: dict[str, Any]) -> Optional[PaperPosition]:
+    pcfg = await get_paper_config()
+    open_count = await db.paper_positions.count_documents({})
+    if open_count >= pcfg.max_open_positions:
+        return None
+    # Prevent duplicates on same signal
+    if await db.paper_positions.find_one({"signal_id": signal["id"]}):
+        return None
+    cash = await get_paper_cash()
+    # Equity approximation for sizing = cash (positions are marked-to-market only for display)
+    risk_usdt = max(1.0, cash * pcfg.risk_per_trade_pct / 100)
+    risk_per_unit = abs(signal["entry"] - signal["stop_loss"])
+    if risk_per_unit <= 0:
+        return None
+    qty = risk_usdt / risk_per_unit
+    pos = PaperPosition(
+        signal_id=signal["id"],
+        symbol=signal["symbol"],
+        timeframe=signal["timeframe"],
+        side=signal["side"],
+        entry=signal["entry"],
+        stop_loss=signal["stop_loss"],
+        take_profit=signal["take_profit"],
+        quantity=round(qty, 8),
+        risk_usdt=round(risk_usdt, 2),
+        opened_at=datetime.now(timezone.utc).isoformat(),
+    )
+    await db.paper_positions.insert_one(pos.model_dump())
+    logger.info(
+        "Opened paper position %s %s qty=%.6f risk=%.2f",
+        pos.symbol, pos.side, pos.quantity, pos.risk_usdt,
+    )
+    return pos
+
+
+async def close_paper_position(pos: dict[str, Any], exit_price: float, outcome: str) -> PaperTrade:
+    entry = float(pos["entry"])
+    qty = float(pos["quantity"])
+    if pos["side"] == "long":
+        pnl = (exit_price - entry) * qty
+    else:
+        pnl = (entry - exit_price) * qty
+    pnl_pct = (pnl / (entry * qty)) * 100 if entry > 0 and qty > 0 else 0.0
+    trade = PaperTrade(
+        signal_id=pos["signal_id"],
+        symbol=pos["symbol"],
+        side=pos["side"],
+        entry=entry,
+        exit=round(exit_price, 8),
+        quantity=qty,
+        pnl_usdt=round(pnl, 2),
+        pnl_pct=round(pnl_pct, 2),
+        outcome=outcome,
+        opened_at=pos["opened_at"],
+        closed_at=datetime.now(timezone.utc).isoformat(),
+    )
+    await db.paper_trades.insert_one(trade.model_dump())
+    await db.paper_positions.delete_one({"id": pos["id"]})
+    cash = await get_paper_cash()
+    await set_paper_cash(cash + pnl)
+    # Update signal outcome
+    await db.signals.update_one(
+        {"id": pos["signal_id"]},
+        {"$set": {"outcome": outcome, "status": "closed"}},
+    )
+    logger.info(
+        "Closed paper %s %s pnl=%.2f (%s)",
+        pos["symbol"], pos["side"], pnl, outcome,
+    )
+    return trade
+
+
+async def monitor_paper_positions() -> None:
+    """Fetch current prices and close positions if SL/TP hit."""
+    positions = await db.paper_positions.find({}, {"_id": 0}).to_list(1000)
+    if not positions:
+        return
+    tickers = await kucoin.get_tickers()
+    price_map: dict[str, float] = {}
+    for t in tickers:
+        try:
+            price_map[t["symbol"]] = float(t.get("last") or 0)
+        except (TypeError, ValueError):
+            continue
+    for pos in positions:
+        price = price_map.get(pos["symbol"], 0.0)
+        if price <= 0:
+            continue
+        if pos["side"] == "long":
+            if price <= pos["stop_loss"]:
+                await close_paper_position(pos, pos["stop_loss"], "loss")
+            elif price >= pos["take_profit"]:
+                await close_paper_position(pos, pos["take_profit"], "win")
+        else:
+            if price >= pos["stop_loss"]:
+                await close_paper_position(pos, pos["stop_loss"], "loss")
+            elif price <= pos["take_profit"]:
+                await close_paper_position(pos, pos["take_profit"], "win")
+
+
+# ---------------------------------------------------------------------------
 # Signal generation
 # ---------------------------------------------------------------------------
 async def analyze_pair(symbol: str, tf: str, cfg: Config) -> Optional[Signal]:
@@ -499,6 +683,13 @@ async def run_scan() -> dict[str, Any]:
                 )
             await db.signals.insert_many([s.model_dump() for s in signals_found])
 
+            # Auto-execute paper trades if enabled
+            pcfg = await get_paper_config()
+            if pcfg.auto_execute:
+                # Best signals first (higher strength)
+                for sig in sorted(signals_found, key=lambda s: -s.strength):
+                    await open_paper_position(sig.model_dump())
+
         duration = (datetime.now(timezone.utc) - started).total_seconds()
         scan_state.last_scan_at = datetime.now(timezone.utc).isoformat()
         scan_state.last_scan_duration_s = round(duration, 2)
@@ -534,14 +725,27 @@ async def scheduler_loop() -> None:
         await asyncio.sleep(max(60, cfg.scan_interval_minutes * 60))
 
 
+async def paper_monitor_loop() -> None:
+    """Poll prices every 60s to detect SL/TP hits on open paper positions."""
+    await asyncio.sleep(10)
+    while True:
+        try:
+            await monitor_paper_positions()
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Paper monitor error: %s", e)
+        await asyncio.sleep(60)
+
+
 # ---------------------------------------------------------------------------
 # FastAPI app & routes
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
-    task = asyncio.create_task(scheduler_loop())
+    scan_task = asyncio.create_task(scheduler_loop())
+    monitor_task = asyncio.create_task(paper_monitor_loop())
     yield
-    task.cancel()
+    scan_task.cancel()
+    monitor_task.cancel()
     await kucoin.close()
     client.close()
 
@@ -663,6 +867,131 @@ async def history_stats() -> dict[str, Any]:
         "losses": losses,
         "win_rate": win_rate,
     }
+
+
+# ---------------------------------------------------------------------------
+# Paper Trading endpoints
+# ---------------------------------------------------------------------------
+@api.get("/paper/config", response_model=PaperConfig)
+async def read_paper_config() -> PaperConfig:
+    return await get_paper_config()
+
+
+@api.put("/paper/config", response_model=PaperConfig)
+async def update_paper_config(cfg: PaperConfig) -> PaperConfig:
+    return await save_paper_config(cfg)
+
+
+@api.get("/paper/portfolio")
+async def paper_portfolio() -> dict[str, Any]:
+    pcfg = await get_paper_config()
+    cash = await get_paper_cash()
+    positions = await db.paper_positions.find({}, {"_id": 0}).to_list(1000)
+    # Mark to market
+    tickers = await kucoin.get_tickers()
+    price_map: dict[str, float] = {}
+    for t in tickers:
+        try:
+            price_map[t["symbol"]] = float(t.get("last") or 0)
+        except (TypeError, ValueError):
+            continue
+    unrealized = 0.0
+    enriched: list[dict[str, Any]] = []
+    for p in positions:
+        cur = price_map.get(p["symbol"], p["entry"])
+        if p["side"] == "long":
+            pnl = (cur - p["entry"]) * p["quantity"]
+        else:
+            pnl = (p["entry"] - cur) * p["quantity"]
+        pnl_pct = (pnl / (p["entry"] * p["quantity"])) * 100 if p["entry"] * p["quantity"] > 0 else 0
+        unrealized += pnl
+        enriched.append(
+            {
+                **p,
+                "current_price": round(cur, 8),
+                "unrealized_pnl": round(pnl, 2),
+                "unrealized_pnl_pct": round(pnl_pct, 2),
+            }
+        )
+    trades = await db.paper_trades.find({}, {"_id": 0}).to_list(1000)
+    realized = sum(t.get("pnl_usdt", 0.0) for t in trades)
+    wins = sum(1 for t in trades if t.get("outcome") == "win")
+    losses = sum(1 for t in trades if t.get("outcome") == "loss")
+    settled = wins + losses
+    win_rate = round((wins / settled) * 100, 1) if settled else 0.0
+    equity = cash + unrealized
+    return {
+        "initial_capital": pcfg.initial_capital,
+        "cash": round(cash, 2),
+        "equity": round(equity, 2),
+        "unrealized_pnl": round(unrealized, 2),
+        "realized_pnl": round(realized, 2),
+        "total_return_pct": round(((equity - pcfg.initial_capital) / pcfg.initial_capital) * 100, 2)
+        if pcfg.initial_capital > 0
+        else 0,
+        "open_positions_count": len(enriched),
+        "closed_trades_count": len(trades),
+        "wins": wins,
+        "losses": losses,
+        "win_rate": win_rate,
+        "auto_execute": pcfg.auto_execute,
+        "positions": enriched,
+    }
+
+
+@api.get("/paper/trades")
+async def paper_trades(limit: int = 100) -> dict[str, Any]:
+    cursor = db.paper_trades.find({}, {"_id": 0}).sort("closed_at", -1).limit(limit)
+    trades = await cursor.to_list(length=limit)
+    return {"trades": trades, "count": len(trades)}
+
+
+@api.post("/paper/execute/{signal_id}")
+async def paper_execute(signal_id: str) -> dict[str, Any]:
+    signal = await db.signals.find_one({"id": signal_id}, {"_id": 0})
+    if not signal:
+        raise HTTPException(status_code=404, detail="Signal not found")
+    pos = await open_paper_position(signal)
+    if not pos:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot open (max positions reached or duplicate)",
+        )
+    return {"position": pos.model_dump()}
+
+
+@api.post("/paper/positions/{position_id}/close")
+async def paper_close_manual(position_id: str) -> dict[str, Any]:
+    pos = await db.paper_positions.find_one({"id": position_id}, {"_id": 0})
+    if not pos:
+        raise HTTPException(status_code=404, detail="Position not found")
+    tickers = await kucoin.get_tickers()
+    price = 0.0
+    for t in tickers:
+        if t.get("symbol") == pos["symbol"]:
+            try:
+                price = float(t.get("last") or 0)
+            except (TypeError, ValueError):
+                pass
+            break
+    if price <= 0:
+        price = float(pos["entry"])
+    # Outcome purely by PnL sign
+    if pos["side"] == "long":
+        outcome = "win" if price >= pos["entry"] else "loss"
+    else:
+        outcome = "win" if price <= pos["entry"] else "loss"
+    trade = await close_paper_position(pos, price, outcome)
+    return {"trade": trade.model_dump()}
+
+
+@api.post("/paper/reset")
+async def paper_reset() -> dict[str, Any]:
+    pcfg = await get_paper_config()
+    await db.paper_positions.delete_many({})
+    await db.paper_trades.delete_many({})
+    await set_paper_cash(pcfg.initial_capital)
+    return {"ok": True, "cash": pcfg.initial_capital}
 
 
 app.include_router(api)
