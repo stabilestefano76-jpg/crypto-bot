@@ -24,9 +24,15 @@ Scheduler asyncio in background esegue `run_scan()` ogni `scan_interval_minutes`
 
 ## Frontend (Expo Router)
 - **(tabs)/index** — Home Signals: header sticky, segmented Long/Short, chip TF, pulsante Scan Now, cards ordinati per forza
+- **(tabs)/portfolio** — Paper Trading portfolio: equity, cash, realized/unrealized PnL, win rate, posizioni aperte con Close manuale, storico trades
 - **(tabs)/history** — Storico + stats win-rate
-- **(tabs)/settings** — Form completo per parametri (RSI, EMA, Volume, R:R, timeframes, coppie escluse) + disclaimer
-- **detail/[id]** — Grafico candlestick SVG con zone FVG, linee entry/SL/TP, sub-grafico RSI
+- **(tabs)/settings** — Form completo per parametri + sezione Paper Trading (auto-execute, initial capital, risk %, max positions) + disclaimer
+- **detail/[id]** — Grafico candlestick SVG con zone FVG, linee entry/SL/TP, sub-grafico RSI + bottone sticky "Execute Paper"
+
+## Paper Trading
+Portfolio virtuale simulato (default $10,000). Ogni esecuzione apre una posizione con position-sizing = risk% * equity / |entry - SL|. Monitor background ogni 60s controlla prezzi live KuCoin → chiude su SL/TP hit, calcola PnL realizzato, aggiorna outcome del segnale (win/loss). Auto-execute opzionale: quando ON, nuove confluenze vengono aperte automaticamente in ordine di strength fino al max_open_positions.
+
+Endpoint: `/api/paper/config` (GET/PUT), `/api/paper/portfolio` (equity mark-to-market), `/api/paper/execute/{signal_id}`, `/api/paper/positions/{id}/close`, `/api/paper/trades`, `/api/paper/reset`.
 
 ## Design
 Dark-first utility (personality 7): base #0b0e14, brand ambra #F5B300, success #00C076, error #FF554A. Nessun blu/viola. Testo Rajdhani per numeri, IBM Plex Sans per UI.
