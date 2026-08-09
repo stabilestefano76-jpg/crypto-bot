@@ -113,6 +113,7 @@ class PaperConfig(BaseModel):
     risk_per_trade_pct: float = 1.0  # % of equity risked per position
     auto_execute: bool = False
     max_open_positions: int = 5
+    trading_mode: str = "spot"  # "spot" or "leverage"
 
 
 class PaperPosition(BaseModel):
@@ -464,13 +465,25 @@ async def open_paper_position(signal: dict[str, Any]) -> Optional[PaperPosition]
     # Prevent duplicates on same signal
     if await db.paper_positions.find_one({"signal_id": signal["id"]}):
         return None
+    # Spot mode restrictions: no shorts (spot cannot short natively)
+    if pcfg.trading_mode == "spot" and signal["side"] == "short":
+        return None
     cash = await get_paper_cash()
-    # Equity approximation for sizing = cash (positions are marked-to-market only for display)
     risk_usdt = max(1.0, cash * pcfg.risk_per_trade_pct / 100)
     risk_per_unit = abs(signal["entry"] - signal["stop_loss"])
     if risk_per_unit <= 0:
         return None
     qty = risk_usdt / risk_per_unit
+
+    if pcfg.trading_mode == "spot":
+        # In spot mode, cash must cover the notional; cap qty by available cash
+        notional = qty * signal["entry"]
+        if notional > cash:
+            qty = cash / signal["entry"]
+            notional = qty * signal["entry"]
+        if qty <= 0 or notional < 1.0:
+            return None
+        await set_paper_cash(cash - notional)  # lock cash on open
     pos = PaperPosition(
         signal_id=signal["id"],
         symbol=signal["symbol"],
@@ -485,8 +498,8 @@ async def open_paper_position(signal: dict[str, Any]) -> Optional[PaperPosition]
     )
     await db.paper_positions.insert_one(pos.model_dump())
     logger.info(
-        "Opened paper position %s %s qty=%.6f risk=%.2f",
-        pos.symbol, pos.side, pos.quantity, pos.risk_usdt,
+        "Opened paper[%s] %s %s qty=%.6f risk=%.2f",
+        pcfg.trading_mode, pos.symbol, pos.side, pos.quantity, pos.risk_usdt,
     )
     return pos
 
@@ -494,6 +507,7 @@ async def open_paper_position(signal: dict[str, Any]) -> Optional[PaperPosition]
 async def close_paper_position(pos: dict[str, Any], exit_price: float, outcome: str) -> PaperTrade:
     entry = float(pos["entry"])
     qty = float(pos["quantity"])
+    pcfg = await get_paper_config()
     if pos["side"] == "long":
         pnl = (exit_price - entry) * qty
     else:
@@ -515,8 +529,11 @@ async def close_paper_position(pos: dict[str, Any], exit_price: float, outcome: 
     await db.paper_trades.insert_one(trade.model_dump())
     await db.paper_positions.delete_one({"id": pos["id"]})
     cash = await get_paper_cash()
-    await set_paper_cash(cash + pnl)
-    # Update signal outcome
+    if pcfg.trading_mode == "spot" and pos["side"] == "long":
+        # Unlock notional and add PnL: cash += exit * qty
+        await set_paper_cash(cash + exit_price * qty)
+    else:
+        await set_paper_cash(cash + pnl)
     await db.signals.update_one(
         {"id": pos["signal_id"]},
         {"$set": {"outcome": outcome, "status": "closed"}},
@@ -936,6 +953,7 @@ async def paper_portfolio() -> dict[str, Any]:
         except (TypeError, ValueError):
             continue
     unrealized = 0.0
+    spot_positions_value = 0.0
     enriched: list[dict[str, Any]] = []
     for p in positions:
         cur = price_map.get(p["symbol"], p["entry"])
@@ -945,6 +963,7 @@ async def paper_portfolio() -> dict[str, Any]:
             pnl = (p["entry"] - cur) * p["quantity"]
         pnl_pct = (pnl / (p["entry"] * p["quantity"])) * 100 if p["entry"] * p["quantity"] > 0 else 0
         unrealized += pnl
+        spot_positions_value += cur * p["quantity"]
         enriched.append(
             {
                 **p,
@@ -959,7 +978,13 @@ async def paper_portfolio() -> dict[str, Any]:
     losses = sum(1 for t in trades if t.get("outcome") == "loss")
     settled = wins + losses
     win_rate = round((wins / settled) * 100, 1) if settled else 0.0
-    equity = cash + unrealized
+    # In spot mode, cash is already locked when a position is opened,
+    # so equity = cash + market value of open positions.
+    # In leverage mode, positions carry no locked cash, equity = cash + unrealized PnL.
+    if pcfg.trading_mode == "spot":
+        equity = cash + spot_positions_value
+    else:
+        equity = cash + unrealized
     return {
         "initial_capital": pcfg.initial_capital,
         "cash": round(cash, 2),
@@ -975,6 +1000,7 @@ async def paper_portfolio() -> dict[str, Any]:
         "losses": losses,
         "win_rate": win_rate,
         "auto_execute": pcfg.auto_execute,
+        "trading_mode": pcfg.trading_mode,
         "positions": enriched,
     }
 
@@ -1059,6 +1085,27 @@ async def paper_set_mode(payload: dict[str, str]) -> dict[str, Any]:
     pcfg.auto_execute = mode == "auto"
     await save_paper_config(pcfg)
     return {"ok": True, "mode": mode, "auto_execute": pcfg.auto_execute}
+
+
+@api.post("/paper/trading-mode")
+async def paper_set_trading_mode(payload: dict[str, str]) -> dict[str, Any]:
+    """Switch between spot (cash-locked, no shorts) and leverage (futures-style PnL)."""
+    mode = payload.get("trading_mode", "").lower()
+    if mode not in ("spot", "leverage"):
+        raise HTTPException(
+            status_code=400, detail="trading_mode must be 'spot' or 'leverage'"
+        )
+    # Refuse to switch while there are open positions to avoid inconsistent cash accounting
+    open_count = await db.paper_positions.count_documents({})
+    if open_count > 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Close {open_count} open positions before switching mode",
+        )
+    pcfg = await get_paper_config()
+    pcfg.trading_mode = mode
+    await save_paper_config(pcfg)
+    return {"ok": True, "trading_mode": mode}
 
 
 # ---------------------------------------------------------------------------

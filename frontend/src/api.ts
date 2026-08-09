@@ -120,6 +120,7 @@ export type Portfolio = {
   losses: number;
   win_rate: number;
   auto_execute: boolean;
+  trading_mode: "spot" | "leverage";
   positions: PaperPosition[];
 };
 
@@ -164,6 +165,11 @@ export const api = {
     req<{ ok: boolean; mode: string; auto_execute: boolean }>("/paper/mode", {
       method: "POST",
       body: JSON.stringify({ mode }),
+    }),
+  setTradingMode: (trading_mode: "spot" | "leverage") =>
+    req<{ ok: boolean; trading_mode: string }>("/paper/trading-mode", {
+      method: "POST",
+      body: JSON.stringify({ trading_mode }),
     }),
   exchangeStatus: () =>
     req<{

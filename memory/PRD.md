@@ -30,14 +30,20 @@ Scheduler asyncio in background esegue `run_scan()` ogni `scan_interval_minutes`
 - **detail/[id]** — Grafico candlestick SVG con zone FVG, linee entry/SL/TP, sub-grafico RSI + bottone sticky "Execute Paper"
 
 ## Paper Trading
-Portfolio virtuale simulato con capitale configurabile inline dal Portfolio screen. Ogni esecuzione apre una posizione con position-sizing = risk% * equity / |entry - SL|. Monitor background ogni 60s controlla prezzi live KuCoin → chiude su SL/TP hit, calcola PnL realizzato, aggiorna outcome del segnale (win/loss).
+Portfolio virtuale simulato con **due modalità di mercato**:
+
+- **SPOT** (default): cash lockato all'apertura, solo posizioni LONG, quantità limitata dal cash disponibile → simulazione realistica del mercato spot
+- **LEVERAGE**: PnL stile futures, LONG & SHORT ammessi, position sizing basato solo sul risk (no cash locking) → esplora scenari più aggressivi
+
+Il cambio di modalità è bloccato quando ci sono posizioni aperte (evita inconsistenze contabili).
 
 **Controlli rapidi in cima al Portfolio**:
-1. **Execution Mode** — toggle Manual vs Auto (bottoni visuali)
-2. **Initial Capital** — input + "Set & Reset" per cambiare capitale
-3. **Connect KuCoin API** — bottone grande che apre bottom-sheet per API Key/Secret/Passphrase; credenziali cifrate at-rest via Fernet, testate immediatamente contro `/api/v1/accounts` di KuCoin, rifiutate se invalide
+1. **Market Type** — Spot vs Leverage
+2. **Execution Mode** — Manual vs Auto
+3. **Initial Capital** — input + "Set & Reset"
+4. **Connect KuCoin API** — bottom-sheet per collegamento sicuro, credenziali cifrate at-rest (Fernet)
 
-Endpoint: `/api/paper/config` (GET/PUT), `/api/paper/portfolio`, `/api/paper/execute/{signal_id}`, `/api/paper/positions/{id}/close`, `/api/paper/trades`, `/api/paper/reset`, `/api/paper/set-capital`, `/api/paper/mode`, `/api/exchange/status`, `/api/exchange/connect`, `/api/exchange/disconnect`.
+Endpoint: `/api/paper/config`, `/api/paper/portfolio`, `/api/paper/execute/{id}`, `/api/paper/positions/{id}/close`, `/api/paper/trades`, `/api/paper/reset`, `/api/paper/set-capital`, `/api/paper/mode`, `/api/paper/trading-mode`, `/api/exchange/status`, `/api/exchange/connect`, `/api/exchange/disconnect`.
 
 ## Design
 Dark-first utility (personality 7): base #0b0e14, brand ambra #F5B300, success #00C076, error #FF554A. Nessun blu/viola. Testo Rajdhani per numeri, IBM Plex Sans per UI.

@@ -104,6 +104,18 @@ export default function PortfolioScreen() {
     }
   };
 
+  const [tradingModeMsg, setTradingModeMsg] = useState<string | null>(null);
+  const onSetTradingMode = async (m: "spot" | "leverage") => {
+    setTradingModeMsg(null);
+    try {
+      await api.setTradingMode(m);
+      await load();
+    } catch (e: any) {
+      setTradingModeMsg(e.message || "Failed");
+      setTimeout(() => setTradingModeMsg(null), 4000);
+    }
+  };
+
   const onDisconnect = async () => {
     await api.exchangeDisconnect();
     await load();
@@ -138,6 +150,74 @@ export default function PortfolioScreen() {
       >
         {/* Quick controls: Mode toggle + Capital + Connect KuCoin */}
         <View style={styles.controlsCard} testID="quick-controls">
+          <Text style={styles.controlsLabel}>Market Type</Text>
+          <View style={styles.modeRow}>
+            <Pressable
+              onPress={() => onSetTradingMode("spot")}
+              style={[
+                styles.modeBtn,
+                portfolio.trading_mode === "spot" && styles.modeBtnActiveManual,
+              ]}
+              testID="market-spot"
+            >
+              <Ionicons
+                name="cash"
+                size={16}
+                color={
+                  portfolio.trading_mode === "spot"
+                    ? "#fff"
+                    : colors.onSurfaceSecondary
+                }
+              />
+              <Text
+                style={[
+                  styles.modeText,
+                  portfolio.trading_mode === "spot" && styles.modeTextActive,
+                ]}
+              >
+                SPOT
+              </Text>
+            </Pressable>
+            <Pressable
+              onPress={() => onSetTradingMode("leverage")}
+              style={[
+                styles.modeBtn,
+                portfolio.trading_mode === "leverage" && styles.modeBtnActiveAuto,
+              ]}
+              testID="market-leverage"
+            >
+              <Ionicons
+                name="trending-up"
+                size={16}
+                color={
+                  portfolio.trading_mode === "leverage"
+                    ? "#000"
+                    : colors.onSurfaceSecondary
+                }
+              />
+              <Text
+                style={[
+                  styles.modeText,
+                  portfolio.trading_mode === "leverage" && { color: "#000" },
+                ]}
+              >
+                LEVERAGE
+              </Text>
+            </Pressable>
+          </View>
+          <Text style={styles.modeHelp}>
+            {portfolio.trading_mode === "spot"
+              ? "Real cash locked on open · long only · safest simulation."
+              : "Futures-style PnL · long & short · larger position sizes."}
+          </Text>
+          {tradingModeMsg && (
+            <Text style={{ color: colors.error, fontSize: 11, fontWeight: "700" }}>
+              {tradingModeMsg}
+            </Text>
+          )}
+
+          <View style={styles.divider} />
+
           <Text style={styles.controlsLabel}>Execution Mode</Text>
           <View style={styles.modeRow}>
             <Pressable
