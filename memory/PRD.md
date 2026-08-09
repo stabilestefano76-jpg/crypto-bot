@@ -30,9 +30,14 @@ Scheduler asyncio in background esegue `run_scan()` ogni `scan_interval_minutes`
 - **detail/[id]** — Grafico candlestick SVG con zone FVG, linee entry/SL/TP, sub-grafico RSI + bottone sticky "Execute Paper"
 
 ## Paper Trading
-Portfolio virtuale simulato (default $10,000). Ogni esecuzione apre una posizione con position-sizing = risk% * equity / |entry - SL|. Monitor background ogni 60s controlla prezzi live KuCoin → chiude su SL/TP hit, calcola PnL realizzato, aggiorna outcome del segnale (win/loss). Auto-execute opzionale: quando ON, nuove confluenze vengono aperte automaticamente in ordine di strength fino al max_open_positions.
+Portfolio virtuale simulato con capitale configurabile inline dal Portfolio screen. Ogni esecuzione apre una posizione con position-sizing = risk% * equity / |entry - SL|. Monitor background ogni 60s controlla prezzi live KuCoin → chiude su SL/TP hit, calcola PnL realizzato, aggiorna outcome del segnale (win/loss).
 
-Endpoint: `/api/paper/config` (GET/PUT), `/api/paper/portfolio` (equity mark-to-market), `/api/paper/execute/{signal_id}`, `/api/paper/positions/{id}/close`, `/api/paper/trades`, `/api/paper/reset`.
+**Controlli rapidi in cima al Portfolio**:
+1. **Execution Mode** — toggle Manual vs Auto (bottoni visuali)
+2. **Initial Capital** — input + "Set & Reset" per cambiare capitale
+3. **Connect KuCoin API** — bottone grande che apre bottom-sheet per API Key/Secret/Passphrase; credenziali cifrate at-rest via Fernet, testate immediatamente contro `/api/v1/accounts` di KuCoin, rifiutate se invalide
+
+Endpoint: `/api/paper/config` (GET/PUT), `/api/paper/portfolio`, `/api/paper/execute/{signal_id}`, `/api/paper/positions/{id}/close`, `/api/paper/trades`, `/api/paper/reset`, `/api/paper/set-capital`, `/api/paper/mode`, `/api/exchange/status`, `/api/exchange/connect`, `/api/exchange/disconnect`.
 
 ## Design
 Dark-first utility (personality 7): base #0b0e14, brand ambra #F5B300, success #00C076, error #FF554A. Nessun blu/viola. Testo Rajdhani per numeri, IBM Plex Sans per UI.

@@ -226,6 +226,14 @@ export default function SignalsScreen() {
                   params: { id: item.id },
                 })
               }
+              onExecute={async () => {
+                try {
+                  await api.paperExecute(item.id);
+                  return "ok";
+                } catch (e: any) {
+                  return e.message || "Failed";
+                }
+              }}
             />
           )}
         />
@@ -237,11 +245,24 @@ export default function SignalsScreen() {
 function SignalCard({
   signal,
   onPress,
+  onExecute,
 }: {
   signal: Signal;
   onPress: () => void;
+  onExecute: () => Promise<string>;
 }) {
   const isLong = signal.side === "long";
+  const [executing, setExecuting] = useState(false);
+  const [msg, setMsg] = useState<string | null>(null);
+  const doExecute = async () => {
+    if (executing) return;
+    setExecuting(true);
+    setMsg(null);
+    const res = await onExecute();
+    setMsg(res === "ok" ? "Opened in paper" : res);
+    setTimeout(() => setMsg(null), 3000);
+    setExecuting(false);
+  };
   return (
     <Pressable
       onPress={onPress}
@@ -292,7 +313,41 @@ function SignalCard({
         </View>
       </View>
 
-      <Text style={styles.timeAgo}>{timeAgo(signal.created_at)}</Text>
+      <View style={styles.cardBottom}>
+        <Text style={styles.timeAgo}>{timeAgo(signal.created_at)}</Text>
+        <Pressable
+          onPress={doExecute}
+          disabled={executing}
+          hitSlop={8}
+          style={({ pressed }) => [
+            styles.execBtn,
+            { backgroundColor: isLong ? colors.success : colors.error },
+            (pressed || executing) && { opacity: 0.7 },
+          ]}
+          testID={`execute-${signal.id}`}
+        >
+          {executing ? (
+            <ActivityIndicator color="#fff" size="small" />
+          ) : (
+            <>
+              <Ionicons name="flash" size={12} color="#fff" />
+              <Text style={styles.execBtnText}>Execute</Text>
+            </>
+          )}
+        </Pressable>
+      </View>
+      {msg && (
+        <Text
+          style={[
+            styles.execMsg,
+            {
+              color: msg === "Opened in paper" ? colors.success : colors.error,
+            },
+          ]}
+        >
+          {msg}
+        </Text>
+      )}
     </Pressable>
   );
 }
@@ -489,5 +544,31 @@ const styles = StyleSheet.create({
     backgroundColor: colors.surfaceTertiary,
   },
   strengthText: { color: colors.brand, fontWeight: "800", fontSize: 11 },
+  cardBottom: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    marginTop: 4,
+  },
   timeAgo: { color: colors.onSurfaceTertiary, fontSize: 11 },
+  execBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    paddingHorizontal: spacing.md,
+    paddingVertical: 6,
+    borderRadius: radius.sm,
+  },
+  execBtnText: {
+    color: "#fff",
+    fontWeight: "800",
+    fontSize: font.sm,
+    letterSpacing: 0.4,
+  },
+  execMsg: {
+    fontSize: 11,
+    fontWeight: "700",
+    marginTop: 4,
+    textAlign: "right",
+  },
 });

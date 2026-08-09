@@ -6,7 +6,12 @@ async function req<T>(path: string, opts: RequestInit = {}): Promise<T> {
     ...opts,
   });
   if (!res.ok) {
-    throw new Error(`HTTP ${res.status}`);
+    let msg = `HTTP ${res.status}`;
+    try {
+      const j = await res.json();
+      if (j && j.detail) msg = String(j.detail);
+    } catch {}
+    throw new Error(msg);
   }
   return res.json();
 }
@@ -150,4 +155,30 @@ export const api = {
   paperClose: (positionId: string) =>
     req<{ trade: PaperTrade }>(`/paper/positions/${positionId}/close`, { method: "POST" }),
   paperReset: () => req<{ ok: boolean; cash: number }>("/paper/reset", { method: "POST" }),
+  setCapital: (amount: number) =>
+    req<{ ok: boolean; initial_capital: number; cash: number }>("/paper/set-capital", {
+      method: "POST",
+      body: JSON.stringify({ initial_capital: amount }),
+    }),
+  setMode: (mode: "manual" | "auto") =>
+    req<{ ok: boolean; mode: string; auto_execute: boolean }>("/paper/mode", {
+      method: "POST",
+      body: JSON.stringify({ mode }),
+    }),
+  exchangeStatus: () =>
+    req<{
+      connected: boolean;
+      exchange: string;
+      api_key_masked?: string;
+      usdt_balance?: number;
+      connected_at?: string;
+      error?: string;
+    }>("/exchange/status"),
+  exchangeConnect: (creds: { api_key: string; api_secret: string; api_passphrase: string }) =>
+    req<{ connected: boolean; usdt_balance?: number; api_key_masked?: string }>(
+      "/exchange/connect",
+      { method: "POST", body: JSON.stringify(creds) }
+    ),
+  exchangeDisconnect: () =>
+    req<{ ok: boolean }>("/exchange/disconnect", { method: "POST" }),
 };

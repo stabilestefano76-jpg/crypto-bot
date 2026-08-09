@@ -6,8 +6,12 @@ endpoints or order execution in this MVP.
 from __future__ import annotations
 
 import asyncio
+import base64
+import hashlib
+import hmac
 import logging
 import os
+import time
 import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime, timezone
@@ -15,6 +19,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import httpx
+from cryptography.fernet import Fernet, InvalidToken
 from dotenv import load_dotenv
 from fastapi import APIRouter, FastAPI, HTTPException, Query
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -66,7 +71,7 @@ class Config(BaseModel):
     require_volume_confirmation: bool = False
     require_ma_alignment: bool = False
     rr_ratio: float = 2.0
-    sl_padding_pct: float = 0.15  # % beyond FVG edge
+    sl_padding_pct: float = 1.0  # % beyond FVG edge — extra drawdown margin
     max_pairs_per_scan: int = 200  # cap for MVP performance
     enabled_pairs: list[str] = Field(default_factory=list)  # empty = all matching filter
     excluded_pairs: list[str] = Field(default_factory=list)
@@ -137,6 +142,41 @@ class PaperTrade(BaseModel):
     outcome: str  # win | loss
     opened_at: str
     closed_at: str
+
+
+class ExchangeConnectRequest(BaseModel):
+    api_key: str
+    api_secret: str
+    api_passphrase: str
+
+
+# ---------------------------------------------------------------------------
+# Encryption for exchange credentials (at-rest)
+# ---------------------------------------------------------------------------
+KEY_PATH = ROOT_DIR / ".fernet_key"
+
+
+def _load_or_create_fernet() -> Fernet:
+    if KEY_PATH.exists():
+        return Fernet(KEY_PATH.read_bytes())
+    key = Fernet.generate_key()
+    KEY_PATH.write_bytes(key)
+    try:
+        os.chmod(KEY_PATH, 0o600)
+    except OSError:
+        pass
+    return Fernet(key)
+
+
+fernet = _load_or_create_fernet()
+
+
+def encrypt_str(v: str) -> str:
+    return fernet.encrypt(v.encode()).decode()
+
+
+def decrypt_str(v: str) -> str:
+    return fernet.decrypt(v.encode()).decode()
 
 
 # ---------------------------------------------------------------------------
@@ -992,6 +1032,137 @@ async def paper_reset() -> dict[str, Any]:
     await db.paper_trades.delete_many({})
     await set_paper_cash(pcfg.initial_capital)
     return {"ok": True, "cash": pcfg.initial_capital}
+
+
+@api.post("/paper/set-capital")
+async def paper_set_capital(payload: dict[str, float]) -> dict[str, Any]:
+    """Set new initial capital AND reset the paper portfolio."""
+    amount = float(payload.get("initial_capital", 0))
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="initial_capital must be > 0")
+    pcfg = await get_paper_config()
+    pcfg.initial_capital = amount
+    await save_paper_config(pcfg)
+    await db.paper_positions.delete_many({})
+    await db.paper_trades.delete_many({})
+    await set_paper_cash(amount)
+    return {"ok": True, "initial_capital": amount, "cash": amount}
+
+
+@api.post("/paper/mode")
+async def paper_set_mode(payload: dict[str, str]) -> dict[str, Any]:
+    """Simple toggle between manual and auto execution."""
+    mode = payload.get("mode", "").lower()
+    if mode not in ("manual", "auto"):
+        raise HTTPException(status_code=400, detail="mode must be 'manual' or 'auto'")
+    pcfg = await get_paper_config()
+    pcfg.auto_execute = mode == "auto"
+    await save_paper_config(pcfg)
+    return {"ok": True, "mode": mode, "auto_execute": pcfg.auto_execute}
+
+
+# ---------------------------------------------------------------------------
+# KuCoin authenticated integration (connection test only, no order execution)
+# ---------------------------------------------------------------------------
+async def _kucoin_signed_get(path: str) -> httpx.Response:
+    doc = await db.exchange_creds.find_one({"_id": "kucoin"}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=400, detail="No KuCoin credentials stored")
+    api_key = decrypt_str(doc["api_key"])
+    api_secret = decrypt_str(doc["api_secret"])
+    api_passphrase = decrypt_str(doc["api_passphrase"])
+    ts = str(int(time.time() * 1000))
+    str_to_sign = ts + "GET" + path
+    sig = base64.b64encode(
+        hmac.new(api_secret.encode(), str_to_sign.encode(), hashlib.sha256).digest()
+    ).decode()
+    passphrase = base64.b64encode(
+        hmac.new(api_secret.encode(), api_passphrase.encode(), hashlib.sha256).digest()
+    ).decode()
+    headers = {
+        "KC-API-KEY": api_key,
+        "KC-API-SIGN": sig,
+        "KC-API-TIMESTAMP": ts,
+        "KC-API-PASSPHRASE": passphrase,
+        "KC-API-KEY-VERSION": "2",
+    }
+    async with httpx.AsyncClient(base_url=KUCOIN_BASE, timeout=10.0) as c:
+        return await c.get(path, headers=headers)
+
+
+@api.get("/exchange/status")
+async def exchange_status() -> dict[str, Any]:
+    doc = await db.exchange_creds.find_one({"_id": "kucoin"}, {"_id": 0})
+    if not doc:
+        return {"connected": False, "exchange": "kucoin"}
+    try:
+        r = await _kucoin_signed_get("/api/v1/accounts")
+        if r.status_code != 200:
+            return {
+                "connected": False,
+                "exchange": "kucoin",
+                "error": f"HTTP {r.status_code}",
+                "api_key_masked": doc.get("api_key_masked", ""),
+            }
+        data = r.json()
+        if data.get("code") != "200000":
+            return {
+                "connected": False,
+                "exchange": "kucoin",
+                "error": data.get("msg", "unknown"),
+                "api_key_masked": doc.get("api_key_masked", ""),
+            }
+        # Sum USDT balances across accounts
+        usdt_total = 0.0
+        for acc in data.get("data", []):
+            if acc.get("currency") == "USDT":
+                try:
+                    usdt_total += float(acc.get("balance") or 0)
+                except (TypeError, ValueError):
+                    continue
+        return {
+            "connected": True,
+            "exchange": "kucoin",
+            "api_key_masked": doc.get("api_key_masked", ""),
+            "usdt_balance": round(usdt_total, 2),
+            "connected_at": doc.get("connected_at"),
+        }
+    except (httpx.HTTPError, InvalidToken) as e:
+        return {"connected": False, "exchange": "kucoin", "error": str(e)}
+
+
+@api.post("/exchange/connect")
+async def exchange_connect(req: ExchangeConnectRequest) -> dict[str, Any]:
+    if not req.api_key or not req.api_secret or not req.api_passphrase:
+        raise HTTPException(status_code=400, detail="All fields required")
+    doc = {
+        "api_key": encrypt_str(req.api_key),
+        "api_secret": encrypt_str(req.api_secret),
+        "api_passphrase": encrypt_str(req.api_passphrase),
+        "api_key_masked": (req.api_key[:4] + "…" + req.api_key[-4:])
+        if len(req.api_key) > 8
+        else "***",
+        "connected_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.exchange_creds.update_one(
+        {"_id": "kucoin"}, {"$set": doc}, upsert=True
+    )
+    # Test connection immediately
+    status_res = await exchange_status()
+    if not status_res.get("connected"):
+        # Roll back on failure to avoid storing invalid creds silently
+        await db.exchange_creds.delete_one({"_id": "kucoin"})
+        raise HTTPException(
+            status_code=400,
+            detail=f"Connection failed: {status_res.get('error', 'unknown')}",
+        )
+    return status_res
+
+
+@api.post("/exchange/disconnect")
+async def exchange_disconnect() -> dict[str, Any]:
+    await db.exchange_creds.delete_one({"_id": "kucoin"})
+    return {"ok": True}
 
 
 app.include_router(api)

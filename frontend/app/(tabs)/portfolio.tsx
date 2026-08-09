@@ -2,11 +2,15 @@ import { useCallback, useEffect, useState } from "react";
 import {
   ActivityIndicator,
   FlatList,
+  KeyboardAvoidingView,
+  Modal,
+  Platform,
   Pressable,
   RefreshControl,
   ScrollView,
   StyleSheet,
   Text,
+  TextInput,
   View,
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
@@ -24,12 +28,27 @@ export default function PortfolioScreen() {
   const [refreshing, setRefreshing] = useState(false);
   const [tab, setTab] = useState<Tab>("positions");
   const [resetting, setResetting] = useState(false);
+  const [capitalInput, setCapitalInput] = useState("");
+  const [capitalSaving, setCapitalSaving] = useState(false);
+  const [modeSaving, setModeSaving] = useState(false);
+  const [connectVisible, setConnectVisible] = useState(false);
+  const [exchange, setExchange] = useState<{
+    connected: boolean;
+    api_key_masked?: string;
+    usdt_balance?: number;
+  } | null>(null);
 
   const load = useCallback(async () => {
     try {
-      const [p, t] = await Promise.all([api.portfolio(), api.paperTrades()]);
+      const [p, t, ex] = await Promise.all([
+        api.portfolio(),
+        api.paperTrades(),
+        api.exchangeStatus(),
+      ]);
       setPortfolio(p);
       setTrades(t.trades);
+      setExchange(ex);
+      setCapitalInput(String(p.initial_capital));
     } catch {
       // silent
     } finally {
@@ -63,6 +82,33 @@ export default function PortfolioScreen() {
     }
   };
 
+  const onSaveCapital = async () => {
+    const n = Number(capitalInput);
+    if (!Number.isFinite(n) || n <= 0) return;
+    setCapitalSaving(true);
+    try {
+      await api.setCapital(n);
+      await load();
+    } finally {
+      setCapitalSaving(false);
+    }
+  };
+
+  const onSetMode = async (mode: "manual" | "auto") => {
+    setModeSaving(true);
+    try {
+      await api.setMode(mode);
+      await load();
+    } finally {
+      setModeSaving(false);
+    }
+  };
+
+  const onDisconnect = async () => {
+    await api.exchangeDisconnect();
+    await load();
+  };
+
   if (loading || !portfolio) {
     return (
       <View style={[styles.root, styles.center, { paddingTop: insets.top }]}>
@@ -90,6 +136,133 @@ export default function PortfolioScreen() {
           />
         }
       >
+        {/* Quick controls: Mode toggle + Capital + Connect KuCoin */}
+        <View style={styles.controlsCard} testID="quick-controls">
+          <Text style={styles.controlsLabel}>Execution Mode</Text>
+          <View style={styles.modeRow}>
+            <Pressable
+              onPress={() => onSetMode("manual")}
+              disabled={modeSaving}
+              style={[
+                styles.modeBtn,
+                !portfolio.auto_execute && styles.modeBtnActiveManual,
+              ]}
+              testID="mode-manual"
+            >
+              <Ionicons
+                name="hand-left"
+                size={16}
+                color={!portfolio.auto_execute ? "#fff" : colors.onSurfaceSecondary}
+              />
+              <Text
+                style={[
+                  styles.modeText,
+                  !portfolio.auto_execute && styles.modeTextActive,
+                ]}
+              >
+                MANUAL
+              </Text>
+            </Pressable>
+            <Pressable
+              onPress={() => onSetMode("auto")}
+              disabled={modeSaving}
+              style={[
+                styles.modeBtn,
+                portfolio.auto_execute && styles.modeBtnActiveAuto,
+              ]}
+              testID="mode-auto"
+            >
+              <Ionicons
+                name="flash"
+                size={16}
+                color={portfolio.auto_execute ? "#000" : colors.onSurfaceSecondary}
+              />
+              <Text
+                style={[
+                  styles.modeText,
+                  portfolio.auto_execute && { color: "#000" },
+                ]}
+              >
+                AUTO
+              </Text>
+            </Pressable>
+          </View>
+          <Text style={styles.modeHelp}>
+            {portfolio.auto_execute
+              ? "New confluence signals open positions automatically."
+              : "Positions open only when you tap Execute on a signal."}
+          </Text>
+
+          <View style={styles.divider} />
+
+          <Text style={styles.controlsLabel}>Initial Capital (USDT)</Text>
+          <View style={styles.capitalRow}>
+            <TextInput
+              style={styles.capitalInput}
+              value={capitalInput}
+              onChangeText={setCapitalInput}
+              keyboardType="decimal-pad"
+              placeholder="10000"
+              placeholderTextColor={colors.onSurfaceTertiary}
+              testID="input-initial-capital"
+            />
+            <Pressable
+              onPress={onSaveCapital}
+              disabled={capitalSaving}
+              style={({ pressed }) => [
+                styles.capitalBtn,
+                pressed && { opacity: 0.7 },
+              ]}
+              testID="set-capital-button"
+            >
+              {capitalSaving ? (
+                <ActivityIndicator size="small" color={colors.onBrand} />
+              ) : (
+                <Text style={styles.capitalBtnText}>Set & Reset</Text>
+              )}
+            </Pressable>
+          </View>
+
+          <View style={styles.divider} />
+
+          <Text style={styles.controlsLabel}>Exchange Connection</Text>
+          {exchange?.connected ? (
+            <View style={styles.connectedRow} testID="exchange-connected">
+              <View style={styles.connectedLeft}>
+                <View style={styles.connectedDot} />
+                <View>
+                  <Text style={styles.connectedTitle}>KuCoin connected</Text>
+                  <Text style={styles.connectedSub}>
+                    {exchange.api_key_masked} · ${exchange.usdt_balance?.toFixed(2) ?? "0.00"} USDT
+                  </Text>
+                </View>
+              </View>
+              <Pressable
+                onPress={onDisconnect}
+                style={({ pressed }) => [
+                  styles.disconnectBtn,
+                  pressed && { opacity: 0.6 },
+                ]}
+                testID="disconnect-exchange"
+              >
+                <Text style={styles.disconnectText}>Disconnect</Text>
+              </Pressable>
+            </View>
+          ) : (
+            <Pressable
+              onPress={() => setConnectVisible(true)}
+              style={({ pressed }) => [
+                styles.connectBtn,
+                pressed && { opacity: 0.8 },
+              ]}
+              testID="connect-kucoin-button"
+            >
+              <Ionicons name="link" size={18} color={colors.onBrand} />
+              <Text style={styles.connectBtnText}>Connect KuCoin API</Text>
+            </Pressable>
+          )}
+        </View>
+
         {/* Header + big equity */}
         <View style={styles.headerCard} testID="portfolio-header">
           <View style={styles.headerTopRow}>
@@ -234,7 +407,144 @@ export default function PortfolioScreen() {
           trades.map((t) => <TradeRow key={t.id} t={t} />)
         )}
       </ScrollView>
+
+      <ConnectModal
+        visible={connectVisible}
+        onClose={() => setConnectVisible(false)}
+        onConnected={async () => {
+          setConnectVisible(false);
+          await load();
+        }}
+      />
     </View>
+  );
+}
+
+function ConnectModal({
+  visible,
+  onClose,
+  onConnected,
+}: {
+  visible: boolean;
+  onClose: () => void;
+  onConnected: () => void;
+}) {
+  const [apiKey, setApiKey] = useState("");
+  const [apiSecret, setApiSecret] = useState("");
+  const [apiPassphrase, setApiPassphrase] = useState("");
+  const [submitting, setSubmitting] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+
+  const submit = async () => {
+    setError(null);
+    setSubmitting(true);
+    try {
+      await api.exchangeConnect({
+        api_key: apiKey.trim(),
+        api_secret: apiSecret.trim(),
+        api_passphrase: apiPassphrase.trim(),
+      });
+      setApiKey("");
+      setApiSecret("");
+      setApiPassphrase("");
+      onConnected();
+    } catch (e: any) {
+      setError(e.message || "Connection failed");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  return (
+    <Modal
+      visible={visible}
+      animationType="slide"
+      transparent
+      onRequestClose={onClose}
+    >
+      <KeyboardAvoidingView
+        behavior={Platform.OS === "ios" ? "padding" : "height"}
+        style={styles.modalRoot}
+      >
+        <Pressable style={styles.modalBackdrop} onPress={onClose} />
+        <View style={styles.modalCard} testID="connect-modal">
+          <View style={styles.modalHeader}>
+            <Text style={styles.modalTitle}>Connect KuCoin</Text>
+            <Pressable onPress={onClose} hitSlop={12}>
+              <Ionicons name="close" size={22} color={colors.onSurface} />
+            </Pressable>
+          </View>
+          <Text style={styles.modalHint}>
+            Paste the API key created in KuCoin → API Management. Use{" "}
+            <Text style={{ color: colors.brand, fontWeight: "800" }}>
+              read + trade permissions only
+            </Text>
+            . NEVER enable withdrawals.
+          </Text>
+
+          <TextInput
+            style={styles.modalInput}
+            placeholder="API Key"
+            placeholderTextColor={colors.onSurfaceTertiary}
+            value={apiKey}
+            onChangeText={setApiKey}
+            autoCapitalize="none"
+            autoCorrect={false}
+            testID="input-api-key"
+          />
+          <TextInput
+            style={styles.modalInput}
+            placeholder="API Secret"
+            placeholderTextColor={colors.onSurfaceTertiary}
+            value={apiSecret}
+            onChangeText={setApiSecret}
+            secureTextEntry
+            autoCapitalize="none"
+            autoCorrect={false}
+            testID="input-api-secret"
+          />
+          <TextInput
+            style={styles.modalInput}
+            placeholder="API Passphrase"
+            placeholderTextColor={colors.onSurfaceTertiary}
+            value={apiPassphrase}
+            onChangeText={setApiPassphrase}
+            secureTextEntry
+            autoCapitalize="none"
+            autoCorrect={false}
+            testID="input-api-passphrase"
+          />
+
+          {error && <Text style={styles.modalError}>{error}</Text>}
+
+          <Pressable
+            onPress={submit}
+            disabled={submitting || !apiKey || !apiSecret || !apiPassphrase}
+            style={({ pressed }) => [
+              styles.modalSubmit,
+              (submitting || !apiKey || !apiSecret || !apiPassphrase) && {
+                opacity: 0.5,
+              },
+              pressed && { opacity: 0.7 },
+            ]}
+            testID="submit-connect"
+          >
+            {submitting ? (
+              <ActivityIndicator color={colors.onBrand} />
+            ) : (
+              <>
+                <Ionicons name="shield-checkmark" size={18} color={colors.onBrand} />
+                <Text style={styles.modalSubmitText}>Connect Securely</Text>
+              </>
+            )}
+          </Pressable>
+
+          <Text style={styles.modalFootnote}>
+            Credentials are encrypted at rest and never shown again.
+          </Text>
+        </View>
+      </KeyboardAvoidingView>
+    </Modal>
   );
 }
 
@@ -590,4 +900,195 @@ const styles = StyleSheet.create({
     borderWidth: 1,
   },
   outcomeText: { fontWeight: "800", fontSize: 10, letterSpacing: 0.5 },
+  // Quick controls
+  controlsCard: {
+    backgroundColor: colors.surfaceSecondary,
+    borderRadius: radius.md,
+    borderWidth: 1,
+    borderColor: colors.border,
+    padding: spacing.lg,
+    gap: spacing.sm,
+  },
+  controlsLabel: {
+    color: colors.onSurfaceTertiary,
+    fontSize: 10,
+    letterSpacing: 0.6,
+    textTransform: "uppercase",
+    fontWeight: "700",
+  },
+  modeRow: { flexDirection: "row", gap: spacing.sm },
+  modeBtn: {
+    flex: 1,
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    paddingVertical: 12,
+    borderRadius: radius.md,
+    backgroundColor: colors.surfaceTertiary,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  modeBtnActiveManual: {
+    backgroundColor: colors.info,
+    borderColor: colors.borderStrong,
+  },
+  modeBtnActiveAuto: {
+    backgroundColor: colors.brand,
+    borderColor: colors.brand,
+  },
+  modeText: {
+    color: colors.onSurfaceSecondary,
+    fontWeight: "800",
+    fontSize: font.sm,
+    letterSpacing: 0.6,
+  },
+  modeTextActive: { color: "#fff" },
+  modeHelp: { color: colors.onSurfaceSecondary, fontSize: 11 },
+  divider: {
+    height: 1,
+    backgroundColor: colors.divider,
+    marginVertical: spacing.sm,
+  },
+  capitalRow: { flexDirection: "row", gap: spacing.sm },
+  capitalInput: {
+    flex: 1,
+    color: colors.onSurface,
+    backgroundColor: colors.surfaceTertiary,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: radius.sm,
+    paddingHorizontal: spacing.md,
+    paddingVertical: 10,
+    fontSize: font.lg,
+    fontWeight: "800",
+  },
+  capitalBtn: {
+    paddingHorizontal: spacing.lg,
+    justifyContent: "center",
+    alignItems: "center",
+    backgroundColor: colors.brand,
+    borderRadius: radius.sm,
+  },
+  capitalBtnText: { color: colors.onBrand, fontWeight: "800", fontSize: font.sm },
+  connectBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: spacing.sm,
+    paddingVertical: 14,
+    borderRadius: radius.md,
+    backgroundColor: colors.brand,
+  },
+  connectBtnText: {
+    color: colors.onBrand,
+    fontWeight: "800",
+    fontSize: font.lg,
+    letterSpacing: 0.4,
+  },
+  connectedRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    padding: spacing.md,
+    backgroundColor: colors.surfaceTertiary,
+    borderRadius: radius.md,
+    borderWidth: 1,
+    borderColor: colors.success,
+  },
+  connectedLeft: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+    flex: 1,
+  },
+  connectedDot: {
+    width: 10,
+    height: 10,
+    borderRadius: 5,
+    backgroundColor: colors.success,
+  },
+  connectedTitle: {
+    color: colors.onSurface,
+    fontWeight: "800",
+    fontSize: font.base,
+  },
+  connectedSub: { color: colors.onSurfaceSecondary, fontSize: 11, marginTop: 2 },
+  disconnectBtn: {
+    paddingHorizontal: spacing.md,
+    paddingVertical: 6,
+    borderRadius: radius.sm,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  disconnectText: {
+    color: colors.onSurfaceSecondary,
+    fontWeight: "700",
+    fontSize: font.sm,
+  },
+  // Modal
+  modalRoot: { flex: 1, justifyContent: "flex-end" },
+  modalBackdrop: {
+    ...StyleSheet.absoluteFillObject,
+    backgroundColor: "rgba(0,0,0,0.65)",
+  },
+  modalCard: {
+    backgroundColor: colors.surfaceSecondary,
+    borderTopLeftRadius: radius.lg,
+    borderTopRightRadius: radius.lg,
+    padding: spacing.lg,
+    paddingBottom: spacing.xl,
+    borderTopWidth: 1,
+    borderLeftWidth: 1,
+    borderRightWidth: 1,
+    borderColor: colors.borderStrong,
+    gap: spacing.md,
+  },
+  modalHeader: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+  },
+  modalTitle: {
+    color: colors.onSurface,
+    fontSize: font.xl,
+    fontWeight: "800",
+  },
+  modalHint: {
+    color: colors.onSurfaceSecondary,
+    fontSize: font.sm,
+    lineHeight: 18,
+  },
+  modalInput: {
+    color: colors.onSurface,
+    backgroundColor: colors.surfaceTertiary,
+    borderWidth: 1,
+    borderColor: colors.border,
+    borderRadius: radius.md,
+    paddingHorizontal: spacing.md,
+    paddingVertical: 12,
+    fontSize: font.base,
+    fontWeight: "600",
+  },
+  modalError: {
+    color: colors.error,
+    fontSize: font.sm,
+    fontWeight: "700",
+    textAlign: "center",
+  },
+  modalSubmit: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: spacing.sm,
+    backgroundColor: colors.brand,
+    paddingVertical: 14,
+    borderRadius: radius.md,
+  },
+  modalSubmitText: { color: colors.onBrand, fontWeight: "800", fontSize: font.lg },
+  modalFootnote: {
+    color: colors.onSurfaceTertiary,
+    fontSize: 11,
+    textAlign: "center",
+  },
 });
