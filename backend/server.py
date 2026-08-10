@@ -114,6 +114,8 @@ class PaperConfig(BaseModel):
     auto_execute: bool = False
     max_open_positions: int = 5
     trading_mode: str = "spot"  # "spot" or "leverage"
+    max_position_size_usdt: float = 10.0  # HARD cap per single trade
+    one_position_per_pair: bool = True
 
 
 class PaperPosition(BaseModel):
@@ -122,7 +124,10 @@ class PaperPosition(BaseModel):
     symbol: str
     timeframe: str
     side: str  # long | short
-    entry: float
+    entry: float  # signal entry (planned)
+    fill_price: float = 0.0  # actual execution price
+    slippage_usdt: float = 0.0
+    slippage_pct: float = 0.0
     stop_loss: float
     take_profit: float
     quantity: float
@@ -389,6 +394,155 @@ kucoin = KuCoinClient()
 
 
 # ---------------------------------------------------------------------------
+# Real-time price feed via KuCoin public WebSocket
+# ---------------------------------------------------------------------------
+class PriceFeed:
+    """Maintains a live cache of last-trade prices via KuCoin WS.
+
+    Falls back to REST if the socket drops. Subscribes to the symbols of
+    currently open paper positions so SL/TP can trigger with minimal delay.
+    """
+
+    def __init__(self) -> None:
+        self.prices: dict[str, float] = {}
+        self.updated_at: dict[str, float] = {}
+        self._ws: Optional[Any] = None
+        self._subscribed: set[str] = set()
+        self._connected = False
+        self._lock = asyncio.Lock()
+
+    def get(self, symbol: str) -> Optional[float]:
+        return self.prices.get(symbol)
+
+    async def _get_token(self) -> Optional[tuple[str, str]]:
+        try:
+            async with httpx.AsyncClient(base_url=KUCOIN_BASE, timeout=10.0) as c:
+                r = await c.post("/api/v1/bullet-public")
+                data = r.json()
+                if data.get("code") != "200000":
+                    return None
+                token = data["data"]["token"]
+                endpoint = data["data"]["instanceServers"][0]["endpoint"]
+                return token, endpoint
+        except (httpx.HTTPError, KeyError, IndexError) as e:
+            logger.warning("WS token fetch failed: %s", e)
+            return None
+
+    async def desired_symbols(self) -> list[str]:
+        docs = await db.paper_positions.find({}, {"symbol": 1, "_id": 0}).to_list(1000)
+        return sorted({d["symbol"] for d in docs})
+
+    async def run(self) -> None:
+        import websockets  # local import, dep added
+
+        while True:
+            tok = await self._get_token()
+            if not tok:
+                await asyncio.sleep(5)
+                continue
+            token, endpoint = tok
+            url = f"{endpoint}?token={token}"
+            try:
+                async with websockets.connect(url, ping_interval=None) as ws:
+                    self._ws = ws
+                    self._connected = True
+                    self._subscribed.clear()
+                    logger.info("KuCoin WS connected")
+                    # background ping every 15s
+                    ping_task = asyncio.create_task(self._ping_loop(ws))
+                    sub_task = asyncio.create_task(self._resub_loop(ws))
+                    try:
+                        async for raw in ws:
+                            self._handle(raw)
+                    finally:
+                        ping_task.cancel()
+                        sub_task.cancel()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("KuCoin WS error, reconnecting: %s", e)
+            self._connected = False
+            self._ws = None
+            await asyncio.sleep(3)
+
+    async def _ping_loop(self, ws: Any) -> None:
+        import json as _json
+        while True:
+            await asyncio.sleep(15)
+            try:
+                await ws.send(_json.dumps({"id": str(int(time.time() * 1000)), "type": "ping"}))
+            except Exception:
+                return
+
+    async def _resub_loop(self, ws: Any) -> None:
+        """Keep subscriptions in sync with open positions."""
+        import json as _json
+        while True:
+            try:
+                want = set(await self.desired_symbols())
+                to_add = want - self._subscribed
+                to_remove = self._subscribed - want
+                for sym in to_add:
+                    await ws.send(_json.dumps({
+                        "id": str(int(time.time() * 1000)),
+                        "type": "subscribe",
+                        "topic": f"/market/ticker:{sym}",
+                        "response": True,
+                    }))
+                    self._subscribed.add(sym)
+                for sym in to_remove:
+                    await ws.send(_json.dumps({
+                        "id": str(int(time.time() * 1000)),
+                        "type": "unsubscribe",
+                        "topic": f"/market/ticker:{sym}",
+                        "response": True,
+                    }))
+                    self._subscribed.discard(sym)
+            except Exception:
+                return
+            await asyncio.sleep(3)
+
+    def _handle(self, raw: str) -> None:
+        import json as _json
+        try:
+            msg = _json.loads(raw)
+        except (ValueError, TypeError):
+            return
+        if msg.get("type") != "message":
+            return
+        topic = msg.get("topic", "")
+        if not topic.startswith("/market/ticker:"):
+            return
+        symbol = topic.split(":", 1)[1]
+        data = msg.get("data", {})
+        price = data.get("price") or data.get("bestBid")
+        try:
+            self.prices[symbol] = float(price)
+            self.updated_at[symbol] = time.time()
+        except (TypeError, ValueError):
+            pass
+
+    async def price_or_rest(self, symbol: str) -> Optional[float]:
+        """Return live WS price if fresh (<10s), else REST fallback."""
+        p = self.prices.get(symbol)
+        ts = self.updated_at.get(symbol, 0)
+        if p and (time.time() - ts) < 10:
+            return p
+        # REST fallback
+        try:
+            async with httpx.AsyncClient(base_url=KUCOIN_BASE, timeout=8.0) as c:
+                r = await c.get("/api/v1/market/orderbook/level1", params={"symbol": symbol})
+                d = r.json()
+                if d.get("code") == "200000" and d.get("data"):
+                    return float(d["data"]["price"])
+        except (httpx.HTTPError, KeyError, TypeError, ValueError):
+            pass
+        return None
+
+
+price_feed = PriceFeed()
+
+
+
+# ---------------------------------------------------------------------------
 # Config helpers
 # ---------------------------------------------------------------------------
 CONFIG_ID = "singleton"
@@ -465,31 +619,57 @@ async def open_paper_position(signal: dict[str, Any]) -> Optional[PaperPosition]
     # Prevent duplicates on same signal
     if await db.paper_positions.find_one({"signal_id": signal["id"]}):
         return None
+    # SAFETY: never more than one position on the same pair at once
+    if pcfg.one_position_per_pair and await db.paper_positions.find_one(
+        {"symbol": signal["symbol"]}
+    ):
+        return None
     # Spot mode restrictions: no shorts (spot cannot short natively)
     if pcfg.trading_mode == "spot" and signal["side"] == "short":
         return None
     cash = await get_paper_cash()
+
+    # IMMEDIATE EXECUTION: fill at the current live market price (WS or REST),
+    # not the planned signal price — this is what produces real slippage.
+    fill_price = await price_feed.price_or_rest(signal["symbol"])
+    if not fill_price or fill_price <= 0:
+        fill_price = signal["entry"]
+
     risk_usdt = max(1.0, cash * pcfg.risk_per_trade_pct / 100)
     risk_per_unit = abs(signal["entry"] - signal["stop_loss"])
     if risk_per_unit <= 0:
         return None
     qty = risk_usdt / risk_per_unit
 
+    # SAFETY: hard cap the notional per single trade (e.g. 10 USDT)
+    notional = qty * fill_price
+    cap = pcfg.max_position_size_usdt
+    if cap > 0 and notional > cap:
+        qty = cap / fill_price
+        notional = qty * fill_price
+        risk_usdt = qty * risk_per_unit
+
     if pcfg.trading_mode == "spot":
-        # In spot mode, cash must cover the notional; cap qty by available cash
-        notional = qty * signal["entry"]
         if notional > cash:
-            qty = cash / signal["entry"]
-            notional = qty * signal["entry"]
+            qty = cash / fill_price
+            notional = qty * fill_price
         if qty <= 0 or notional < 1.0:
             return None
         await set_paper_cash(cash - notional)  # lock cash on open
+
+    # Slippage = actual fill vs planned signal entry
+    slip_usdt = (fill_price - signal["entry"]) * qty
+    slip_pct = ((fill_price - signal["entry"]) / signal["entry"]) * 100 if signal["entry"] else 0.0
+
     pos = PaperPosition(
         signal_id=signal["id"],
         symbol=signal["symbol"],
         timeframe=signal["timeframe"],
         side=signal["side"],
         entry=signal["entry"],
+        fill_price=round(fill_price, 8),
+        slippage_usdt=round(slip_usdt, 4),
+        slippage_pct=round(slip_pct, 4),
         stop_loss=signal["stop_loss"],
         take_profit=signal["take_profit"],
         quantity=round(qty, 8),
@@ -497,15 +677,30 @@ async def open_paper_position(signal: dict[str, Any]) -> Optional[PaperPosition]
         opened_at=datetime.now(timezone.utc).isoformat(),
     )
     await db.paper_positions.insert_one(pos.model_dump())
+    # Persist slippage log entry
+    await db.slippage_log.insert_one({
+        "id": str(uuid.uuid4()),
+        "position_id": pos.id,
+        "signal_id": signal["id"],
+        "symbol": signal["symbol"],
+        "side": signal["side"],
+        "signal_price": signal["entry"],
+        "fill_price": round(fill_price, 8),
+        "slippage_usdt": round(slip_usdt, 4),
+        "slippage_pct": round(slip_pct, 4),
+        "quantity": round(qty, 8),
+        "source": "ws" if price_feed.get(signal["symbol"]) else "rest",
+        "at": datetime.now(timezone.utc).isoformat(),
+    })
     logger.info(
-        "Opened paper[%s] %s %s qty=%.6f risk=%.2f",
-        pcfg.trading_mode, pos.symbol, pos.side, pos.quantity, pos.risk_usdt,
+        "Opened paper[%s] %s %s qty=%.6f fill=%.8f slip=%.4f%%",
+        pcfg.trading_mode, pos.symbol, pos.side, pos.quantity, fill_price, slip_pct,
     )
     return pos
 
 
 async def close_paper_position(pos: dict[str, Any], exit_price: float, outcome: str) -> PaperTrade:
-    entry = float(pos["entry"])
+    entry = float(pos.get("fill_price") or pos["entry"])  # real fill for PnL
     qty = float(pos["quantity"])
     pcfg = await get_paper_config()
     if pos["side"] == "long":
@@ -546,19 +741,22 @@ async def close_paper_position(pos: dict[str, Any], exit_price: float, outcome: 
 
 
 async def monitor_paper_positions() -> None:
-    """Fetch current prices and close positions if SL/TP hit."""
+    """Close positions if SL/TP hit, using real-time WS prices when available."""
     positions = await db.paper_positions.find({}, {"_id": 0}).to_list(1000)
     if not positions:
         return
-    tickers = await kucoin.get_tickers()
-    price_map: dict[str, float] = {}
-    for t in tickers:
-        try:
-            price_map[t["symbol"]] = float(t.get("last") or 0)
-        except (TypeError, ValueError):
-            continue
+    # Build price map: prefer live WS cache, fallback to REST tickers once
+    rest_map: dict[str, float] = {}
+    need_rest = any(price_feed.get(p["symbol"]) is None for p in positions)
+    if need_rest:
+        tickers = await kucoin.get_tickers()
+        for t in tickers:
+            try:
+                rest_map[t["symbol"]] = float(t.get("last") or 0)
+            except (TypeError, ValueError):
+                continue
     for pos in positions:
-        price = price_map.get(pos["symbol"], 0.0)
+        price = price_feed.get(pos["symbol"]) or rest_map.get(pos["symbol"], 0.0)
         if price <= 0:
             continue
         if pos["side"] == "long":
@@ -783,14 +981,14 @@ async def scheduler_loop() -> None:
 
 
 async def paper_monitor_loop() -> None:
-    """Poll prices every 60s to detect SL/TP hits on open paper positions."""
-    await asyncio.sleep(10)
+    """Check SL/TP hits every 3s using the real-time WS price cache."""
+    await asyncio.sleep(8)
     while True:
         try:
             await monitor_paper_positions()
         except Exception as e:  # noqa: BLE001
             logger.exception("Paper monitor error: %s", e)
-        await asyncio.sleep(60)
+        await asyncio.sleep(3)
 
 
 # ---------------------------------------------------------------------------
@@ -800,9 +998,11 @@ async def paper_monitor_loop() -> None:
 async def lifespan(_app: FastAPI):
     scan_task = asyncio.create_task(scheduler_loop())
     monitor_task = asyncio.create_task(paper_monitor_loop())
+    ws_task = asyncio.create_task(price_feed.run())
     yield
     scan_task.cancel()
     monitor_task.cancel()
+    ws_task.cancel()
     await kucoin.close()
     client.close()
 
@@ -1010,6 +1210,35 @@ async def paper_trades(limit: int = 100) -> dict[str, Any]:
     cursor = db.paper_trades.find({}, {"_id": 0}).sort("closed_at", -1).limit(limit)
     trades = await cursor.to_list(length=limit)
     return {"trades": trades, "count": len(trades)}
+
+
+@api.get("/slippage/log")
+async def slippage_log(limit: int = 100) -> dict[str, Any]:
+    cursor = db.slippage_log.find({}, {"_id": 0}).sort("at", -1).limit(limit)
+    logs = await cursor.to_list(length=limit)
+    total_abs = sum(abs(l.get("slippage_usdt", 0.0)) for l in logs)
+    avg_pct = (
+        round(sum(l.get("slippage_pct", 0.0) for l in logs) / len(logs), 4)
+        if logs
+        else 0.0
+    )
+    return {
+        "logs": logs,
+        "count": len(logs),
+        "total_abs_slippage_usdt": round(total_abs, 4),
+        "avg_slippage_pct": avg_pct,
+    }
+
+
+@api.get("/feed/status")
+async def feed_status() -> dict[str, Any]:
+    return {
+        "ws_connected": price_feed._connected,
+        "subscribed": sorted(price_feed._subscribed),
+        "cached_symbols": len(price_feed.prices),
+    }
+
+
 
 
 @api.post("/paper/execute/{signal_id}")

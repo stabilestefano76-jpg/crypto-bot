@@ -24,15 +24,25 @@ export default function HistoryScreen() {
   } | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
+  const [slip, setSlip] = useState<{
+    logs: any[];
+    total_abs_slippage_usdt: number;
+    avg_slippage_pct: number;
+  } | null>(null);
+  const [feed, setFeed] = useState<{ ws_connected: boolean; cached_symbols: number } | null>(null);
 
   const load = useCallback(async () => {
     try {
-      const [s, st] = await Promise.all([
+      const [s, st, sl, fd] = await Promise.all([
         api.signals({ status: "all" }),
         api.historyStats(),
+        api.slippageLog(),
+        api.feedStatus(),
       ]);
       setItems(s.signals);
       setStats(st);
+      setSlip(sl);
+      setFeed(fd);
     } catch {
       // silent
     } finally {
@@ -43,14 +53,48 @@ export default function HistoryScreen() {
 
   useEffect(() => {
     load();
+    const iv = setInterval(load, 10_000);
+    return () => clearInterval(iv);
   }, [load]);
 
   return (
     <View style={[styles.root, { paddingTop: insets.top }]}>
       <View style={styles.header}>
-        <Text style={styles.title} testID="history-title">
-          Signal History
-        </Text>
+        <View style={styles.titleRow}>
+          <Text style={styles.title} testID="history-title">
+            Signal History
+          </Text>
+          {feed && (
+            <View
+              style={[
+                styles.wsBadge,
+                {
+                  backgroundColor: feed.ws_connected
+                    ? colors.success
+                    : colors.surfaceTertiary,
+                },
+              ]}
+              testID="ws-badge"
+            >
+              <View
+                style={[
+                  styles.wsDot,
+                  {
+                    backgroundColor: feed.ws_connected ? "#fff" : colors.error,
+                  },
+                ]}
+              />
+              <Text
+                style={[
+                  styles.wsText,
+                  { color: feed.ws_connected ? "#fff" : colors.onSurfaceSecondary },
+                ]}
+              >
+                {feed.ws_connected ? "LIVE WS" : "WS OFF"}
+              </Text>
+            </View>
+          )}
+        </View>
         {stats && (
           <View style={styles.statsRow} testID="history-stats">
             <StatBox label="Total" value={String(stats.total)} color={colors.onSurface} />
@@ -87,6 +131,68 @@ export default function HistoryScreen() {
           data={items}
           keyExtractor={(i) => i.id}
           contentContainerStyle={styles.listPad}
+          ListHeaderComponent={
+            slip && slip.logs.length > 0 ? (
+              <View style={styles.slipCard} testID="slippage-panel">
+                <View style={styles.slipHead}>
+                  <Ionicons name="swap-vertical" size={16} color={colors.brand} />
+                  <Text style={styles.slipTitle}>Slippage Monitor</Text>
+                </View>
+                <View style={styles.slipStats}>
+                  <View style={styles.slipStat}>
+                    <Text style={styles.slipLabel}>Avg slippage</Text>
+                    <Text
+                      style={[
+                        styles.slipValue,
+                        {
+                          color:
+                            slip.avg_slippage_pct >= 0
+                              ? colors.error
+                              : colors.success,
+                        },
+                      ]}
+                    >
+                      {slip.avg_slippage_pct >= 0 ? "+" : ""}
+                      {slip.avg_slippage_pct}%
+                    </Text>
+                  </View>
+                  <View style={styles.slipStat}>
+                    <Text style={styles.slipLabel}>Total impact</Text>
+                    <Text style={styles.slipValue}>
+                      ${slip.total_abs_slippage_usdt}
+                    </Text>
+                  </View>
+                  <View style={styles.slipStat}>
+                    <Text style={styles.slipLabel}>Fills</Text>
+                    <Text style={styles.slipValue}>{slip.logs.length}</Text>
+                  </View>
+                </View>
+                {slip.logs.slice(0, 5).map((l) => (
+                  <View key={l.id} style={styles.slipRow}>
+                    <Text style={styles.slipSym}>{l.symbol}</Text>
+                    <Text style={styles.slipDetail}>
+                      {l.signal_price} → {l.fill_price}
+                    </Text>
+                    <View style={styles.slipSrcTag}>
+                      <Text style={styles.slipSrcText}>{l.source.toUpperCase()}</Text>
+                    </View>
+                    <Text
+                      style={[
+                        styles.slipPct,
+                        {
+                          color:
+                            l.slippage_pct >= 0 ? colors.error : colors.success,
+                        },
+                      ]}
+                    >
+                      {l.slippage_pct >= 0 ? "+" : ""}
+                      {l.slippage_pct}%
+                    </Text>
+                  </View>
+                ))}
+              </View>
+            ) : null
+          }
           refreshControl={
             <RefreshControl
               refreshing={refreshing}
@@ -168,6 +274,64 @@ const styles = StyleSheet.create({
     gap: spacing.md,
   },
   title: { fontSize: 22, fontWeight: "800", color: colors.onSurface },
+  titleRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "space-between",
+  },
+  wsBadge: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 5,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 4,
+    borderRadius: radius.pill,
+  },
+  wsDot: { width: 7, height: 7, borderRadius: 4 },
+  wsText: { fontSize: 10, fontWeight: "800", letterSpacing: 0.5 },
+  slipCard: {
+    backgroundColor: colors.surfaceSecondary,
+    borderRadius: radius.md,
+    borderWidth: 1,
+    borderColor: colors.border,
+    padding: spacing.md,
+    marginBottom: spacing.md,
+    gap: spacing.sm,
+  },
+  slipHead: { flexDirection: "row", alignItems: "center", gap: 6 },
+  slipTitle: { color: colors.onSurface, fontWeight: "800", fontSize: font.base },
+  slipStats: { flexDirection: "row", gap: spacing.sm },
+  slipStat: {
+    flex: 1,
+    backgroundColor: colors.surfaceTertiary,
+    borderRadius: radius.sm,
+    padding: spacing.sm,
+  },
+  slipLabel: {
+    color: colors.onSurfaceTertiary,
+    fontSize: 10,
+    textTransform: "uppercase",
+    letterSpacing: 0.4,
+  },
+  slipValue: { color: colors.onSurface, fontWeight: "800", fontSize: font.base, marginTop: 2 },
+  slipRow: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: spacing.sm,
+    borderTopWidth: 1,
+    borderTopColor: colors.divider,
+    paddingTop: spacing.sm,
+  },
+  slipSym: { color: colors.onSurface, fontWeight: "700", fontSize: font.sm, width: 84 },
+  slipDetail: { color: colors.onSurfaceSecondary, fontSize: 11, flex: 1 },
+  slipSrcTag: {
+    paddingHorizontal: 5,
+    paddingVertical: 1,
+    borderRadius: radius.sm,
+    backgroundColor: colors.brandTertiary,
+  },
+  slipSrcText: { color: colors.brand, fontSize: 9, fontWeight: "800" },
+  slipPct: { fontWeight: "800", fontSize: font.sm, width: 58, textAlign: "right" },
   statsRow: { flexDirection: "row", gap: spacing.sm, flexWrap: "wrap" },
   statBox: {
     flex: 1,

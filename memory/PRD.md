@@ -29,6 +29,12 @@ Scheduler asyncio in background esegue `run_scan()` ogni `scan_interval_minutes`
 - **(tabs)/settings** — Form completo per parametri + sezione Paper Trading (auto-execute, initial capital, risk %, max positions) + disclaimer
 - **detail/[id]** — Grafico candlestick SVG con zone FVG, linee entry/SL/TP, sub-grafico RSI + bottone sticky "Execute Paper"
 
+## Real-time & Live-trading safety (WebSocket)
+- **KuCoin WebSocket** (`/api/v1/bullet-public` → wss ticker feed): cache prezzi in tempo reale, auto-subscribe ai simboli delle posizioni aperte, ping/reconnect automatici, fallback REST se il socket cade. Monitor SL/TP ora gira ogni **3s** sui prezzi live invece dei 60s REST.
+- **Esecuzione immediata**: la posizione viene riempita al prezzo di mercato live (`fill_price`) nell'istante del segnale, non al prezzo pianificato.
+- **Sicurezza**: `max_position_size_usdt` (default 10) cappa il notional per singola operazione; `one_position_per_pair` impedisce più posizioni sulla stessa coppia.
+- **Slippage log** (`slippage_log` collection): salva signal_price vs fill_price per ogni esecuzione, con % e fonte (ws/rest). Endpoint `/api/slippage/log` (con aggregati avg%/total impact) e `/api/feed/status`. Pannello "Slippage Monitor" + badge LIVE WS nella schermata History; sezione "Live Safety" in Settings.
+
 ## Paper Trading
 Portfolio virtuale simulato con **due modalità di mercato**:
 

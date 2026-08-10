@@ -238,6 +238,21 @@ export default function SettingsScreen() {
             />
           </Section>
 
+          <Section title="Live Safety">
+            <NumRow
+              label="Max size per trade (USDT)"
+              value={pcfg.max_position_size_usdt}
+              onChange={(v) => updatePaper({ max_position_size_usdt: v })}
+              testID="input-max-size"
+            />
+            <ToggleRow
+              label="One position per pair"
+              value={pcfg.one_position_per_pair}
+              onChange={(v) => updatePaper({ one_position_per_pair: v })}
+              testID="toggle-one-per-pair"
+            />
+          </Section>
+
           <Section title="Paper Trading">
             <ToggleRow
               label="Auto-execute new signals"

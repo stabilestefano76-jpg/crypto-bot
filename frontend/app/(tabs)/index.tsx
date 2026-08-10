@@ -117,6 +117,17 @@ export default function SignalsScreen() {
             </View>
           </View>
           <Pressable
+            onPress={() => router.push("/academy")}
+            style={({ pressed }) => [
+              styles.scanBtn,
+              { backgroundColor: colors.surfaceTertiary, marginRight: 8 },
+              pressed && { opacity: 0.6 },
+            ]}
+            testID="academy-button"
+          >
+            <Ionicons name="school" size={16} color={colors.brand} />
+          </Pressable>
+          <Pressable
             onPress={onScan}
             disabled={scanning}
             style={({ pressed }) => [

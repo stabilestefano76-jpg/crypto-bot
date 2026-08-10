@@ -73,6 +73,9 @@ export type PaperConfig = {
   risk_per_trade_pct: number;
   auto_execute: boolean;
   max_open_positions: number;
+  trading_mode?: "spot" | "leverage";
+  max_position_size_usdt: number;
+  one_position_per_pair: boolean;
 };
 
 export type PaperPosition = {
@@ -187,4 +190,25 @@ export const api = {
     ),
   exchangeDisconnect: () =>
     req<{ ok: boolean }>("/exchange/disconnect", { method: "POST" }),
+  slippageLog: () =>
+    req<{
+      logs: {
+        id: string;
+        symbol: string;
+        side: string;
+        signal_price: number;
+        fill_price: number;
+        slippage_usdt: number;
+        slippage_pct: number;
+        source: string;
+        at: string;
+      }[];
+      count: number;
+      total_abs_slippage_usdt: number;
+      avg_slippage_pct: number;
+    }>("/slippage/log"),
+  feedStatus: () =>
+    req<{ ws_connected: boolean; subscribed: string[]; cached_symbols: number }>(
+      "/feed/status"
+    ),
 };

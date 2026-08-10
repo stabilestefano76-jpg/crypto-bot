@@ -138,14 +138,24 @@ export default function DetailScreen() {
         </View>
 
         <View style={styles.ctxCard}>
-          <Text style={styles.ctxTitle}>Technical Context</Text>
+          <Text style={styles.ctxTitle}>Signal Reasoning</Text>
+          <Text style={styles.reasonIntro}>
+            Il bot ha aperto questo setup {isLong ? "LONG" : "SHORT"} perché{" "}
+            {signal.confirmations.length} criteri tecnici indipendenti convergono
+            sullo stesso scenario:
+          </Text>
           {signal.confirmations.map((c) => (
-            <View key={c} style={styles.ctxRow}>
-              <Ionicons name="checkmark-circle" size={16} color={colors.brand} />
-              <Text style={styles.ctxText}>{c}</Text>
+            <View key={c} style={styles.reasonBlock}>
+              <View style={styles.ctxRow}>
+                <Ionicons name="checkmark-circle" size={16} color={colors.brand} />
+                <Text style={[styles.ctxText, { fontWeight: "800" }]}>{c}</Text>
+              </View>
+              <Text style={styles.reasonText}>
+                {reasonFor(c, signal, isLong)}
+              </Text>
             </View>
           ))}
-          <View style={styles.ctxRow}>
+          <View style={[styles.ctxRow, { marginTop: 6 }]}>
             <Ionicons name="albums" size={16} color={colors.onSurfaceTertiary} />
             <Text style={styles.ctxText}>
               FVG zone: {formatPrice(signal.fvg_bottom)} —{" "}
@@ -427,6 +437,31 @@ function formatPrice(v: number): string {
   return v.toPrecision(4);
 }
 
+function reasonFor(criterion: string, s: Signal, isLong: boolean): string {
+  const rsi = s.rsi_value;
+  const vol = s.volume_ratio;
+  switch (criterion) {
+    case "RSI Divergence":
+      return isLong
+        ? `Il prezzo ha fatto un minimo più basso mentre RSI (${rsi.toFixed(1)}) ha fatto un minimo più alto: il momentum ribassista si sta esaurendo, tipico segnale di inversione al rialzo.`
+        : `Il prezzo ha fatto un massimo più alto mentre RSI (${rsi.toFixed(1)}) ha fatto un massimo più basso: la spinta rialzista sta perdendo forza, probabile inversione ribassista.`;
+    case "FVG Zone":
+      return `Rilevato un Fair Value Gap ${
+        isLong ? "rialzista" : "ribassista"
+      } ancora aperto tra ${formatPrice(s.fvg_bottom)} e ${formatPrice(
+        s.fvg_top
+      )}. Il prezzo tende a tornare a testare queste zone: entry al bordo, stop appena oltre.`;
+    case "Volume Spike":
+      return `Volume attuale ${vol}× la media 20 periodi: c'è partecipazione istituzionale/reale sul movimento, non un fakeout a bassa liquidità.`;
+    case "EMA Trend Up":
+      return "EMA veloce sopra la lenta: il trend maggiore è rialzista, il long è allineato con la corrente principale del mercato.";
+    case "EMA Trend Down":
+      return "EMA veloce sotto la lenta: il trend maggiore è ribassista, lo short è allineato con la direzione dominante.";
+    default:
+      return "Conferma tecnica aggiuntiva rilevata dall'algoritmo.";
+  }
+}
+
 const styles = StyleSheet.create({
   root: { flex: 1, backgroundColor: colors.surface },
   center: {
@@ -506,6 +541,25 @@ const styles = StyleSheet.create({
   },
   ctxRow: { flexDirection: "row", alignItems: "center", gap: spacing.sm },
   ctxText: { color: colors.onSurface, fontSize: font.sm, flex: 1 },
+  reasonIntro: {
+    color: colors.onSurfaceSecondary,
+    fontSize: font.sm,
+    lineHeight: 20,
+    marginBottom: 4,
+  },
+  reasonBlock: {
+    gap: 4,
+    paddingLeft: 0,
+    paddingBottom: spacing.sm,
+    borderBottomWidth: 1,
+    borderBottomColor: colors.divider,
+  },
+  reasonText: {
+    color: colors.onSurfaceSecondary,
+    fontSize: font.sm,
+    lineHeight: 18,
+    paddingLeft: 22,
+  },
   disclaimer: {
     flexDirection: "row",
     alignItems: "center",
