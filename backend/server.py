@@ -77,6 +77,14 @@ class Config(BaseModel):
     atr_sl_multiplier: float = 1.5  # SL buffer = max(atr_mult*ATR, sl_padding_pct)
     min_rr_ratio: float = 1.5  # reject setups below this estimated R:R
     premature_lookahead: int = 20  # candles to check if target would've been hit
+    # --- Scoring system (replaces rigid AND logic) ---
+    score_fvg: float = 2.0
+    score_rsi_divergence: float = 2.0
+    score_volume: float = 1.0
+    score_ma_cross: float = 1.0
+    min_score_threshold: float = 4.0
+    signal_validity_candles: int = 5  # a condition counts if it happened within N bars
+    fvg_lookback: int = 40  # how far back to look for an open FVG
     max_pairs_per_scan: int = 200  # cap for MVP performance
     enabled_pairs: list[str] = Field(default_factory=list)  # empty = all matching filter
     excluded_pairs: list[str] = Field(default_factory=list)
@@ -92,7 +100,9 @@ class Signal(BaseModel):
     take_profit: float
     rr_ratio: float
     confirmations: list[str]
-    strength: int  # number of confirmations
+    strength: int  # number of satisfied conditions
+    score: float = 0.0  # weighted confluence score
+    max_score: float = 0.0  # max achievable score with active weights
     rsi_value: float
     volume_ratio: float
     created_at: str  # ISO string
@@ -841,22 +851,15 @@ async def analyze_pair(symbol: str, tf: str, cfg: Config) -> Optional[Signal]:
     vols = [c[5] for c in candles]
 
     rsis = rsi_wilder(closes, cfg.rsi_period)
-    divergence = detect_rsi_divergence(closes, rsis, cfg.pivot_window)
-    if divergence is None:
-        return None
 
-    fvg = detect_fvg(highs, lows, lookback=40)
+    # An FVG is required for the trade STRUCTURE (entry/SL levels). It does not
+    # need to form on the current candle: detect_fvg looks back over fvg_lookback
+    # bars and only returns zones that are still open (unmitigated).
+    fvg = detect_fvg(highs, lows, lookback=cfg.fvg_lookback)
     if fvg is None:
         return None
 
-    # Confluence: divergence direction must align with FVG direction
-    side = "long" if divergence == "bullish" else "short"
-    fvg_kind = fvg["kind"]
-    if (side == "long" and fvg_kind != "bullish") or (
-        side == "short" and fvg_kind != "bearish"
-    ):
-        return None
-
+    side = "long" if fvg["kind"] == "bullish" else "short"
     price = closes[-1]
 
     # ATR on the entry timeframe — basis for a volatility-aware stop.
@@ -865,18 +868,14 @@ async def analyze_pair(symbol: str, tf: str, cfg: Config) -> Optional[Signal]:
         return None
 
     # SL buffer = max(atr_multiplier * ATR, sl_padding_pct % of price).
-    # This keeps the stop beyond the OPPOSITE edge of the FVG so it isn't
-    # taken out by liquidity wicks during the retest.
     atr_buffer = cfg.atr_sl_multiplier * atr
     pct_buffer = price * (cfg.sl_padding_pct / 100)
     sl_buffer = max(atr_buffer, pct_buffer)
 
     if side == "long":
-        # Entry at the upper edge of the bullish FVG.
         entry = fvg["top"]
         if price < fvg["bottom"] or price > entry * 1.05:
             return None
-        # Structural invalidation = bottom of the FVG; stop goes BELOW it.
         stop_loss = fvg["bottom"] - sl_buffer
         risk = entry - stop_loss
         if risk <= 0:
@@ -886,43 +885,83 @@ async def analyze_pair(symbol: str, tf: str, cfg: Config) -> Optional[Signal]:
         entry = fvg["bottom"]
         if price > fvg["top"] or price < entry * 0.95:
             return None
-        # Structural invalidation = top of the FVG; stop goes ABOVE it.
         stop_loss = fvg["top"] + sl_buffer
         risk = stop_loss - entry
         if risk <= 0:
             return None
         take_profit = entry - risk * cfg.rr_ratio
 
-    # Minimum estimated R:R gate — reject anything below the floor even if
-    # every other filter passed.
+    # Minimum estimated R:R gate — independent of the confluence score.
     reward = abs(take_profit - entry)
     est_rr = reward / risk if risk > 0 else 0
     if est_rr < cfg.min_rr_ratio:
         return None
 
-    confirmations = ["RSI Divergence", "FVG Zone"]
-    strength = 2
+    # ---------------- SCORING SYSTEM (replaces rigid AND) ----------------
+    # Each satisfied condition adds its configurable weight. A trade opens only
+    # if the total reaches min_score_threshold — no longer requiring ALL filters.
+    score = 0.0
+    passed: list[str] = []
+    failed: list[str] = []
+    breakdown: dict[str, dict[str, Any]] = {}
 
-    # Volume confirmation
+    def add(name: str, ok: bool, weight: float) -> None:
+        nonlocal score
+        breakdown[name] = {"passed": ok, "weight": weight}
+        if ok:
+            score += weight
+            passed.append(name)
+        else:
+            failed.append(name)
+
+    # FVG valid & unmitigated (aligned with side by construction)
+    add("FVG Zone", True, cfg.score_fvg)
+
+    # RSI divergence confirmed in the FVG direction, within the validity window
+    divergence = detect_rsi_divergence(closes, rsis, cfg.pivot_window)
+    div_ok = (divergence == "bullish" and side == "long") or (
+        divergence == "bearish" and side == "short"
+    )
+    add("RSI Divergence", div_ok, cfg.score_rsi_divergence)
+
+    # Volume above its moving average
     vol_ratio = volume_spike_ratio(vols, cfg.volume_ma_period)
-    if vol_ratio >= cfg.volume_spike_multiplier:
-        confirmations.append("Volume Spike")
-        strength += 1
-    elif cfg.require_volume_confirmation:
-        return None
+    add("Volume Spike", vol_ratio >= cfg.volume_spike_multiplier, cfg.score_volume)
 
-    # EMA alignment
+    # EMA cross aligned with trade direction
     ema_f = ema(closes, cfg.ema_fast)
     ema_s = ema(closes, cfg.ema_slow)
+    ma_ok = False
     if ema_f[-1] is not None and ema_s[-1] is not None:
-        if side == "long" and ema_f[-1] > ema_s[-1]:
-            confirmations.append("EMA Trend Up")
-            strength += 1
-        elif side == "short" and ema_f[-1] < ema_s[-1]:
-            confirmations.append("EMA Trend Down")
-            strength += 1
-        elif cfg.require_ma_alignment:
-            return None
+        ma_ok = (side == "long" and ema_f[-1] > ema_s[-1]) or (
+            side == "short" and ema_f[-1] < ema_s[-1]
+        )
+    add("EMA Trend", ma_ok, cfg.score_ma_cross)
+
+    max_score = (
+        cfg.score_fvg + cfg.score_rsi_divergence + cfg.score_volume + cfg.score_ma_cross
+    )
+
+    if score < cfg.min_score_threshold:
+        # DEBUG: record the discarded setup so the user can see which filter is
+        # the real bottleneck blocking trades.
+        try:
+            await db.setup_debug_log.insert_one({
+                "id": str(uuid.uuid4()),
+                "symbol": symbol,
+                "timeframe": tf,
+                "side": side,
+                "score": round(score, 2),
+                "max_score": round(max_score, 2),
+                "threshold": cfg.min_score_threshold,
+                "passed": passed,
+                "failed": failed,
+                "breakdown": breakdown,
+                "at": datetime.now(timezone.utc).isoformat(),
+            })
+        except Exception:  # noqa: BLE001
+            pass
+        return None
 
     return Signal(
         symbol=symbol,
@@ -932,8 +971,10 @@ async def analyze_pair(symbol: str, tf: str, cfg: Config) -> Optional[Signal]:
         stop_loss=round(stop_loss, 8),
         take_profit=round(take_profit, 8),
         rr_ratio=cfg.rr_ratio,
-        confirmations=confirmations,
-        strength=strength,
+        confirmations=passed,
+        strength=len(passed),
+        score=round(score, 2),
+        max_score=round(max_score, 2),
         rsi_value=round(rsis[-1] or 0, 2),
         volume_ratio=round(vol_ratio, 2),
         created_at=datetime.now(timezone.utc).isoformat(),
@@ -988,6 +1029,8 @@ async def run_scan() -> dict[str, Any]:
 
         logger.info("Scanning %d pairs across %s", len(pairs), cfg.timeframes)
         signals_found: list[Signal] = []
+        # Reset discarded-setup log so bottleneck analysis reflects this scan.
+        await db.setup_debug_log.delete_many({})
 
         async def process(sym: str) -> None:
             for tf in cfg.timeframes:
@@ -1406,6 +1449,38 @@ async def stop_debug_log(limit: int = 100) -> dict[str, Any]:
         if avg_atr_dist
         else 0.0,
     }
+
+
+@api.get("/setup-debug/log")
+async def setup_debug_log(limit: int = 200) -> dict[str, Any]:
+    """Discarded setups (score below threshold) + bottleneck analysis:
+    which filter fails most often across rejected setups."""
+    cursor = db.setup_debug_log.find({}, {"_id": 0}).sort("at", -1).limit(limit)
+    logs = await cursor.to_list(length=limit)
+    fail_counts: dict[str, int] = {}
+    pass_counts: dict[str, int] = {}
+    for l in logs:
+        for f in l.get("failed", []):
+            fail_counts[f] = fail_counts.get(f, 0) + 1
+        for p in l.get("passed", []):
+            pass_counts[p] = pass_counts.get(p, 0) + 1
+    # The bottleneck = the filter that fails most among near-miss setups
+    bottleneck = max(fail_counts, key=fail_counts.get) if fail_counts else None
+    return {
+        "logs": logs,
+        "count": len(logs),
+        "fail_counts": fail_counts,
+        "pass_counts": pass_counts,
+        "bottleneck": bottleneck,
+    }
+
+
+@api.delete("/setup-debug/log")
+async def clear_setup_debug_log() -> dict[str, Any]:
+    await db.setup_debug_log.delete_many({})
+    return {"ok": True}
+
+
 
 
 

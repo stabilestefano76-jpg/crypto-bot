@@ -78,7 +78,7 @@ export default function SignalsScreen() {
     try {
       await api.triggerScan();
       setTimeout(load, 4000);
-    } catch (e) {
+    } catch {
       // ignore
     } finally {
       setTimeout(() => setScanning(false), 2000);
@@ -320,7 +320,10 @@ function SignalCard({
           </View>
         ))}
         <View style={styles.strengthBox}>
-          <Text style={styles.strengthText}>×{signal.strength}</Text>
+          <Ionicons name="star" size={9} color={colors.brand} />
+          <Text style={styles.strengthText}>
+            {signal.score ?? signal.strength}/{signal.max_score ?? signal.strength}
+          </Text>
         </View>
       </View>
 
@@ -549,6 +552,9 @@ const styles = StyleSheet.create({
   confText: { color: colors.brand, fontSize: 10, fontWeight: "700" },
   strengthBox: {
     marginLeft: "auto",
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 3,
     paddingHorizontal: 6,
     paddingVertical: 2,
     borderRadius: radius.sm,

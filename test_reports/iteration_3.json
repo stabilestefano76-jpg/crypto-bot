@@ -1,0 +1,37 @@
+{
+  "summary": "Scoring system (replaces rigid AND) verified end-to-end. Backend 9/9 pytest passing on public URL. GET /api/config exposes new scoring fields with correct defaults (score_fvg=2, score_rsi_divergence=2, score_volume=1, score_ma_cross=1, min_score_threshold=4, signal_validity_candles=5, fvg_lookback=40); PUT persists (min_score_threshold set to 3.0 -> readback 3.0). GET /api/signals now emits `score` and `max_score`; every returned signal satisfies threshold<=score<=max_score and max_score == sum of the 4 weights (6.0). AND requirement gone: live signals show varied confirmation combos (e.g. BNB-USDT 1h LONG has FVG+RSI+Volume+EMA => 6/6, DASH-USDT 15m SHORT has FVG+Volume+EMA => 4/6, MEGA-USDT 4h SHORT has FVG+RSI+EMA => 5/6). POST /api/scan resets setup_debug_log at start and populates near-miss log; GET /api/setup-debug/log returns full schema {logs, count, fail_counts, pass_counts, bottleneck}; observed bottleneck='RSI Divergence' (fails in 100% of 149 discarded setups). DELETE /api/setup-debug/log clears the collection (verified standalone; note: transient race with the always-on background scheduler can immediately repopulate — not a bug). Regression: ATR-based SL (atr>0, SL beyond opposite FVG edge, R:R>=1.5), /api/stop-debug/log, /api/slippage/log, /api/feed/status, and POST /api/paper/execute/{signal_id} all still work. Frontend (390x844 mobile web): Signals cards show '6/6', '5/6', '4/6' badges replacing the old xN strength indicator; History tab renders 'Setup Bottleneck' panel with discarded count, bottleneck name (RSI Divergence) and bars with fail % per filter (RSI 100%, Volume 97%, EMA 36%); Settings has a 'SCORING SYSTEM' section with all 7 numeric inputs (score-fvg, score-rsi, score-volume, score-ma, min-score, validity-window, fvg-lookback) plus a live max-score readout (6.0). Save persists via PUT /api/config -> 'Saved!' confirmation. No red screens, no runtime errors (only the carried-over 'props.pointerEvents deprecated' warning from a dep, non-blocking).",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": [
+      {"component": "react-native-web (dependency)", "issue": "Deprecation warning: 'props.pointerEvents is deprecated. Use style.pointerEvents'. Carried over from previous iterations, comes from a dep. Non-blocking."}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_scoring_system.py",
+    "/app/backend/tests/test_kusignal.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "analyze_pair(): single path. FVG still required for STRUCTURE (entry/SL levels), always contributes score_fvg. The other three filters (RSI divergence, volume spike, EMA trend) contribute their weights independently; total gated by cfg.min_score_threshold. Rejected setups are persisted to db.setup_debug_log with passed/failed/breakdown for diagnostics. Correct.",
+    "run_scan(): db.setup_debug_log.delete_many({}) is called at scan start so bottleneck panel always reflects the LAST scan only — matches spec.",
+    "GET /api/setup-debug/log: bottleneck = max(fail_counts, key=fail_counts.get). Correct choice for identifying the most-failing filter.",
+    "MongoDB _id excluded via projection on every read endpoint (verified). No serialization issues.",
+    "Frontend Signal type has new fields `score` and `max_score` and the card renders `${score}/${max_score}` badge; History bottleneck panel guards on setupDbg.count > 0 so it hides cleanly when nothing was discarded.",
+    "Settings 'Scoring System' section correctly renders editable weights + computed max score total; Save calls PUT /api/config and shows a transient 'Saved!' state."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_scoring_system.py",
+    "/app/test_reports/pytest/pytest_results.xml",
+    "/app/test_reports/iteration_3.json"
+  ],
+  "success_rate": {"backend": "100%", "frontend": "100%"},
+  "seed_data_creation": "Triggered POST /api/scan mid-test to populate setup_debug_log for bottleneck verification (149 discarded setups observed).",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Public URL: https://divergence-trader-1.preview.emergentagent.com. Scoring config fields: score_fvg, score_rsi_divergence, score_volume, score_ma_cross, min_score_threshold (default 4.0, max 6.0), signal_validity_candles, fvg_lookback. Signal fields added: score, max_score. New endpoints: GET/DELETE /api/setup-debug/log. Note: setup_debug_log is CLEARED at every run_scan start; the background scheduler runs every scan_interval_minutes (default 5), so a manual DELETE may be immediately followed by fresh entries if a scan happens to be running — the DELETE itself works correctly (verified standalone). Frontend testIDs: setup-bottleneck-panel, input-score-fvg, input-score-rsi, input-score-volume, input-score-ma, input-min-score, input-validity-window, input-fvg-lookback, save-config-button.",
+  "rca_of_issue": "N/A — feature verified working. Score badges, threshold gating, debug bottleneck, and settings UI all match spec."
+}

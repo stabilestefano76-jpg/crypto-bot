@@ -27,6 +27,8 @@ export type Signal = {
   rr_ratio: number;
   confirmations: string[];
   strength: number;
+  score?: number;
+  max_score?: number;
   rsi_value: number;
   volume_ratio: number;
   created_at: string;
@@ -55,6 +57,17 @@ export type Config = {
   require_ma_alignment: boolean;
   rr_ratio: number;
   sl_padding_pct: number;
+  atr_period: number;
+  atr_sl_multiplier: number;
+  min_rr_ratio: number;
+  premature_lookahead: number;
+  score_fvg: number;
+  score_rsi_divergence: number;
+  score_volume: number;
+  score_ma_cross: number;
+  min_score_threshold: number;
+  signal_validity_candles: number;
+  fvg_lookback: number;
   max_pairs_per_scan: number;
   enabled_pairs: string[];
   excluded_pairs: string[];
@@ -236,4 +249,22 @@ export const api = {
       premature_rate: number;
       avg_stop_distance_atr: number;
     }>("/stop-debug/log"),
+  setupDebugLog: () =>
+    req<{
+      logs: {
+        id: string;
+        symbol: string;
+        side: string;
+        score: number;
+        max_score: number;
+        threshold: number;
+        passed: string[];
+        failed: string[];
+        at: string;
+      }[];
+      count: number;
+      fail_counts: Record<string, number>;
+      pass_counts: Record<string, number>;
+      bottleneck: string | null;
+    }>("/setup-debug/log"),
 };

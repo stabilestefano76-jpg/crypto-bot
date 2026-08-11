@@ -29,6 +29,16 @@ Scheduler asyncio in background esegue `run_scan()` ogni `scan_interval_minutes`
 - **(tabs)/settings** — Form completo per parametri + sezione Paper Trading (auto-execute, initial capital, risk %, max positions) + disclaimer
 - **detail/[id]** — Grafico candlestick SVG con zone FVG, linee entry/SL/TP, sub-grafico RSI + bottone sticky "Execute Paper"
 
+## Sistema a punteggio (sostituisce logica AND rigida)
+Un trade si apre in base a un **punteggio di confluenza** pesato, non richiedendo più tutti i filtri insieme:
+- Pesi (tutti configurabili da Settings): FVG=2, RSI divergence=2, Volume=1, EMA cross=1 → max 6
+- **Soglia minima** configurabile (default 4): basta FVG+RSI (2+2) OPPURE FVG+Volume+EMA (2+1+1)
+- FVG resta l'ancora strutturale (definisce entry/SL) su lookback configurabile (`fvg_lookback` 40); nessuna condizione richiesta sulla stessa candela (`signal_validity_candles` 5)
+- **Log setup scartati** (`setup_debug_log`, azzerato a ogni scan): per ogni setto sotto soglia salva passed/failed + score. Endpoint `/api/setup-debug/log` con analisi del **collo di bottiglia** (filtro che fallisce più spesso) + `DELETE` per pulizia
+- Config aggiuntivi: `score_fvg`, `score_rsi_divergence`, `score_volume`, `score_ma_cross`, `min_score_threshold`, `signal_validity_candles`, `fvg_lookback`
+- Signal ora include `score` e `max_score`
+- UI: sezione "Scoring System" in Settings (pesi+soglia editabili), badge score/max sulle card, pannello "Setup Bottleneck" nella History con barre di fallimento per filtro
+
 ## Stop-Loss ATR-based (overhaul)
 Per ridurre gli stop prematuri:
 - **ATR (Wilder, periodo 14 configurabile)** calcolato sul timeframe di entry

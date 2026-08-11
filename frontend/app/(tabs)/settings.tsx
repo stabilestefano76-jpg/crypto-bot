@@ -102,6 +102,77 @@ export default function SettingsScreen() {
           contentContainerStyle={styles.body}
           keyboardShouldPersistTaps="handled"
         >
+          <Section title="Scoring System">
+            <View style={styles.scoreHint}>
+              <Ionicons name="information-circle" size={14} color={colors.brand} />
+              <Text style={styles.scoreHintText}>
+                Un trade si apre se la somma dei punti dei filtri soddisfatti
+                raggiunge la soglia minima. Non serve che tutti i filtri siano
+                veri insieme.
+              </Text>
+            </View>
+            <NumRow
+              label="Punti FVG valida"
+              value={cfg.score_fvg}
+              onChange={(v) => update({ score_fvg: v })}
+              step={0.5}
+              testID="input-score-fvg"
+            />
+            <NumRow
+              label="Punti divergenza RSI"
+              value={cfg.score_rsi_divergence}
+              onChange={(v) => update({ score_rsi_divergence: v })}
+              step={0.5}
+              testID="input-score-rsi"
+            />
+            <NumRow
+              label="Punti volume sopra media"
+              value={cfg.score_volume}
+              onChange={(v) => update({ score_volume: v })}
+              step={0.5}
+              testID="input-score-volume"
+            />
+            <NumRow
+              label="Punti incrocio medie"
+              value={cfg.score_ma_cross}
+              onChange={(v) => update({ score_ma_cross: v })}
+              step={0.5}
+              testID="input-score-ma"
+            />
+            <NumRow
+              label="Soglia minima apertura"
+              value={cfg.min_score_threshold}
+              onChange={(v) => update({ min_score_threshold: v })}
+              step={0.5}
+              testID="input-min-score"
+            />
+            <View style={styles.maxScoreRow}>
+              <Text style={styles.maxScoreText}>
+                Punteggio massimo raggiungibile:{" "}
+                <Text style={{ color: colors.brand, fontWeight: "800" }}>
+                  {(
+                    cfg.score_fvg +
+                    cfg.score_rsi_divergence +
+                    cfg.score_volume +
+                    cfg.score_ma_cross
+                  ).toFixed(1)}
+                </Text>
+              </Text>
+            </View>
+            <NumRow
+              label="Finestra validità (candele)"
+              value={cfg.signal_validity_candles}
+              onChange={(v) => update({ signal_validity_candles: v })}
+              testID="input-validity-window"
+            />
+            <NumRow
+              label="FVG lookback (candele)"
+              value={cfg.fvg_lookback}
+              onChange={(v) => update({ fvg_lookback: v })}
+              testID="input-fvg-lookback"
+            />
+          </Section>
+
           <Section title="Scan Engine">
             <NumRow
               label="Scan interval (min)"
@@ -508,6 +579,21 @@ const styles = StyleSheet.create({
     borderColor: colors.brand,
   },
   disclaimerText: { color: colors.onSurface, flex: 1, fontSize: font.sm, lineHeight: 18 },
+  scoreHint: {
+    flexDirection: "row",
+    gap: 6,
+    padding: spacing.sm,
+    backgroundColor: colors.brandTertiary,
+    borderRadius: radius.sm,
+    marginBottom: 4,
+  },
+  scoreHintText: { color: colors.onSurface, flex: 1, fontSize: 11, lineHeight: 16 },
+  maxScoreRow: {
+    paddingVertical: spacing.sm,
+    borderTopWidth: 1,
+    borderTopColor: colors.divider,
+  },
+  maxScoreText: { color: colors.onSurfaceSecondary, fontSize: font.sm },
   saveBtn: {
     flexDirection: "row",
     alignItems: "center",

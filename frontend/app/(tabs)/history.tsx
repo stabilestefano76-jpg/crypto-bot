@@ -38,21 +38,29 @@ export default function HistoryScreen() {
     avg_stop_distance_atr: number;
     logs: any[];
   } | null>(null);
+  const [setupDbg, setSetupDbg] = useState<{
+    count: number;
+    bottleneck: string | null;
+    fail_counts: Record<string, number>;
+    pass_counts: Record<string, number>;
+  } | null>(null);
 
   const load = useCallback(async () => {
     try {
-      const [s, st, sl, fd, sd] = await Promise.all([
+      const [s, st, sl, fd, sd, su] = await Promise.all([
         api.signals({ status: "all" }),
         api.historyStats(),
         api.slippageLog(),
         api.feedStatus(),
         api.stopDebugLog(),
+        api.setupDebugLog(),
       ]);
       setItems(s.signals);
       setStats(st);
       setSlip(sl);
       setFeed(fd);
       setStopDbg(sd);
+      setSetupDbg(su);
     } catch {
       // silent
     } finally {
@@ -143,6 +151,43 @@ export default function HistoryScreen() {
           contentContainerStyle={styles.listPad}
           ListHeaderComponent={
             <>
+            {setupDbg && setupDbg.count > 0 ? (
+              <View style={styles.slipCard} testID="setup-bottleneck-panel">
+                <View style={styles.slipHead}>
+                  <Ionicons name="funnel" size={16} color={colors.brand} />
+                  <Text style={styles.slipTitle}>Setup Bottleneck</Text>
+                </View>
+                <Text style={styles.bottleneckLine}>
+                  {setupDbg.count} setup scartati nell&apos;ultimo scan · collo di
+                  bottiglia:{" "}
+                  <Text style={{ color: colors.error, fontWeight: "800" }}>
+                    {setupDbg.bottleneck || "—"}
+                  </Text>
+                </Text>
+                {Object.entries(setupDbg.fail_counts)
+                  .sort((a, b) => b[1] - a[1])
+                  .map(([name, cnt]) => {
+                    const pct = Math.round((cnt / setupDbg.count) * 100);
+                    return (
+                      <View key={name} style={styles.barRow}>
+                        <Text style={styles.barLabel}>{name}</Text>
+                        <View style={styles.barTrack}>
+                          <View
+                            style={[
+                              styles.barFill,
+                              { width: `${pct}%` },
+                            ]}
+                          />
+                        </View>
+                        <Text style={styles.barPct}>{pct}%</Text>
+                      </View>
+                    );
+                  })}
+                <Text style={styles.bottleneckHint}>
+                  % = quanto spesso quel filtro FALLISCE tra i setup scartati.
+                </Text>
+              </View>
+            ) : null}
             {stopDbg && (stopDbg.premature + stopDbg.valid + stopDbg.pending) > 0 ? (
               <View style={styles.slipCard} testID="stop-debug-panel">
                 <View style={styles.slipHead}>
@@ -420,6 +465,19 @@ const styles = StyleSheet.create({
   },
   slipSrcText: { color: colors.brand, fontSize: 9, fontWeight: "800" },
   slipPct: { fontWeight: "800", fontSize: font.sm, width: 58, textAlign: "right" },
+  bottleneckLine: { color: colors.onSurfaceSecondary, fontSize: font.sm, lineHeight: 18 },
+  bottleneckHint: { color: colors.onSurfaceTertiary, fontSize: 10, marginTop: 4 },
+  barRow: { flexDirection: "row", alignItems: "center", gap: spacing.sm },
+  barLabel: { color: colors.onSurface, fontSize: 11, width: 96 },
+  barTrack: {
+    flex: 1,
+    height: 8,
+    borderRadius: 4,
+    backgroundColor: colors.surfaceTertiary,
+    overflow: "hidden",
+  },
+  barFill: { height: 8, borderRadius: 4, backgroundColor: colors.error },
+  barPct: { color: colors.onSurfaceSecondary, fontSize: 11, width: 36, textAlign: "right" },
   statsRow: { flexDirection: "row", gap: spacing.sm, flexWrap: "wrap" },
   statBox: {
     flex: 1,
