@@ -49,6 +49,7 @@ TF_MAP = {
     "4h": "4hour",
     "1d": "1day",
 }
+TF_SECONDS = {"15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
 DEFAULT_TIMEFRAMES = ["1h", "4h"]
 CANDLE_LIMIT = 200  # candles fetched per pair/tf
 
@@ -71,7 +72,11 @@ class Config(BaseModel):
     require_volume_confirmation: bool = False
     require_ma_alignment: bool = False
     rr_ratio: float = 2.0
-    sl_padding_pct: float = 1.0  # % beyond FVG edge — extra drawdown margin
+    sl_padding_pct: float = 0.3  # min % buffer beyond FVG edge (fallback)
+    atr_period: int = 14
+    atr_sl_multiplier: float = 1.5  # SL buffer = max(atr_mult*ATR, sl_padding_pct)
+    min_rr_ratio: float = 1.5  # reject setups below this estimated R:R
+    premature_lookahead: int = 20  # candles to check if target would've been hit
     max_pairs_per_scan: int = 200  # cap for MVP performance
     enabled_pairs: list[str] = Field(default_factory=list)  # empty = all matching filter
     excluded_pairs: list[str] = Field(default_factory=list)
@@ -93,6 +98,8 @@ class Signal(BaseModel):
     created_at: str  # ISO string
     fvg_top: float
     fvg_bottom: float
+    atr: float = 0.0  # ATR value at entry (same units as price)
+    atr_multiplier: float = 0.0  # multiplier applied for the SL buffer
     status: str = "active"  # active | hit_tp | hit_sl | expired
     outcome: Optional[str] = None
 
@@ -317,6 +324,30 @@ def volume_spike_ratio(volumes: list[float], period: int = 20) -> float:
     if avg == 0:
         return 1.0
     return volumes[-1] / avg
+
+
+def atr_wilder(
+    highs: list[float], lows: list[float], closes: list[float], period: int = 14
+) -> Optional[float]:
+    """Average True Range (Wilder smoothing). Returns latest ATR value."""
+    n = len(closes)
+    if n < period + 1:
+        return None
+    trs: list[float] = []
+    for i in range(1, n):
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1]),
+        )
+        trs.append(tr)
+    if len(trs) < period:
+        return None
+    atr = sum(trs[:period]) / period
+    for tr in trs[period:]:
+        atr = (atr * (period - 1) + tr) / period
+    return atr
+
 
 
 # ---------------------------------------------------------------------------
@@ -733,6 +764,31 @@ async def close_paper_position(pos: dict[str, Any], exit_price: float, outcome: 
         {"id": pos["signal_id"]},
         {"$set": {"outcome": outcome, "status": "closed"}},
     )
+    # DEBUG: on stop-loss, record data for premature-stop analysis. A background
+    # checker will later look ahead N candles to see if the ORIGINAL target
+    # would have been reached with a wider stop.
+    if outcome == "loss":
+        sig = await db.signals.find_one({"id": pos["signal_id"]}, {"_id": 0}) or {}
+        await db.stop_debug_log.insert_one({
+            "id": str(uuid.uuid4()),
+            "signal_id": pos["signal_id"],
+            "symbol": pos["symbol"],
+            "timeframe": pos.get("timeframe") or sig.get("timeframe", "1h"),
+            "side": pos["side"],
+            "entry": entry,
+            "stop_loss": float(pos["stop_loss"]),
+            "take_profit": float(pos["take_profit"]),
+            "atr_at_entry": float(sig.get("atr", 0.0)),
+            "atr_multiplier": float(sig.get("atr_multiplier", 0.0)),
+            "stop_distance": round(abs(entry - float(pos["stop_loss"])), 8),
+            "stop_distance_in_atr": round(
+                abs(entry - float(pos["stop_loss"])) / sig["atr"], 3
+            ) if sig.get("atr") else None,
+            "closed_at": datetime.now(timezone.utc).isoformat(),
+            "premature_status": "pending",  # pending | premature | valid
+            "would_hit_target": None,
+            "candles_to_target": None,
+        })
     logger.info(
         "Closed paper %s %s pnl=%.2f (%s)",
         pos["symbol"], pos["side"], pnl, outcome,
@@ -802,13 +858,26 @@ async def analyze_pair(symbol: str, tf: str, cfg: Config) -> Optional[Signal]:
         return None
 
     price = closes[-1]
-    # Entry at nearest FVG edge; SL beyond zone with padding
+
+    # ATR on the entry timeframe — basis for a volatility-aware stop.
+    atr = atr_wilder(highs, lows, closes, cfg.atr_period)
+    if atr is None or atr <= 0:
+        return None
+
+    # SL buffer = max(atr_multiplier * ATR, sl_padding_pct % of price).
+    # This keeps the stop beyond the OPPOSITE edge of the FVG so it isn't
+    # taken out by liquidity wicks during the retest.
+    atr_buffer = cfg.atr_sl_multiplier * atr
+    pct_buffer = price * (cfg.sl_padding_pct / 100)
+    sl_buffer = max(atr_buffer, pct_buffer)
+
     if side == "long":
-        entry = fvg["top"]  # top of bullish FVG is the low of candle[i] = upper edge above bottom
-        # Ensure price is at/above FVG zone but hasn't broken far above
+        # Entry at the upper edge of the bullish FVG.
+        entry = fvg["top"]
         if price < fvg["bottom"] or price > entry * 1.05:
             return None
-        stop_loss = fvg["bottom"] * (1 - cfg.sl_padding_pct / 100)
+        # Structural invalidation = bottom of the FVG; stop goes BELOW it.
+        stop_loss = fvg["bottom"] - sl_buffer
         risk = entry - stop_loss
         if risk <= 0:
             return None
@@ -817,11 +886,19 @@ async def analyze_pair(symbol: str, tf: str, cfg: Config) -> Optional[Signal]:
         entry = fvg["bottom"]
         if price > fvg["top"] or price < entry * 0.95:
             return None
-        stop_loss = fvg["top"] * (1 + cfg.sl_padding_pct / 100)
+        # Structural invalidation = top of the FVG; stop goes ABOVE it.
+        stop_loss = fvg["top"] + sl_buffer
         risk = stop_loss - entry
         if risk <= 0:
             return None
         take_profit = entry - risk * cfg.rr_ratio
+
+    # Minimum estimated R:R gate — reject anything below the floor even if
+    # every other filter passed.
+    reward = abs(take_profit - entry)
+    est_rr = reward / risk if risk > 0 else 0
+    if est_rr < cfg.min_rr_ratio:
+        return None
 
     confirmations = ["RSI Divergence", "FVG Zone"]
     strength = 2
@@ -862,6 +939,8 @@ async def analyze_pair(symbol: str, tf: str, cfg: Config) -> Optional[Signal]:
         created_at=datetime.now(timezone.utc).isoformat(),
         fvg_top=round(fvg["top"], 8),
         fvg_bottom=round(fvg["bottom"], 8),
+        atr=round(atr, 8),
+        atr_multiplier=cfg.atr_sl_multiplier,
     )
 
 
@@ -991,6 +1070,68 @@ async def paper_monitor_loop() -> None:
         await asyncio.sleep(3)
 
 
+async def resolve_premature_stops() -> None:
+    """For each pending SL log, look ahead N candles to see if the ORIGINAL
+    target would have been reached — i.e. whether the stop was premature."""
+    cfg = await get_config()
+    lookahead = cfg.premature_lookahead
+    pending = await db.stop_debug_log.find(
+        {"premature_status": "pending"}, {"_id": 0}
+    ).to_list(500)
+    for log in pending:
+        tf = log.get("timeframe", "1h")
+        tf_sec = TF_SECONDS.get(tf, 3600)
+        closed_epoch = datetime.fromisoformat(log["closed_at"]).timestamp()
+        candles = await kucoin.get_klines(log["symbol"], tf)
+        # candles: [t, o, c, h, l, v] ascending, t in seconds
+        after = [c for c in candles if c[0] >= closed_epoch]
+        if not after:
+            continue
+        window = after[:lookahead]
+        tp = log["take_profit"]
+        side = log["side"]
+        hit_idx = None
+        for i, c in enumerate(window):
+            high, low = c[3], c[4]
+            if side == "long" and high >= tp:
+                hit_idx = i + 1
+                break
+            if side == "short" and low <= tp:
+                hit_idx = i + 1
+                break
+        # Only conclude once we either found a hit or the full window elapsed
+        elapsed = time.time() - closed_epoch
+        window_complete = elapsed >= lookahead * tf_sec
+        if hit_idx is not None:
+            await db.stop_debug_log.update_one(
+                {"id": log["id"]},
+                {"$set": {
+                    "premature_status": "premature",
+                    "would_hit_target": True,
+                    "candles_to_target": hit_idx,
+                }},
+            )
+        elif window_complete:
+            await db.stop_debug_log.update_one(
+                {"id": log["id"]},
+                {"$set": {
+                    "premature_status": "valid",
+                    "would_hit_target": False,
+                    "candles_to_target": None,
+                }},
+            )
+
+
+async def premature_stop_loop() -> None:
+    await asyncio.sleep(30)
+    while True:
+        try:
+            await resolve_premature_stops()
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Premature stop checker error: %s", e)
+        await asyncio.sleep(120)
+
+
 # ---------------------------------------------------------------------------
 # FastAPI app & routes
 # ---------------------------------------------------------------------------
@@ -999,10 +1140,12 @@ async def lifespan(_app: FastAPI):
     scan_task = asyncio.create_task(scheduler_loop())
     monitor_task = asyncio.create_task(paper_monitor_loop())
     ws_task = asyncio.create_task(price_feed.run())
+    premature_task = asyncio.create_task(premature_stop_loop())
     yield
     scan_task.cancel()
     monitor_task.cancel()
     ws_task.cancel()
+    premature_task.cancel()
     await kucoin.close()
     client.close()
 
@@ -1236,6 +1379,32 @@ async def feed_status() -> dict[str, Any]:
         "ws_connected": price_feed._connected,
         "subscribed": sorted(price_feed._subscribed),
         "cached_symbols": len(price_feed.prices),
+    }
+
+
+@api.get("/stop-debug/log")
+async def stop_debug_log(limit: int = 100) -> dict[str, Any]:
+    cursor = db.stop_debug_log.find({}, {"_id": 0}).sort("closed_at", -1).limit(limit)
+    logs = await cursor.to_list(length=limit)
+    total = len(logs)
+    premature = sum(1 for l in logs if l.get("premature_status") == "premature")
+    valid = sum(1 for l in logs if l.get("premature_status") == "valid")
+    pending = sum(1 for l in logs if l.get("premature_status") == "pending")
+    resolved = premature + valid
+    premature_rate = round((premature / resolved) * 100, 1) if resolved else 0.0
+    avg_atr_dist = [
+        l["stop_distance_in_atr"] for l in logs if l.get("stop_distance_in_atr")
+    ]
+    return {
+        "logs": logs,
+        "count": total,
+        "premature": premature,
+        "valid": valid,
+        "pending": pending,
+        "premature_rate": premature_rate,
+        "avg_stop_distance_atr": round(sum(avg_atr_dist) / len(avg_atr_dist), 3)
+        if avg_atr_dist
+        else 0.0,
     }
 
 

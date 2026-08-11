@@ -30,19 +30,29 @@ export default function HistoryScreen() {
     avg_slippage_pct: number;
   } | null>(null);
   const [feed, setFeed] = useState<{ ws_connected: boolean; cached_symbols: number } | null>(null);
+  const [stopDbg, setStopDbg] = useState<{
+    premature: number;
+    valid: number;
+    pending: number;
+    premature_rate: number;
+    avg_stop_distance_atr: number;
+    logs: any[];
+  } | null>(null);
 
   const load = useCallback(async () => {
     try {
-      const [s, st, sl, fd] = await Promise.all([
+      const [s, st, sl, fd, sd] = await Promise.all([
         api.signals({ status: "all" }),
         api.historyStats(),
         api.slippageLog(),
         api.feedStatus(),
+        api.stopDebugLog(),
       ]);
       setItems(s.signals);
       setStats(st);
       setSlip(sl);
       setFeed(fd);
+      setStopDbg(sd);
     } catch {
       // silent
     } finally {
@@ -132,7 +142,84 @@ export default function HistoryScreen() {
           keyExtractor={(i) => i.id}
           contentContainerStyle={styles.listPad}
           ListHeaderComponent={
-            slip && slip.logs.length > 0 ? (
+            <>
+            {stopDbg && (stopDbg.premature + stopDbg.valid + stopDbg.pending) > 0 ? (
+              <View style={styles.slipCard} testID="stop-debug-panel">
+                <View style={styles.slipHead}>
+                  <Ionicons name="bug" size={16} color={colors.brand} />
+                  <Text style={styles.slipTitle}>Stop-Loss Debug</Text>
+                </View>
+                <View style={styles.slipStats}>
+                  <View style={styles.slipStat}>
+                    <Text style={styles.slipLabel}>Premature</Text>
+                    <Text style={[styles.slipValue, { color: colors.error }]}>
+                      {stopDbg.premature}
+                    </Text>
+                  </View>
+                  <View style={styles.slipStat}>
+                    <Text style={styles.slipLabel}>Premature %</Text>
+                    <Text style={[styles.slipValue, { color: colors.error }]}>
+                      {stopDbg.premature_rate}%
+                    </Text>
+                  </View>
+                  <View style={styles.slipStat}>
+                    <Text style={styles.slipLabel}>Avg stop</Text>
+                    <Text style={styles.slipValue}>
+                      {stopDbg.avg_stop_distance_atr}×ATR
+                    </Text>
+                  </View>
+                  <View style={styles.slipStat}>
+                    <Text style={styles.slipLabel}>Pending</Text>
+                    <Text style={styles.slipValue}>{stopDbg.pending}</Text>
+                  </View>
+                </View>
+                {stopDbg.logs.slice(0, 5).map((l) => (
+                  <View key={l.id} style={styles.slipRow}>
+                    <Text style={styles.slipSym}>{l.symbol}</Text>
+                    <Text style={styles.slipDetail}>
+                      {l.stop_distance_in_atr ? `${l.stop_distance_in_atr}×ATR` : "—"}
+                    </Text>
+                    <View
+                      style={[
+                        styles.slipSrcTag,
+                        {
+                          backgroundColor:
+                            l.premature_status === "premature"
+                              ? "rgba(255,85,74,0.15)"
+                              : l.premature_status === "valid"
+                              ? "rgba(0,192,118,0.15)"
+                              : colors.surfaceTertiary,
+                        },
+                      ]}
+                    >
+                      <Text
+                        style={[
+                          styles.slipSrcText,
+                          {
+                            color:
+                              l.premature_status === "premature"
+                                ? colors.error
+                                : l.premature_status === "valid"
+                                ? colors.success
+                                : colors.onSurfaceTertiary,
+                          },
+                        ]}
+                      >
+                        {l.premature_status === "premature"
+                          ? "PREMATURE"
+                          : l.premature_status === "valid"
+                          ? "VALID"
+                          : "PENDING"}
+                      </Text>
+                    </View>
+                    <Text style={styles.slipPct}>
+                      {l.candles_to_target ? `${l.candles_to_target}c` : ""}
+                    </Text>
+                  </View>
+                ))}
+              </View>
+            ) : null}
+            {slip && slip.logs.length > 0 ? (
               <View style={styles.slipCard} testID="slippage-panel">
                 <View style={styles.slipHead}>
                   <Ionicons name="swap-vertical" size={16} color={colors.brand} />
@@ -191,7 +278,8 @@ export default function HistoryScreen() {
                   </View>
                 ))}
               </View>
-            ) : null
+            ) : null}
+            </>
           }
           refreshControl={
             <RefreshControl

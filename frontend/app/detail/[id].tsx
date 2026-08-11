@@ -136,6 +136,22 @@ export default function DetailScreen() {
             color={colors.onSurface}
           />
         </View>
+        {signal.atr ? (
+          <View style={styles.gridRow}>
+            <Metric
+              label="ATR"
+              value={formatPrice(signal.atr)}
+              color={colors.onSurface}
+            />
+            <Metric
+              label="Stop distance"
+              value={`${(
+                Math.abs(signal.entry - signal.stop_loss) / signal.atr
+              ).toFixed(2)}×ATR`}
+              color={colors.brand}
+            />
+          </View>
+        ) : null}
 
         <View style={styles.ctxCard}>
           <Text style={styles.ctxTitle}>Signal Reasoning</Text>

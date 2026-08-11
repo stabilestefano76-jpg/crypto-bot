@@ -32,6 +32,8 @@ export type Signal = {
   created_at: string;
   fvg_top: number;
   fvg_bottom: number;
+  atr?: number;
+  atr_multiplier?: number;
   status: string;
   outcome?: string | null;
 };
@@ -211,4 +213,27 @@ export const api = {
     req<{ ws_connected: boolean; subscribed: string[]; cached_symbols: number }>(
       "/feed/status"
     ),
+  stopDebugLog: () =>
+    req<{
+      logs: {
+        id: string;
+        symbol: string;
+        side: string;
+        entry: number;
+        stop_loss: number;
+        take_profit: number;
+        atr_at_entry: number;
+        stop_distance_in_atr: number | null;
+        premature_status: string;
+        would_hit_target: boolean | null;
+        candles_to_target: number | null;
+        closed_at: string;
+      }[];
+      count: number;
+      premature: number;
+      valid: number;
+      pending: number;
+      premature_rate: number;
+      avg_stop_distance_atr: number;
+    }>("/stop-debug/log"),
 };

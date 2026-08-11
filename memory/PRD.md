@@ -29,6 +29,16 @@ Scheduler asyncio in background esegue `run_scan()` ogni `scan_interval_minutes`
 - **(tabs)/settings** — Form completo per parametri + sezione Paper Trading (auto-execute, initial capital, risk %, max positions) + disclaimer
 - **detail/[id]** — Grafico candlestick SVG con zone FVG, linee entry/SL/TP, sub-grafico RSI + bottone sticky "Execute Paper"
 
+## Stop-Loss ATR-based (overhaul)
+Per ridurre gli stop prematuri:
+- **ATR (Wilder, periodo 14 configurabile)** calcolato sul timeframe di entry
+- SL posizionato **oltre il bordo opposto della zona FVG** (long: sotto il fondo; short: sopra il top) con buffer = **max(1.5×ATR, sl_padding_pct 0.3%)** → resistente ai wick di liquidità nel retest
+- **Gate R:R minimo 1:1.5**: i setup sotto la soglia vengono scartati prima dell'apertura
+- **Stop-debug log**: ogni stop-loss salva entry/stop/ATR/distanza-in-ATR; un checker in background (ogni 120s) guarda avanti fino a `premature_lookahead` candele (default 20) e marca lo stop `premature` (il target sarebbe stato raggiunto) o `valid`. Endpoint `/api/stop-debug/log` con premature_rate e avg_stop_distance_atr
+- Config aggiuntivi: `atr_period`, `atr_sl_multiplier`, `min_rr_ratio`, `premature_lookahead`
+- **Percorso unico di calcolo SL** in `analyze_pair` (confluenza RSI-divergence + FVG): nessun modulo duplicato
+- UI: pannello "Stop-Loss Debug" nella History + metriche ATR/Stop-distance nel Detail
+
 ## Real-time & Live-trading safety (WebSocket)
 - **KuCoin WebSocket** (`/api/v1/bullet-public` → wss ticker feed): cache prezzi in tempo reale, auto-subscribe ai simboli delle posizioni aperte, ping/reconnect automatici, fallback REST se il socket cade. Monitor SL/TP ora gira ogni **3s** sui prezzi live invece dei 60s REST.
 - **Esecuzione immediata**: la posizione viene riempita al prezzo di mercato live (`fill_price`) nell'istante del segnale, non al prezzo pianificato.

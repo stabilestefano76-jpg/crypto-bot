@@ -1,0 +1,45 @@
+{
+  "summary": "Stop-loss overhaul verified. Backend: 11/11 pytest passing on public URL. New Config fields (atr_period=14, atr_sl_multiplier=1.5, min_rr_ratio=1.5, premature_lookahead=20, sl_padding_pct default persists) are present, GET/PUT persist correctly. GET /api/signals now emits `atr` and `atr_multiplier`; every NEW signal (produced this iteration) satisfies: (a) |entry-stop|/ATR >= 1.5, (b) LONG stop_loss < fvg_bottom / SHORT stop_loss > fvg_top, (c) reward/risk >= 1.5. Verified live examples (MEGA-USDT 4h short: entry 0.03465, SL 0.03725, ATR 0.0008359 -> 3.11xATR, R:R 1:2). GET /api/stop-debug/log returns full schema {logs,count,premature,valid,pending,premature_rate,avg_stop_distance_atr}. /api/slippage/log and /api/feed/status still healthy (regression). POST /api/paper/execute opens position with correct SL/TP; manual close endpoint works (real SL trigger requires live price hit — schema verified instead). Frontend (mobile 390x844): History tab shows LIVE WS badge, Slippage Monitor panel (5 fills, wins visible). Stop-Loss Debug panel is intentionally not rendered while stop_debug_log is empty (no true SL hits yet — acceptable per spec). Detail screen for a signal with `atr` displays ATR value and `Stop distance` (xATR) metrics as required. No red screens, no runtime errors.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "GET /api/signals?status=active", "issue": "40 of 47 active signals are LEGACY (produced before this iteration) and therefore lack `atr`/`atr_multiplier` fields. They also carry a `15m` timeframe not in current config timeframes. Because dedup only replaces active signals when a NEW signal for same symbol+timeframe+side is found, these keep lingering as `active`. Detail screen will render without the ATR panel (no crash). Recommend expiring signals missing `atr` at startup or on next scan."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": [
+      {"component": "global (react-native-web)", "issue": "Deprecation warning: 'props.pointerEvents is deprecated. Use style.pointerEvents'. Comes from a dependency (react-native-svg / expo-router). Non-blocking, carried over from iteration 1."}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_stop_loss_v2.py",
+    "/app/backend/tests/test_kusignal.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "Consider expiring pre-ATR legacy signals on startup: db.signals.update_many({status:'active', atr:{$exists:false}}, {$set:{status:'expired'}}). Keeps GET /api/signals clean and prevents Detail screen showing signals without ATR/Stop-distance metrics.",
+    "Optional: also expire signals whose timeframe is not in current cfg.timeframes."
+  ],
+  "critical_code_review_comments": [
+    "analyze_pair(): single path for entry/stop/TP with correct ATR-based buffer max(atr_mult*ATR, sl_padding_pct*price) applied BEYOND FVG bottom (long) / FVG top (short). R:R gate `est_rr < cfg.min_rr_ratio` correctly rejects sub-1.5 setups. Confirmed by 11 live signals all >=1.5xATR and R:R >=1.5.",
+    "close_paper_position(): stop_debug_log entry created only on outcome=='loss', with atr_at_entry, stop_distance_in_atr, and premature_status='pending'. Correct.",
+    "resolve_premature_stops(): correctly reads klines ascending, uses TF_SECONDS lookup, only concludes 'valid' once window_complete elapses — matches design.",
+    "GET /api/stop-debug/log: proper aggregate math; premature_rate uses resolved (=premature+valid) denominator — good.",
+    "MongoDB _id excluded via projection on every read endpoint. No serialization issues observed.",
+    "Legacy signals without `atr` will crash the analytics assumption of any client code that dereferences signal.atr — frontend guards this with `signal.atr ?`, good; server-side monitor should also purge them."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_stop_loss_v2.py",
+    "/app/test_reports/pytest/pytest_results.xml",
+    "/app/test_reports/iteration_2.json"
+  ],
+  "success_rate": {"backend": "100%", "frontend": "100%"},
+  "seed_data_creation": "Triggered POST /api/scan and waited 45s to generate fresh ATR-annotated signals for validation (MEGA-USDT, ARB-USDT, SUI-USDT, etc.).",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Public URL: https://divergence-trader-1.preview.emergentagent.com. New Signal fields: atr, atr_multiplier. New Config fields: atr_period, atr_sl_multiplier, min_rr_ratio, premature_lookahead, sl_padding_pct. Stop-debug log endpoint: GET /api/stop-debug/log. Stop-Loss Debug UI panel in History tab renders only when logs exist (needs a real paper SL hit, which requires live price to touch SL — cannot be reliably forced in a short test window). Detail screen shows ATR + 'Stop distance' (xATR) only when signal.atr is truthy. Legacy active signals lacking atr coexist with new signals — main agent should purge or expire them.",
+  "rca_of_issue": "None. All new stop-loss requirements are enforced correctly at the single entry point analyze_pair(). Only observation: legacy signals from prior iterations remain 'active' and lack the new atr fields; dedup replaces same symbol+tf+side but leaves other legacy rows alone."
+}
