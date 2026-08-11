@@ -29,6 +29,16 @@ Scheduler asyncio in background esegue `run_scan()` ogni `scan_interval_minutes`
 - **(tabs)/settings** — Form completo per parametri + sezione Paper Trading (auto-execute, initial capital, risk %, max positions) + disclaimer
 - **detail/[id]** — Grafico candlestick SVG con zone FVG, linee entry/SL/TP, sub-grafico RSI + bottone sticky "Execute Paper"
 
+## FVG Reversal Entry (estensione condizioni, non sostituzione)
+Nuova condizione di entry **integrata nel sistema a punteggio esistente** (stesso calcolo di soglia, nessun secondo scoring):
+- **"FVG Reversal"** = inversione confermata dentro la zona FVG, con peso configurabile (default 2 → max score ora 8)
+- Sotto-segnali (riusano la logica esistente dove possibile): **Rejection Candle** (wick lungo nella direzione del fill), **Reversal Volume** (spike vs media), **Change of Character** (rottura mini swing locale), **RSI Divergence (FVG)** (riusa `detect_rsi_divergence`). Conferma se ≥ `reversal_min_signals` (default 2)
+- **Target sul fill**: quando la condizione è attiva, il take-profit diventa il bordo opposto della FVG (o il 50% "consequent encroachment", via `fvg_fill_mode`). R:R rivalidato con lo **stop ATR invariato**; scarta se sotto `min_rr_ratio` o se il target è già superato/troppo vicino
+- **Invalidazione**: se il prezzo rompe la FVG dal lato opposto al fill (chiusura oltre il bordo strutturale), il setup viene scartato subito
+- **Logging**: i sotto-segnali contribuenti sono salvati su ogni segnale (`reversal_signals`) e nei setup scartati (stesso formato del debug esistente)
+- **Stop-loss ATR/strutturale: NON modificato.** Sistema a punteggio: NON duplicato
+- UI: peso "Punti inversione FVG" + sezione "FVG Reversal Entry" (min segnali, wick ratio, target fill) in Settings; chip dei sotto-segnali nel Detail
+
 ## Sistema a punteggio (sostituisce logica AND rigida)
 Un trade si apre in base a un **punteggio di confluenza** pesato, non richiedendo più tutti i filtri insieme:
 - Pesi (tutti configurabili da Settings): FVG=2, RSI divergence=2, Volume=1, EMA cross=1 → max 6

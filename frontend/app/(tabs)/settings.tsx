@@ -140,6 +140,13 @@ export default function SettingsScreen() {
               testID="input-score-ma"
             />
             <NumRow
+              label="Punti inversione FVG"
+              value={cfg.score_fvg_reversal}
+              onChange={(v) => update({ score_fvg_reversal: v })}
+              step={0.5}
+              testID="input-score-reversal"
+            />
+            <NumRow
               label="Soglia minima apertura"
               value={cfg.min_score_threshold}
               onChange={(v) => update({ min_score_threshold: v })}
@@ -154,7 +161,8 @@ export default function SettingsScreen() {
                     cfg.score_fvg +
                     cfg.score_rsi_divergence +
                     cfg.score_volume +
-                    cfg.score_ma_cross
+                    cfg.score_ma_cross +
+                    cfg.score_fvg_reversal
                   ).toFixed(1)}
                 </Text>
               </Text>
@@ -171,6 +179,55 @@ export default function SettingsScreen() {
               onChange={(v) => update({ fvg_lookback: v })}
               testID="input-fvg-lookback"
             />
+          </Section>
+
+          <Section title="FVG Reversal Entry">
+            <View style={styles.scoreHint}>
+              <Ionicons name="git-compare" size={14} color={colors.brand} />
+              <Text style={styles.scoreHintText}>
+                Riconosce l&apos;inversione dentro la FVG (rejection candle, volume,
+                change of character, divergenza RSI). Se attiva, il target diventa
+                il fill della zona.
+              </Text>
+            </View>
+            <NumRow
+              label="Min. segnali inversione"
+              value={cfg.reversal_min_signals}
+              onChange={(v) => update({ reversal_min_signals: v })}
+              testID="input-reversal-min"
+            />
+            <NumRow
+              label="Rejection wick ratio"
+              value={cfg.reversal_rejection_wick_ratio}
+              onChange={(v) => update({ reversal_rejection_wick_ratio: v })}
+              step={0.1}
+              testID="input-reversal-wick"
+            />
+            <View style={styles.formRow}>
+              <Text style={styles.formLabel}>Target fill</Text>
+              <View style={{ flexDirection: "row", gap: 6 }}>
+                {(["opposite_edge", "midpoint"] as const).map((m) => {
+                  const active = cfg.fvg_fill_mode === m;
+                  return (
+                    <Pressable
+                      key={m}
+                      onPress={() => update({ fvg_fill_mode: m })}
+                      style={[styles.fillChip, active && styles.fillChipActive]}
+                      testID={`fill-mode-${m}`}
+                    >
+                      <Text
+                        style={[
+                          styles.fillChipText,
+                          active && { color: colors.brand },
+                        ]}
+                      >
+                        {m === "opposite_edge" ? "Bordo opp." : "50% (CE)"}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+            </View>
           </Section>
 
           <Section title="Scan Engine">
@@ -594,6 +651,16 @@ const styles = StyleSheet.create({
     borderTopColor: colors.divider,
   },
   maxScoreText: { color: colors.onSurfaceSecondary, fontSize: font.sm },
+  fillChip: {
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 8,
+    borderRadius: radius.sm,
+    backgroundColor: colors.surfaceTertiary,
+    borderWidth: 1,
+    borderColor: colors.border,
+  },
+  fillChipActive: { borderColor: colors.brand, backgroundColor: colors.brandTertiary },
+  fillChipText: { color: colors.onSurfaceSecondary, fontWeight: "700", fontSize: font.sm },
   saveBtn: {
     flexDirection: "row",
     alignItems: "center",

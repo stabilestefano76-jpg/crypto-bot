@@ -36,6 +36,7 @@ export type Signal = {
   fvg_bottom: number;
   atr?: number;
   atr_multiplier?: number;
+  reversal_signals?: string[];
   status: string;
   outcome?: string | null;
 };
@@ -65,9 +66,13 @@ export type Config = {
   score_rsi_divergence: number;
   score_volume: number;
   score_ma_cross: number;
+  score_fvg_reversal: number;
   min_score_threshold: number;
   signal_validity_candles: number;
   fvg_lookback: number;
+  reversal_min_signals: number;
+  reversal_rejection_wick_ratio: number;
+  fvg_fill_mode: string;
   max_pairs_per_scan: number;
   enabled_pairs: string[];
   excluded_pairs: string[];

@@ -1,0 +1,47 @@
+{
+  "summary": "FVG Reversal extension (additive) verified end-to-end. Backend 7/7 pytest passing on public URL. GET /api/config now exposes: score_fvg_reversal=2.0, reversal_min_signals=2, reversal_rejection_wick_ratio=1.5, fvg_fill_mode='opposite_edge'. PUT /api/config persists changes (verified: set fvg_fill_mode='midpoint' + reversal_min_signals=1 -> GET returns them; then restored). GET /api/signals: every signal now carries a 'reversal_signals' list; freshly-scanned signals correctly show max_score=8.0 (=score_fvg+score_rsi_divergence+score_volume+score_ma_cross+score_fvg_reversal). POST /api/scan repopulates setup_debug_log; among 231 discarded setups, 'FVG Reversal' appears in fail_counts and 66 discarded setups contain reversal sub-signals such as 'Change of Character' and 'Rejection Candle' (schema field 'reversal_signals' present on every log entry). GET /api/setup-debug/log returns full schema with 'FVG Reversal' listed under fail_counts. REGRESSION: ATR-based structural stop unchanged: every fresh signal has atr>0, LONG stop_loss<fvg_bottom / SHORT stop_loss>fvg_top for non-reversal signals, all with est R:R >= min_rr_ratio (1.5). /api/stop-debug/log, /api/slippage/log, /api/feed/status, POST /api/paper/execute/{signal_id} all still 200. Frontend (390x844 mobile web /settings): 'Scoring System' section shows new 'Punti inversione FVG' input (input-score-reversal) and live max-score readout now reads '8.0'. New 'FVG Reversal Entry' section renders input-reversal-min, input-reversal-wick, and the fill-mode toggle (fill-mode-opposite_edge / fill-mode-midpoint) — toggling to midpoint then pressing save-config-button shows 'Saved!'. No red screens; only carried-over 'props.pointerEvents deprecated' warning from a dep, non-blocking. Note: no active signal currently has 'FVG Reversal' in confirmations (expected — the spec allows this because confirmed reversals are rare); the frontend chip rendering in /app/frontend/app/detail/[id].tsx guards on `c === 'FVG Reversal' && signal.reversal_signals.length > 0` and looks correct by code review, but could not be visually exercised at test time.",
+  "backend_issues": {
+    "critical": [],
+    "minor": [
+      {"endpoint": "GET /api/signals", "issue": "Stale active signals from previous iteration (e.g. MEGA-USDT 4h short) still expose max_score=6.0 because they were persisted before this feature and never got replaced by a fresh scan on the same symbol/tf/side. New signals correctly show max_score=8.0. Non-blocking — will self-heal as scans run; main agent may optionally run a one-off migration `db.signals.update_many({status:'active', max_score: {$lt: 8}}, {$set:{status:'expired'}})` to clean the display immediately."}
+    ]
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": [
+      {"component": "react-native-web (dependency)", "issue": "Deprecation warning: 'props.pointerEvents is deprecated. Use style.pointerEvents'. Carried over from previous iterations; comes from a dep. Non-blocking."}
+    ]
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_fvg_reversal.py",
+    "/app/backend/tests/test_scoring_system.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [
+    "Optional: expire stale active signals with max_score<8.0 so the UI never mixes old (6.0) and new (8.0) max scores together.",
+    "Optional: to visually verify the reversal_signals chips on Detail screen, PUT /api/config reversal_min_signals=1 and POST /api/scan; open a signal whose confirmations include 'FVG Reversal'."
+  ],
+  "critical_code_review_comments": [
+    "detect_fvg_reversal() reuses detect_rsi_divergence (no duplication); rejection wick, volume spike, change-of-character, and RSI divergence all funnel into the single `signals` list — clean.",
+    "analyze_pair(): 'FVG Reversal' added via the SAME add() scorer — no second scoring system. Correct.",
+    "FVG-fill target override only fires when reversal['confirmed'] is True; ATR/structural stop_loss expression is IDENTICAL to the base path (fvg_bottom - sl_buffer / fvg_top + sl_buffer). Confirmed unchanged.",
+    "Invalidation: LONG discards if closes[-1] < fvg_bottom, SHORT if closes[-1] > fvg_top (opposite-side sweep). Target-already-passed short-circuit present.",
+    "Re-validation: min_rr_ratio applied a second time after switching entry to current price and target to fill edge — correct.",
+    "setup_debug_log entries include 'reversal_signals' list (verified: 66/231 discarded setups have sub-signals).",
+    "Frontend Signal type extended with reversal_signals; detail screen renders chips only when confirmation 'FVG Reversal' is present AND array non-empty — safe.",
+    "Settings max-score readout dynamically sums all five weights including cfg.score_fvg_reversal — visually verified 8.0."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_fvg_reversal.py",
+    "/app/test_reports/pytest/pytest_results.xml",
+    "/app/test_reports/iteration_4.json"
+  ],
+  "success_rate": {"backend": "100%", "frontend": "100%"},
+  "seed_data_creation": "Triggered POST /api/scan; observed 32 new signals + 231 discarded setups with 66 carrying reversal sub-signals. Config was momentarily flipped to fvg_fill_mode='midpoint' during frontend save test, then restored to 'opposite_edge'.",
+  "retest_needed": false,
+  "should_main_agent_self_test": true,
+  "context_for_next_testing_agent": "Public URL: https://divergence-trader-1.preview.emergentagent.com. New config fields: score_fvg_reversal (default 2.0), reversal_min_signals (2), reversal_rejection_wick_ratio (1.5), fvg_fill_mode ('opposite_edge'|'midpoint'). New Signal field: reversal_signals: list[str]. max_score is now 8.0 by default. Frontend testIDs added on /settings: input-score-reversal, input-reversal-min, input-reversal-wick, fill-mode-opposite_edge, fill-mode-midpoint. On detail screen the reversal chips render inline under the 'FVG Reversal' confirmation block. Confirmed reversal signals are rare; to force one, PUT reversal_min_signals=1 and POST /api/scan.",
+  "rca_of_issue": "N/A — additive extension verified working. The only observation is a data-migration artifact where legacy active signals still have the pre-feature max_score=6.0 in DB; harmless because new scans emit max_score=8.0."
+}

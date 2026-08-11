@@ -82,9 +82,14 @@ class Config(BaseModel):
     score_rsi_divergence: float = 2.0
     score_volume: float = 1.0
     score_ma_cross: float = 1.0
+    score_fvg_reversal: float = 2.0  # NEW: confirmed reversal inside FVG zone
     min_score_threshold: float = 4.0
     signal_validity_candles: int = 5  # a condition counts if it happened within N bars
     fvg_lookback: int = 40  # how far back to look for an open FVG
+    # --- FVG reversal / fill entry extension ---
+    reversal_min_signals: int = 2  # min reversal sub-signals to confirm
+    reversal_rejection_wick_ratio: float = 1.5  # wick/body ratio for rejection candle
+    fvg_fill_mode: str = "opposite_edge"  # "opposite_edge" or "midpoint" (50% CE)
     max_pairs_per_scan: int = 200  # cap for MVP performance
     enabled_pairs: list[str] = Field(default_factory=list)  # empty = all matching filter
     excluded_pairs: list[str] = Field(default_factory=list)
@@ -103,6 +108,7 @@ class Signal(BaseModel):
     strength: int  # number of satisfied conditions
     score: float = 0.0  # weighted confluence score
     max_score: float = 0.0  # max achievable score with active weights
+    reversal_signals: list[str] = Field(default_factory=list)  # FVG reversal contributors
     rsi_value: float
     volume_ratio: float
     created_at: str  # ISO string
@@ -357,6 +363,73 @@ def atr_wilder(
     for tr in trs[period:]:
         atr = (atr * (period - 1) + tr) / period
     return atr
+
+
+def detect_fvg_reversal(
+    opens: list[float],
+    highs: list[float],
+    lows: list[float],
+    closes: list[float],
+    volumes: list[float],
+    rsis: list[Optional[float]],
+    fvg: dict[str, Any],
+    side: str,
+    cfg: Config,
+) -> dict[str, Any]:
+    """Detect a confirmed reversal INSIDE the FVG zone (price rejecting the
+    zone edge to go fill it), reusing existing RSI-divergence logic.
+
+    Returns {"confirmed": bool, "signals": [names]}.
+    'side' == 'long' means a bullish FVG acting as support (expected bounce up);
+    'short' means a bearish FVG acting as resistance (expected drop down).
+    """
+    signals: list[str] = []
+    n = len(closes)
+    if n < 8:
+        return {"confirmed": False, "signals": signals}
+
+    o, h, l, c = opens[-1], highs[-1], lows[-1], closes[-1]
+    body = abs(c - o)
+    if body <= 0:
+        body = (h - l) * 0.25 or 1e-9
+    upper_wick = h - max(o, c)
+    lower_wick = min(o, c) - l
+    ratio = cfg.reversal_rejection_wick_ratio
+
+    # 1) Rejection candle: long wick in the fill direction.
+    if side == "long":
+        if lower_wick >= ratio * body and lower_wick > upper_wick:
+            signals.append("Rejection Candle")
+    else:
+        if upper_wick >= ratio * body and upper_wick > lower_wick:
+            signals.append("Rejection Candle")
+
+    # 2) Volume spike on the rejection candle.
+    if volume_spike_ratio(volumes, cfg.volume_ma_period) >= cfg.volume_spike_multiplier:
+        signals.append("Reversal Volume")
+
+    # 3) Change of character: break of the local mini swing on the last bars.
+    window = max(3, cfg.pivot_window)
+    prior = slice(-(window + 1), -1)
+    if side == "long":
+        local_high = max(highs[prior]) if highs[prior] else h
+        if c > local_high:
+            signals.append("Change of Character")
+    else:
+        local_low = min(lows[prior]) if lows[prior] else l
+        if c < local_low:
+            signals.append("Change of Character")
+
+    # 4) RSI divergence in the FVG direction (reuse existing detector).
+    divergence = detect_rsi_divergence(closes, rsis, cfg.pivot_window)
+    if (divergence == "bullish" and side == "long") or (
+        divergence == "bearish" and side == "short"
+    ):
+        signals.append("RSI Divergence (FVG)")
+
+    confirmed = len(signals) >= cfg.reversal_min_signals
+    return {"confirmed": confirmed, "signals": signals}
+
 
 
 
@@ -849,6 +922,7 @@ async def analyze_pair(symbol: str, tf: str, cfg: Config) -> Optional[Signal]:
     highs = [c[3] for c in candles]
     lows = [c[4] for c in candles]
     vols = [c[5] for c in candles]
+    opens = [c[1] for c in candles]
 
     rsis = rsi_wilder(closes, cfg.rsi_period)
 
@@ -938,8 +1012,19 @@ async def analyze_pair(symbol: str, tf: str, cfg: Config) -> Optional[Signal]:
         )
     add("EMA Trend", ma_ok, cfg.score_ma_cross)
 
+    # NEW scored condition: confirmed reversal INSIDE the FVG zone. Reuses the
+    # existing RSI-divergence detector; contributes into THIS same score.
+    reversal = detect_fvg_reversal(
+        opens, highs, lows, closes, vols, rsis, fvg, side, cfg
+    )
+    add("FVG Reversal", reversal["confirmed"], cfg.score_fvg_reversal)
+
     max_score = (
-        cfg.score_fvg + cfg.score_rsi_divergence + cfg.score_volume + cfg.score_ma_cross
+        cfg.score_fvg
+        + cfg.score_rsi_divergence
+        + cfg.score_volume
+        + cfg.score_ma_cross
+        + cfg.score_fvg_reversal
     )
 
     if score < cfg.min_score_threshold:
@@ -957,11 +1042,50 @@ async def analyze_pair(symbol: str, tf: str, cfg: Config) -> Optional[Signal]:
                 "passed": passed,
                 "failed": failed,
                 "breakdown": breakdown,
+                "reversal_signals": reversal["signals"],
                 "at": datetime.now(timezone.utc).isoformat(),
             })
         except Exception:  # noqa: BLE001
             pass
         return None
+
+    # ---- FVG-fill target override (only when reversal is an ACTIVE condition) ----
+    # The ATR/structural stop is left UNCHANGED. Only entry/target adapt to the
+    # reversal-to-fill scenario, then R:R is re-validated with the same stop.
+    reversal_signals: list[str] = reversal["signals"] if reversal["confirmed"] else []
+    if reversal["confirmed"]:
+        span = fvg["top"] - fvg["bottom"]
+        midpoint = fvg["bottom"] + span * 0.5
+        if side == "long":
+            fill_target = fvg["top"] if cfg.fvg_fill_mode == "opposite_edge" else midpoint
+            # Invalidation: price swept the FVG on the opposite side of the fill.
+            if closes[-1] < fvg["bottom"]:
+                return None
+            # Target already reached or too close → discard.
+            if price >= fill_target:
+                return None
+            entry = price  # enter at the rejection close, inside the zone
+            stop_loss = fvg["bottom"] - sl_buffer  # UNCHANGED ATR/structural stop
+            risk = entry - stop_loss
+            take_profit = fill_target
+        else:
+            fill_target = fvg["bottom"] if cfg.fvg_fill_mode == "opposite_edge" else midpoint
+            if closes[-1] > fvg["top"]:
+                return None
+            if price <= fill_target:
+                return None
+            entry = price
+            stop_loss = fvg["top"] + sl_buffer  # UNCHANGED ATR/structural stop
+            risk = stop_loss - entry
+            take_profit = fill_target
+
+        if risk <= 0:
+            return None
+        reward = abs(take_profit - entry)
+        est_rr = reward / risk if risk > 0 else 0
+        # Re-apply the SAME configured minimum R:R gate.
+        if est_rr < cfg.min_rr_ratio:
+            return None
 
     return Signal(
         symbol=symbol,
@@ -975,6 +1099,7 @@ async def analyze_pair(symbol: str, tf: str, cfg: Config) -> Optional[Signal]:
         strength=len(passed),
         score=round(score, 2),
         max_score=round(max_score, 2),
+        reversal_signals=reversal_signals,
         rsi_value=round(rsis[-1] or 0, 2),
         volume_ratio=round(vol_ratio, 2),
         created_at=datetime.now(timezone.utc).isoformat(),

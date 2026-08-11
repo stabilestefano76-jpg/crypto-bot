@@ -169,6 +169,18 @@ export default function DetailScreen() {
               <Text style={styles.reasonText}>
                 {reasonFor(c, signal, isLong)}
               </Text>
+              {c === "FVG Reversal" &&
+                signal.reversal_signals &&
+                signal.reversal_signals.length > 0 && (
+                  <View style={styles.revChips}>
+                    {signal.reversal_signals.map((rs) => (
+                      <View key={rs} style={styles.revChip}>
+                        <Ionicons name="flash" size={9} color={colors.brand} />
+                        <Text style={styles.revChipText}>{rs}</Text>
+                      </View>
+                    ))}
+                  </View>
+                )}
             </View>
           ))}
           <View style={[styles.ctxRow, { marginTop: 6 }]}>
@@ -473,6 +485,10 @@ function reasonFor(criterion: string, s: Signal, isLong: boolean): string {
       return "EMA veloce sopra la lenta: il trend maggiore è rialzista, il long è allineato con la corrente principale del mercato.";
     case "EMA Trend Down":
       return "EMA veloce sotto la lenta: il trend maggiore è ribassista, lo short è allineato con la direzione dominante.";
+    case "FVG Reversal":
+      return isLong
+        ? "Inversione confermata dentro la zona FVG: il prezzo ha respinto il bordo e sta risalendo per colmare il gap. Il target è impostato sul fill della zona."
+        : "Inversione confermata dentro la zona FVG: il prezzo ha respinto il bordo e sta scendendo per colmare il gap. Il target è impostato sul fill della zona.";
     default:
       return "Conferma tecnica aggiuntiva rilevata dall'algoritmo.";
   }
@@ -576,6 +592,23 @@ const styles = StyleSheet.create({
     lineHeight: 18,
     paddingLeft: 22,
   },
+  revChips: {
+    flexDirection: "row",
+    flexWrap: "wrap",
+    gap: 6,
+    paddingLeft: 22,
+    marginTop: 2,
+  },
+  revChip: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 3,
+    paddingHorizontal: 6,
+    paddingVertical: 3,
+    backgroundColor: colors.brandTertiary,
+    borderRadius: radius.sm,
+  },
+  revChipText: { color: colors.brand, fontSize: 10, fontWeight: "700" },
   disclaimer: {
     flexDirection: "row",
     alignItems: "center",
