@@ -113,6 +113,10 @@ export type PaperPosition = {
   current_price: number;
   unrealized_pnl: number;
   unrealized_pnl_pct: number;
+  breakeven_active?: boolean;
+  trailing_active?: boolean;
+  partial_closed?: boolean;
+  current_stop?: number;
 };
 
 export type PaperTrade = {

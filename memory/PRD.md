@@ -29,6 +29,16 @@ Scheduler asyncio in background esegue `run_scan()` ogni `scan_interval_minutes`
 - **(tabs)/settings** — Form completo per parametri + sezione Paper Trading (auto-execute, initial capital, risk %, max positions) + disclaimer
 - **detail/[id]** — Grafico candlestick SVG con zone FVG, linee entry/SL/TP, sub-grafico RSI + bottone sticky "Execute Paper"
 
+## Position Management: Timeout + Breakeven + Trailing (moduli additivi)
+Tre moduli nuovi, integrati SOLO nel monitor paper esistente (nessuna modifica a FVG/RSI/scoring/stop ATR):
+- **TimeoutManager**: tabella per timeframe (15m=14, 1h=7, 4h=5, 1d=3 candele). Se candele trascorse ≥ timeout e profit_in_R < 0.3 → sposta stop a breakeven
+- **BreakevenCalculator**: SPOT = entry + (fee_maker+fee_taker via API KuCoin + spread medio da level1 + margine 0.05%); LEVERAGE aggiunge funding accumulato = funding_rate×(ore/8) via API futures. Fallback con warning se fee/funding non disponibili (non blocca)
+- **TrailingStopManager**: attivo quando profit_in_R ≥ 1.0; trailing = ultimo swing (riusa detect_pivots) ∓ ATR(14)×1.2; ricalcolo solo a chiusura nuova candela sul TF del trade; non arretra mai; clamp leverage a ≥25% dalla liquidazione quando nota
+- **Chiusura parziale** 35% al raggiungimento di 1R (una volta), il resto continua col trailing
+- Nuovi campi Config (timeout_*, breakeven_safety_pct, default_fee_rate, trailing_*, partial_close_*, liq_min_distance_pct) e PaperPosition (current_stop, initial_risk, breakeven_active, trailing_active, partial_closed, liquidation_price)
+- UI: badge "Breakeven attivo" / "Trailing attivo" / "Parziale 35%" sulla card della posizione (unica modifica UI)
+- Testato spot 1h come da spec (8/8 backend passati)
+
 ## FVG Reversal Entry (estensione condizioni, non sostituzione)
 Nuova condizione di entry **integrata nel sistema a punteggio esistente** (stesso calcolo di soglia, nessun secondo scoring):
 - **"FVG Reversal"** = inversione confermata dentro la zona FVG, con peso configurabile (default 2 → max score ora 8)

@@ -1,0 +1,33 @@
+{
+  "summary": "Additive position-management modules verified. Backend: 8/8 pytest passed. GET /api/config exposes all 13 new fields with correct defaults (timeout_15m=14, timeout_1h=7, timeout_4h=5, timeout_1d=3, timeout_min_r=0.3, breakeven_safety_pct=0.05, default_fee_rate=0.001, trailing_activation_r=1.0, trailing_atr_mult=1.2, partial_close_enabled=true, partial_close_r=1.0, partial_close_pct=35.0, liq_min_distance_pct=25.0). PUT /api/config persists a changed field (timeout_1h=6) and GET returns it. POST /api/paper/trading-mode {spot} + /paper/reset + /paper/execute/{signal_id} for a 1h LONG signal opens a position with new schema fields: current_stop == stop_loss, initial_risk == |fill_price - stop_loss| > 0, breakeven_active=false, trailing_active=false, partial_closed=false. GET /api/paper/portfolio returns positions with the same new fields. Regression endpoints (/signals, /setup-debug/log, /stop-debug/log, /slippage/log, /feed/status) all return 200; signals schema unchanged (score, max_score=8, atr>0, reversal_signals present). Frontend: mobile viewport (375x667) Portfolio tab loads without crash, no React Native red screen; PositionCard correctly renders Entry/Now/SL/TP/Close and mgmt badges are conditional (none at open, as expected).",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_position_management.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "compute_breakeven: fee_cost is computed as entry*(maker+taker) which is a RATE addition, not a dollar cost per notional. This matches spec ('fee_maker+fee_taker as rate*entry'). OK.",
+    "get_funding_rate: contract symbol mapping uses simple '-' strip which likely 404s on KuCoin futures endpoint for most spot pairs; acceptable per spec (silent fallback to 0). Consider mapping to 'XBTUSDTM' style contracts if leverage is scoped in a future pass.",
+    "manage_open_position runs on every 3s monitor tick; get_trade_fees is cached per symbol (good), _current_spread and get_funding_rate hit KuCoin every call until BE actually triggers. Minor: could gate compute_breakeven behind timeout precondition to reduce external calls.",
+    "apply_trailing_manager updates last_trail_candle_t even when no trailing change is applied (fine to prevent re-fetch), but could still be missed if the manage_open_position fails between."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_position_management.py"
+  ],
+  "success_rate": {"backend": "100%", "frontend": "100%"},
+  "seed_data_creation": "None. Tests use existing live signals from KuCoin scans and clean up (paper/reset) after opening a test position.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Position-management modules (TimeoutManager, BreakevenCalculator, TrailingStopManager, partial close) are additive and verified at the schema/config level for SPOT 1h. Leverage/liquidation and time-elapsed BE/trailing triggers were intentionally out of scope. If leverage testing is added later, verify KuCoin futures funding-rate contract-symbol mapping (BTC-USDT -> XBTUSDTM style, currently only strips '-').",
+  "rca_of_issue": "N/A - no issues found."
+}

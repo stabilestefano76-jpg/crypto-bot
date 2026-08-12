@@ -93,6 +93,20 @@ class Config(BaseModel):
     max_pairs_per_scan: int = 200  # cap for MVP performance
     enabled_pairs: list[str] = Field(default_factory=list)  # empty = all matching filter
     excluded_pairs: list[str] = Field(default_factory=list)
+    # --- Position management: timeout / breakeven / trailing ---
+    timeout_15m: int = 14
+    timeout_1h: int = 7
+    timeout_4h: int = 5
+    timeout_1d: int = 3
+    timeout_min_r: float = 0.3  # move to BE if profit_in_R below this at timeout
+    breakeven_safety_pct: float = 0.05  # % safety margin added to breakeven
+    default_fee_rate: float = 0.001  # fallback maker/taker if API unavailable
+    trailing_activation_r: float = 1.0  # activate trailing when profit_in_R >= this
+    trailing_atr_mult: float = 1.2
+    partial_close_enabled: bool = True
+    partial_close_r: float = 1.0
+    partial_close_pct: float = 35.0  # % of position closed at partial_close_r
+    liq_min_distance_pct: float = 25.0  # leverage: min distance from liquidation (%)
 
 
 class Signal(BaseModel):
@@ -156,6 +170,14 @@ class PaperPosition(BaseModel):
     quantity: float
     risk_usdt: float
     opened_at: str
+    # --- Position management (timeout / breakeven / trailing) ---
+    current_stop: float = 0.0  # active stop (0 = use stop_loss)
+    initial_risk: float = 0.0  # |entry - stop_loss| at open
+    breakeven_active: bool = False
+    trailing_active: bool = False
+    partial_closed: bool = False
+    last_trail_candle_t: float = 0.0  # last candle time used to recompute trailing
+    liquidation_price: float = 0.0  # leverage only (0 = unknown/spot)
 
 
 class PaperTrade(BaseModel):
@@ -789,6 +811,8 @@ async def open_paper_position(signal: dict[str, Any]) -> Optional[PaperPosition]
         quantity=round(qty, 8),
         risk_usdt=round(risk_usdt, 2),
         opened_at=datetime.now(timezone.utc).isoformat(),
+        current_stop=round(signal["stop_loss"], 8),
+        initial_risk=round(abs(fill_price - signal["stop_loss"]), 8),
     )
     await db.paper_positions.insert_one(pos.model_dump())
     # Persist slippage log entry
@@ -879,6 +903,256 @@ async def close_paper_position(pos: dict[str, Any], exit_price: float, outcome: 
     return trade
 
 
+# ===========================================================================
+# POSITION MANAGEMENT: Timeout + Breakeven + Trailing Stop (additive modules)
+# ===========================================================================
+_fee_cache: dict[str, tuple[float, float]] = {}
+_funding_cache: dict[str, float] = {}
+
+
+async def get_trade_fees(symbol: str, cfg: Config) -> tuple[float, float]:
+    """Maker/taker fee rates via KuCoin (authenticated). Falls back to
+    default_fee_rate with a warning if credentials/endpoint unavailable."""
+    if symbol in _fee_cache:
+        return _fee_cache[symbol]
+    maker = taker = cfg.default_fee_rate
+    try:
+        r = await _kucoin_signed_get(f"/api/v1/trade-fees?symbols={symbol}")
+        data = r.json()
+        if data.get("code") == "200000" and data.get("data"):
+            d = data["data"][0]
+            maker = float(d.get("makerFeeRate", maker))
+            taker = float(d.get("takerFeeRate", taker))
+        else:
+            logger.warning("Fee API for %s returned %s; using default", symbol, data.get("code"))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Fee API unavailable for %s (%s); using default fee", symbol, e)
+    _fee_cache[symbol] = (maker, taker)
+    return maker, taker
+
+
+async def get_funding_rate(symbol: str, cfg: Config) -> float:
+    """Current funding rate via KuCoin Futures public API. Falls back to last
+    known value (or 0) with a warning; never blocks execution."""
+    contract = symbol.replace("-", "")  # e.g. BTC-USDT -> BTCUSDT (best effort)
+    try:
+        async with httpx.AsyncClient(base_url="https://api-futures.kucoin.com", timeout=8.0) as c:
+            r = await c.get(f"/api/v1/funding-rate/{contract}/current")
+            data = r.json()
+            if data.get("code") == "200000" and data.get("data"):
+                val = float(data["data"].get("value", 0.0))
+                _funding_cache[symbol] = val
+                return val
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Funding rate unavailable for %s (%s); using last known", symbol, e)
+    return _funding_cache.get(symbol, 0.0)
+
+
+async def _current_spread(symbol: str) -> float:
+    """Approx average bid-ask spread from KuCoin level1 (proxy for last-20-tick avg)."""
+    try:
+        async with httpx.AsyncClient(base_url=KUCOIN_BASE, timeout=8.0) as c:
+            r = await c.get("/api/v1/market/orderbook/level1", params={"symbol": symbol})
+            d = r.json()
+            if d.get("code") == "200000" and d.get("data"):
+                bid = float(d["data"].get("bestBid") or 0)
+                ask = float(d["data"].get("bestAsk") or 0)
+                if bid > 0 and ask > 0:
+                    return max(0.0, ask - bid)
+    except Exception:  # noqa: BLE001
+        pass
+    return 0.0
+
+
+async def compute_breakeven(pos: dict[str, Any], cfg: Config, trading_mode: str) -> float:
+    """BreakevenCalculator (spot & leverage). Returns the breakeven price."""
+    entry = float(pos.get("fill_price") or pos["entry"])
+    symbol = pos["symbol"]
+    maker, taker = await get_trade_fees(symbol, cfg)
+    spread = await _current_spread(symbol)
+    fee_cost = entry * (maker + taker)
+    safety = entry * (cfg.breakeven_safety_pct / 100)
+    cost = fee_cost + spread + safety
+    if trading_mode == "leverage":
+        funding_rate = await get_funding_rate(symbol, cfg)
+        opened = datetime.fromisoformat(pos["opened_at"]).timestamp()
+        hours_open = max(0.0, (time.time() - opened) / 3600)
+        funding_accumulato = entry * funding_rate * (hours_open / 8)
+        cost += funding_accumulato
+    if pos["side"] == "long":
+        return entry + cost
+    return entry - cost
+
+
+def _profit_in_r(pos: dict[str, Any], price: float) -> float:
+    entry = float(pos.get("fill_price") or pos["entry"])
+    risk = float(pos.get("initial_risk") or abs(entry - float(pos["stop_loss"])))
+    if risk <= 0:
+        return 0.0
+    if pos["side"] == "long":
+        return (price - entry) / risk
+    return (entry - price) / risk
+
+
+def _timeout_candles(tf: str, cfg: Config) -> int:
+    return {
+        "15m": cfg.timeout_15m,
+        "1h": cfg.timeout_1h,
+        "4h": cfg.timeout_4h,
+        "1d": cfg.timeout_1d,
+    }.get(tf, cfg.timeout_1h)
+
+
+async def apply_timeout_manager(pos: dict[str, Any], price: float, cfg: Config) -> Optional[float]:
+    """TimeoutManager: if enough candles elapsed with profit < timeout_min_r,
+    move stop to breakeven. Returns the new stop or None."""
+    if pos.get("breakeven_active"):
+        return None
+    tf = pos.get("timeframe", "1h")
+    tf_sec = TF_SECONDS.get(tf, 3600)
+    opened = datetime.fromisoformat(pos["opened_at"]).timestamp()
+    candles_elapsed = (time.time() - opened) / tf_sec
+    if candles_elapsed < _timeout_candles(tf, cfg):
+        return None
+    if _profit_in_r(pos, price) >= cfg.timeout_min_r:
+        return None
+    pcfg = await get_paper_config()
+    be = await compute_breakeven(pos, cfg, pcfg.trading_mode)
+    return be
+
+
+def _recent_swing(candles: list[list[float]], side: str, window: int) -> Optional[float]:
+    """Reuse pivot logic to get the last significant swing low (long) / high (short)."""
+    highs = [c[3] for c in candles]
+    lows = [c[4] for c in candles]
+    low_idx, high_idx = detect_pivots(lows if side == "long" else highs, window)
+    if side == "long":
+        pivots = low_idx
+        series = lows
+    else:
+        pivots = high_idx
+        series = highs
+    if not pivots:
+        return None
+    return series[pivots[-1]]
+
+
+async def apply_trailing_manager(pos: dict[str, Any], price: float, cfg: Config) -> Optional[float]:
+    """TrailingStopManager: activate at trailing_activation_r; recompute only on
+    a NEW candle close of the trade timeframe; never move against the position.
+    Leverage-only liquidation distance clamp when liquidation_price known."""
+    if _profit_in_r(pos, price) < cfg.trailing_activation_r:
+        return None
+    tf = pos.get("timeframe", "1h")
+    tf_sec = TF_SECONDS.get(tf, 3600)
+    current_candle = (time.time() // tf_sec) * tf_sec
+    if current_candle <= float(pos.get("last_trail_candle_t") or 0):
+        return None  # only recompute on new candle close
+    candles = await kucoin.get_klines(pos["symbol"], tf)
+    if len(candles) < 20:
+        return None
+    ref = _recent_swing(candles, pos["side"], cfg.pivot_window)
+    if ref is None:
+        return None
+    atr = atr_wilder([c[3] for c in candles], [c[4] for c in candles],
+                     [c[2] for c in candles], cfg.atr_period)
+    if not atr or atr <= 0:
+        return None
+    buffer = atr * cfg.trailing_atr_mult
+    if pos["side"] == "long":
+        trailing = ref - buffer
+    else:
+        trailing = ref + buffer
+
+    # Leverage-only: keep the stop at least liq_min_distance_pct away from liquidation
+    liq = float(pos.get("liquidation_price") or 0)
+    if liq > 0:
+        min_dist = liq * (cfg.liq_min_distance_pct / 100)
+        if pos["side"] == "long" and trailing < liq + min_dist:
+            trailing = liq + min_dist
+        elif pos["side"] == "short" and trailing > liq - min_dist:
+            trailing = liq - min_dist
+
+    # Never move against the position
+    cur = float(pos.get("current_stop") or pos["stop_loss"])
+    if pos["side"] == "long":
+        new_stop = max(cur, trailing)
+    else:
+        new_stop = min(cur, trailing)
+    await db.paper_positions.update_one(
+        {"id": pos["id"]}, {"$set": {"last_trail_candle_t": current_candle}}
+    )
+    if new_stop != cur:
+        return new_stop
+    return None
+
+
+async def maybe_partial_close(pos: dict[str, Any], price: float, cfg: Config) -> None:
+    """Close partial_close_pct of the position once profit reaches partial_close_r."""
+    if not cfg.partial_close_enabled or pos.get("partial_closed"):
+        return
+    if _profit_in_r(pos, price) < cfg.partial_close_r:
+        return
+    frac = cfg.partial_close_pct / 100
+    close_qty = float(pos["quantity"]) * frac
+    remain_qty = float(pos["quantity"]) - close_qty
+    if close_qty <= 0 or remain_qty <= 0:
+        return
+    entry = float(pos.get("fill_price") or pos["entry"])
+    if pos["side"] == "long":
+        pnl = (price - entry) * close_qty
+    else:
+        pnl = (entry - price) * close_qty
+    pnl_pct = (pnl / (entry * close_qty)) * 100 if entry > 0 else 0.0
+    pcfg = await get_paper_config()
+    trade = PaperTrade(
+        signal_id=pos["signal_id"], symbol=pos["symbol"], side=pos["side"],
+        entry=entry, exit=round(price, 8), quantity=round(close_qty, 8),
+        pnl_usdt=round(pnl, 2), pnl_pct=round(pnl_pct, 2), outcome="partial",
+        opened_at=pos["opened_at"], closed_at=datetime.now(timezone.utc).isoformat(),
+    )
+    await db.paper_trades.insert_one(trade.model_dump())
+    cash = await get_paper_cash()
+    if pcfg.trading_mode == "spot" and pos["side"] == "long":
+        await set_paper_cash(cash + price * close_qty)  # unlock proportional notional
+    else:
+        await set_paper_cash(cash + pnl)
+    await db.paper_positions.update_one(
+        {"id": pos["id"]},
+        {"$set": {"quantity": round(remain_qty, 8), "partial_closed": True}},
+    )
+    logger.info("Partial close %s %.1f%% qty=%.6f pnl=%.2f",
+                pos["symbol"], cfg.partial_close_pct, close_qty, pnl)
+
+
+async def manage_open_position(pos: dict[str, Any], price: float, cfg: Config) -> dict[str, Any]:
+    """Run the 3 additive managers + partial close. Returns the possibly-updated
+    position dict (with fresh current_stop)."""
+    updates: dict[str, Any] = {}
+    # Partial close first (does not affect stop)
+    await maybe_partial_close(pos, price, cfg)
+    # Timeout -> breakeven
+    be = await apply_timeout_manager(pos, price, cfg)
+    if be is not None:
+        cur = float(pos.get("current_stop") or pos["stop_loss"])
+        # never move against position
+        improved = be > cur if pos["side"] == "long" else be < cur
+        if improved or cur == float(pos["stop_loss"]):
+            updates["current_stop"] = be
+            updates["breakeven_active"] = True
+    # Trailing
+    working = {**pos, **updates}
+    trail = await apply_trailing_manager(working, price, cfg)
+    if trail is not None:
+        updates["current_stop"] = trail
+        updates["trailing_active"] = True
+    if updates:
+        await db.paper_positions.update_one({"id": pos["id"]}, {"$set": updates})
+        pos = {**pos, **updates}
+    return pos
+
+
+
 async def monitor_paper_positions() -> None:
     """Close positions if SL/TP hit, using real-time WS prices when available."""
     positions = await db.paper_positions.find({}, {"_id": 0}).to_list(1000)
@@ -894,18 +1168,22 @@ async def monitor_paper_positions() -> None:
                 rest_map[t["symbol"]] = float(t.get("last") or 0)
             except (TypeError, ValueError):
                 continue
+    cfg = await get_config()
     for pos in positions:
         price = price_feed.get(pos["symbol"]) or rest_map.get(pos["symbol"], 0.0)
         if price <= 0:
             continue
+        # Additive position management (timeout/breakeven/trailing/partial).
+        pos = await manage_open_position(pos, price, cfg)
+        active_stop = float(pos.get("current_stop") or pos["stop_loss"])
         if pos["side"] == "long":
-            if price <= pos["stop_loss"]:
-                await close_paper_position(pos, pos["stop_loss"], "loss")
+            if price <= active_stop:
+                await close_paper_position(pos, active_stop, "loss")
             elif price >= pos["take_profit"]:
                 await close_paper_position(pos, pos["take_profit"], "win")
         else:
-            if price >= pos["stop_loss"]:
-                await close_paper_position(pos, pos["stop_loss"], "loss")
+            if price >= active_stop:
+                await close_paper_position(pos, active_stop, "loss")
             elif price <= pos["take_profit"]:
                 await close_paper_position(pos, pos["take_profit"], "win")
 

@@ -688,6 +688,35 @@ function PositionCard({
         </Text>
       </View>
 
+      {(pos.breakeven_active || pos.trailing_active || pos.partial_closed) && (
+        <View style={styles.mgmtRow} testID={`mgmt-${pos.id}`}>
+          {pos.breakeven_active && (
+            <View style={[styles.mgmtChip, { borderColor: colors.brand }]}>
+              <Ionicons name="shield-half" size={10} color={colors.brand} />
+              <Text style={[styles.mgmtText, { color: colors.brand }]}>
+                Breakeven attivo
+              </Text>
+            </View>
+          )}
+          {pos.trailing_active && (
+            <View style={[styles.mgmtChip, { borderColor: colors.success }]}>
+              <Ionicons name="trending-up" size={10} color={colors.success} />
+              <Text style={[styles.mgmtText, { color: colors.success }]}>
+                Trailing attivo
+              </Text>
+            </View>
+          )}
+          {pos.partial_closed && (
+            <View style={[styles.mgmtChip, { borderColor: colors.onSurfaceSecondary }]}>
+              <Ionicons name="pie-chart" size={10} color={colors.onSurfaceSecondary} />
+              <Text style={[styles.mgmtText, { color: colors.onSurfaceSecondary }]}>
+                Parziale 35%
+              </Text>
+            </View>
+          )}
+        </View>
+      )}
+
       <View style={styles.priceRow}>
         <Col label="Entry" value={fmtPrice(pos.entry)} />
         <Col label="Now" value={fmtPrice(pos.current_price)} color={colors.brand} />
@@ -924,6 +953,17 @@ const styles = StyleSheet.create({
   pnlRow: { marginTop: 2 },
   pnlBig: { fontSize: font.xl, fontWeight: "800" },
   pnlPct: { fontSize: font.base, fontWeight: "700" },
+  mgmtRow: { flexDirection: "row", flexWrap: "wrap", gap: 6 },
+  mgmtChip: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 3,
+    paddingHorizontal: 6,
+    paddingVertical: 3,
+    borderRadius: radius.sm,
+    borderWidth: 1,
+  },
+  mgmtText: { fontSize: 10, fontWeight: "800" },
   priceRow: { flexDirection: "row", gap: spacing.sm },
   priceLabel: {
     color: colors.onSurfaceTertiary,
