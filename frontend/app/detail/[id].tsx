@@ -136,6 +136,16 @@ export default function DetailScreen() {
             color={colors.onSurface}
           />
         </View>
+        {signal.strategy === "impulse_fvg" && (
+          <View style={styles.gridRow}>
+            <Metric label="TP1 (65%)" value={formatPrice(signal.tp1 || 0)} color={colors.success} />
+            <Metric
+              label={signal.tp2 ? "TP2 (35%)" : "TP2 → trailing"}
+              value={signal.tp2 ? formatPrice(signal.tp2) : "trailing"}
+              color={colors.brand}
+            />
+          </View>
+        )}
         {signal.atr ? (
           <View style={styles.gridRow}>
             <Metric
@@ -489,6 +499,16 @@ function reasonFor(criterion: string, s: Signal, isLong: boolean): string {
       return isLong
         ? "Inversione confermata dentro la zona FVG: il prezzo ha respinto il bordo e sta risalendo per colmare il gap. Il target è impostato sul fill della zona."
         : "Inversione confermata dentro la zona FVG: il prezzo ha respinto il bordo e sta scendendo per colmare il gap. Il target è impostato sul fill della zona.";
+    case "Market Structure":
+      return isLong
+        ? "Struttura di mercato rialzista: massimi e minimi crescenti confermano l'uptrend."
+        : "Struttura di mercato ribassista: massimi e minimi decrescenti confermano il downtrend.";
+    case "Impulse FVG":
+      return "Candela d'impulso che ha originato il trend: il suo FVG non colmato è il target finale (TP2).";
+    case "Consolidation Breakout":
+      return isLong
+        ? "Rottura in chiusura sopra il box di consolidamento: trigger d'ingresso long."
+        : "Rottura in chiusura sotto il box di consolidamento: trigger d'ingresso short.";
     default:
       return "Conferma tecnica aggiuntiva rilevata dall'algoritmo.";
   }

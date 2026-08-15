@@ -102,6 +102,73 @@ export default function SettingsScreen() {
           contentContainerStyle={styles.body}
           keyboardShouldPersistTaps="handled"
         >
+          <Section title="Strategia segnali">
+            <View style={styles.stratRow}>
+              {([
+                ["scoring", "Scoring"],
+                ["impulse_fvg", "Impulse FVG"],
+                ["both", "Entrambe"],
+              ] as const).map(([val, label]) => {
+                const active = cfg.strategy_mode === val;
+                return (
+                  <Pressable
+                    key={val}
+                    onPress={() => update({ strategy_mode: val })}
+                    style={[styles.stratChip, active && styles.stratChipActive]}
+                    testID={`strategy-${val}`}
+                  >
+                    <Text
+                      style={[styles.stratText, active && { color: colors.onBrand }]}
+                    >
+                      {label}
+                    </Text>
+                  </Pressable>
+                );
+              })}
+            </View>
+            <Text style={styles.scoreHintText}>
+              Scoring = confluenza a punteggio. Impulse FVG = trend + impulso +
+              breakout del consolidamento con TP1/TP2. Entrambe = attive insieme.
+            </Text>
+          </Section>
+
+          {(cfg.strategy_mode === "impulse_fvg" || cfg.strategy_mode === "both") && (
+            <Section title="Impulse FVG Strategy">
+              <NumRow
+                label="Soglia ATR candela impulso"
+                value={cfg.impulse_atr_mult}
+                onChange={(v) => update({ impulse_atr_mult: v })}
+                step={0.1}
+                testID="input-impulse-atr"
+              />
+              <NumRow
+                label="Min. candele consolidamento"
+                value={cfg.consolidation_min_candles}
+                onChange={(v) => update({ consolidation_min_candles: v })}
+                testID="input-consol-min"
+              />
+              <NumRow
+                label="Max ampiezza box (×ATR)"
+                value={cfg.consolidation_max_atr}
+                onChange={(v) => update({ consolidation_max_atr: v })}
+                step={0.1}
+                testID="input-consol-atr"
+              />
+              <NumRow
+                label="Quota TP1 (%)"
+                value={cfg.tp1_pct}
+                onChange={(v) => update({ tp1_pct: v })}
+                testID="input-tp1-pct"
+              />
+              <NumRow
+                label="Quota TP2 (%)"
+                value={cfg.tp2_pct}
+                onChange={(v) => update({ tp2_pct: v })}
+                testID="input-tp2-pct"
+              />
+            </Section>
+          )}
+
           <Section title="Scoring System">
             <View style={styles.scoreHint}>
               <Ionicons name="information-circle" size={14} color={colors.brand} />
@@ -645,6 +712,18 @@ const styles = StyleSheet.create({
     marginBottom: 4,
   },
   scoreHintText: { color: colors.onSurface, flex: 1, fontSize: 11, lineHeight: 16 },
+  stratRow: { flexDirection: "row", gap: spacing.sm, marginBottom: spacing.sm },
+  stratChip: {
+    flex: 1,
+    paddingVertical: 10,
+    borderRadius: radius.md,
+    backgroundColor: colors.surfaceTertiary,
+    borderWidth: 1,
+    borderColor: colors.border,
+    alignItems: "center",
+  },
+  stratChipActive: { backgroundColor: colors.brand, borderColor: colors.brand },
+  stratText: { color: colors.onSurfaceSecondary, fontWeight: "800", fontSize: font.sm },
   maxScoreRow: {
     paddingVertical: spacing.sm,
     borderTopWidth: 1,

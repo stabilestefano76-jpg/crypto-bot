@@ -1,0 +1,36 @@
+{
+  "summary": "Counter-Trend strategy backend verified end-to-end: 22 passed, 1 skipped (0 failed). POST /api/strategy-mode accepts 'counter_trend', 'both', 'scoring', 'impulse_fvg' (all 200) and rejects invalid values with 400; GET /api/config reflects each change. GET /api/config exposes rsi_high_tf_ob=80, rsi_high_tf_os=20, trailing_pct_from_entry=1.0 alongside all pre-existing fields (strategy_mode, atr_period, rsi_period, rsi_overbought/oversold, consolidation_min_candles, consolidation_max_atr, tp1_pct, tp2_pct, atr_sl_multiplier). POST /api/scan under strategy_mode='counter_trend' completes cleanly (started=true, no exceptions) and yields ZERO counter_trend signals — ACCEPTABLE per spec (HTF RSI<=20/>=80 gate + tight consolidation + reversal pattern make live setups extremely rare). TP MAPPING (the reported bug) code-validated in analyze_pair_counter (server.py:1740-1747): LONG -> tp1=origin['bottom'] (near edge / touch), tp2=(top+bottom)/2 (midpoint); SHORT -> tp1=origin['top'] (near edge), tp2=(top+bottom)/2. Direction safety hard-coded: entry_side='short' if trend=='up' else 'long' AGAINST trend; tp1 beyond entry check enforced (server.py:1752). SL beyond IMPULSE EXTREME (seg_hi/seg_lo of 3-candle window at origin index, not FVG edge). RSI MISALIGNMENT FIX confirmed: kucoin.get_klines drops the last forming candle (raw = raw[:-1]) so BTC-USDT/1h candles endpoint returns equal-length candles+rsi arrays AND the last candle timestamp is >=3600s old (closed); /api/candles uses the same rsi_wilder(cfg.rsi_period) as signal logic. Regression endpoints all 200: /api/signals (returns {signals:[...], count}), /api/paper/portfolio, /api/paper/execute/{id} (accepts existing signal), /api/stop-debug/log, /api/slippage/log, /api/setup-debug/log, /api/feed/status, /api/config, /api/status. Scoring strategy still produces signals after mode toggle.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_counter_trend.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "analyze_pair_counter (server.py:1669-1771): TP1/TP2 mapping matches spec exactly — LONG tp1=fvg_bottom (touch/near edge), SHORT tp1=fvg_top; TP2 always (top+bottom)/2. Direction safety guaranteed by entry_side derivation on line 1683.",
+    "get_klines (server.py:517-550): raw = raw[:-1] drops the forming candle before slicing to CANDLE_LIMIT. Length parity between candles and rsi arrays in /api/candles is guaranteed because rsi_wilder returns a list matching closes length.",
+    "Reversal-pattern gate (server.py:1707-1709): explicit early return when pattern is None guarantees NO counter-trend entry ever fires without an engulfing/star AGAINST trend. Continuation-direction opens are impossible by construction.",
+    "SL uses impulse extreme not FVG edge (server.py:1735-1737): seg_hi/seg_lo taken over [origin.index-2 .. origin.index] — matches spec.",
+    "detect_reversal_pattern (server.py:1634-1656): engulfing checks correct (bearish requires prior bullish body engulfed by bear body, mirror for bullish). Star patterns use middle-candle body <50% of first-candle body — reasonable strict definition.",
+    "/api/signals response shape is {signals:[...], count:N} (not a raw list). Frontend consumers must handle the wrapper — noted for UI code but not a bug.",
+    "server.py is 2504 lines — again flag for modularisation (backend/strategies/{scoring,impulse,counter_trend}.py), non-blocking."
+  ],
+  "updated_files": [
+    "/app/backend/tests/test_counter_trend.py"
+  ],
+  "success_rate": {"backend": "100%", "frontend": "N/A (not tested per request)"},
+  "seed_data_creation": "None. Tests rely on live KuCoin data; /api/paper/reset called before paper-execute test.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Counter-trend is strategy #3, additive, verified at schema/direction/regression + TP-mapping code level. Live counter_trend signals were ZERO at test time (by design — HTF RSI<=20/>=80 is very strict). If a future run needs to assert on a live counter_trend signal, temporarily relax cfg.rsi_high_tf_ob/os via PUT /api/config (e.g. ob=65, os=35) and cfg.consolidation_max_atr, trigger /api/scan, then run test_counter_trend.py::TestCounterTrendTPMapping::test_signal_tp_mapping_from_live_or_code which iterates each counter_trend signal and enforces LONG tp1==fvg_bottom / SHORT tp1==fvg_top / tp2==midpoint / tp1 beyond entry.",
+  "rca_of_issue": "N/A — TP1/TP2 mapping bug reported in the request was already fixed in analyze_pair_counter (server.py:1740-1747: tp1=origin['bottom' or 'top'] = near edge / touch; tp2=(top+bottom)/2 = midpoint). RSI misalignment was fixed in kucoin.get_klines (server.py:533-534: raw = raw[:-1] drops the forming candle). Both fixes verified: code assertions pass, /api/candles returns equal-length arrays with last-timestamp older than 1h."
+}

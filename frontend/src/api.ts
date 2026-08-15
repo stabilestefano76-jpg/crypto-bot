@@ -37,6 +37,11 @@ export type Signal = {
   atr?: number;
   atr_multiplier?: number;
   reversal_signals?: string[];
+  strategy?: string;
+  tp1?: number;
+  tp2?: number;
+  consolidation_high?: number;
+  consolidation_low?: number;
   status: string;
   outcome?: string | null;
 };
@@ -73,6 +78,12 @@ export type Config = {
   reversal_min_signals: number;
   reversal_rejection_wick_ratio: number;
   fvg_fill_mode: string;
+  strategy_mode: string;
+  impulse_atr_mult: number;
+  consolidation_min_candles: number;
+  consolidation_max_atr: number;
+  tp1_pct: number;
+  tp2_pct: number;
   max_pairs_per_scan: number;
   enabled_pairs: string[];
   excluded_pairs: string[];
@@ -197,6 +208,11 @@ export const api = {
     req<{ ok: boolean; trading_mode: string }>("/paper/trading-mode", {
       method: "POST",
       body: JSON.stringify({ trading_mode }),
+    }),
+  setStrategyMode: (strategy_mode: "scoring" | "impulse_fvg" | "both") =>
+    req<{ ok: boolean; strategy_mode: string }>("/strategy-mode", {
+      method: "POST",
+      body: JSON.stringify({ strategy_mode }),
     }),
   exchangeStatus: () =>
     req<{

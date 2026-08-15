@@ -107,6 +107,17 @@ class Config(BaseModel):
     partial_close_r: float = 1.0
     partial_close_pct: float = 35.0  # % of position closed at partial_close_r
     liq_min_distance_pct: float = 25.0  # leverage: min distance from liquidation (%)
+    # --- Impulse-FVG + Consolidation strategy (additive, selectable) ---
+    strategy_mode: str = "scoring"  # "scoring" | "impulse_fvg" | "counter_trend" | "both"
+    impulse_atr_mult: float = 1.5  # impulse candle range >= this * ATR
+    consolidation_min_candles: int = 3
+    consolidation_max_atr: float = 1.5  # channel width <= this * ATR
+    tp1_pct: float = 65.0  # % closed at TP1
+    tp2_pct: float = 35.0  # % remainder to TP2 / trailing
+    # --- Counter-trend strategy RSI filters ---
+    rsi_high_tf_ob: float = 80.0  # higher-TF overbought (short)
+    rsi_high_tf_os: float = 20.0  # higher-TF oversold (long)
+    trailing_pct_from_entry: float = 1.0  # counter-trend trailing distance %
 
 
 class Signal(BaseModel):
@@ -123,6 +134,11 @@ class Signal(BaseModel):
     score: float = 0.0  # weighted confluence score
     max_score: float = 0.0  # max achievable score with active weights
     reversal_signals: list[str] = Field(default_factory=list)  # FVG reversal contributors
+    strategy: str = "scoring"  # "scoring" | "impulse_fvg"
+    tp1: float = 0.0
+    tp2: float = 0.0
+    consolidation_high: float = 0.0
+    consolidation_low: float = 0.0
     rsi_value: float
     volume_ratio: float
     created_at: str  # ISO string
@@ -178,6 +194,9 @@ class PaperPosition(BaseModel):
     partial_closed: bool = False
     last_trail_candle_t: float = 0.0  # last candle time used to recompute trailing
     liquidation_price: float = 0.0  # leverage only (0 = unknown/spot)
+    strategy: str = "scoring"
+    tp1: float = 0.0
+    tp2: float = 0.0
 
 
 class PaperTrade(BaseModel):
@@ -508,6 +527,11 @@ class KuCoinClient:
         # KuCoin returns [time, open, close, high, low, volume, turnover] descending
         raw = data.get("data", [])
         raw.reverse()
+        # BUGFIX (RSI misalignment): drop the last, still-forming candle so that
+        # BOTH signal logic and chart rendering reference the same CLOSED candles
+        # using the same rsi_wilder function.
+        if len(raw) > 1:
+            raw = raw[:-1]
         candles = []
         for row in raw[-CANDLE_LIMIT:]:
             try:
@@ -813,6 +837,9 @@ async def open_paper_position(signal: dict[str, Any]) -> Optional[PaperPosition]
         opened_at=datetime.now(timezone.utc).isoformat(),
         current_stop=round(signal["stop_loss"], 8),
         initial_risk=round(abs(fill_price - signal["stop_loss"]), 8),
+        strategy=signal.get("strategy", "scoring"),
+        tp1=float(signal.get("tp1", 0.0)),
+        tp2=float(signal.get("tp2", 0.0)),
     )
     await db.paper_positions.insert_one(pos.model_dump())
     # Persist slippage log entry
@@ -1087,48 +1114,108 @@ async def apply_trailing_manager(pos: dict[str, Any], price: float, cfg: Config)
     return None
 
 
+async def _close_fraction(pos: dict[str, Any], price: float, frac: float,
+                          outcome: str, set_partial: bool = True) -> float:
+    """Close `frac` of the position at `price`, log a trade, settle cash.
+    Returns the remaining quantity."""
+    close_qty = float(pos["quantity"]) * frac
+    remain_qty = float(pos["quantity"]) - close_qty
+    if close_qty <= 0:
+        return float(pos["quantity"])
+    entry = float(pos.get("fill_price") or pos["entry"])
+    pnl = (price - entry) * close_qty if pos["side"] == "long" else (entry - price) * close_qty
+    pnl_pct = (pnl / (entry * close_qty)) * 100 if entry > 0 else 0.0
+    pcfg = await get_paper_config()
+    trade = PaperTrade(
+        signal_id=pos["signal_id"], symbol=pos["symbol"], side=pos["side"],
+        entry=entry, exit=round(price, 8), quantity=round(close_qty, 8),
+        pnl_usdt=round(pnl, 2), pnl_pct=round(pnl_pct, 2), outcome=outcome,
+        opened_at=pos["opened_at"], closed_at=datetime.now(timezone.utc).isoformat(),
+    )
+    await db.paper_trades.insert_one(trade.model_dump())
+    cash = await get_paper_cash()
+    if pcfg.trading_mode == "spot" and pos["side"] == "long":
+        await set_paper_cash(cash + price * close_qty)
+    else:
+        await set_paper_cash(cash + pnl)
+    upd: dict[str, Any] = {"quantity": round(remain_qty, 8)}
+    if set_partial:
+        upd["partial_closed"] = True
+    await db.paper_positions.update_one({"id": pos["id"]}, {"$set": upd})
+    logger.info("Fraction close %s %.0f%% qty=%.6f pnl=%.2f (%s)",
+                pos["symbol"], frac * 100, close_qty, pnl, outcome)
+    return remain_qty
+
+
 async def maybe_partial_close(pos: dict[str, Any], price: float, cfg: Config) -> None:
     """Close partial_close_pct of the position once profit reaches partial_close_r."""
     if not cfg.partial_close_enabled or pos.get("partial_closed"):
         return
     if _profit_in_r(pos, price) < cfg.partial_close_r:
         return
-    frac = cfg.partial_close_pct / 100
-    close_qty = float(pos["quantity"]) * frac
-    remain_qty = float(pos["quantity"]) - close_qty
-    if close_qty <= 0 or remain_qty <= 0:
-        return
-    entry = float(pos.get("fill_price") or pos["entry"])
-    if pos["side"] == "long":
-        pnl = (price - entry) * close_qty
+    await _close_fraction(pos, price, cfg.partial_close_pct / 100, "partial")
+
+
+async def _last_closed_close(symbol: str, tf: str) -> Optional[float]:
+    """Close of the last FULLY closed candle (index -2) for close-confirmation."""
+    candles = await kucoin.get_klines(symbol, tf)
+    if len(candles) < 2:
+        return None
+    return candles[-2][2]
+
+
+async def manage_impulse_position(pos: dict[str, Any], price: float, cfg: Config) -> dict[str, Any]:
+    """Impulse strategy execution: TP1 (close tp1_pct on candle-close beyond TP1,
+    then move remainder to breakeven), TP2 for the rest, trailing fallback if
+    no TP2. Uses close-confirmation (not wick)."""
+    tf = pos.get("timeframe", "1h")
+    tp1 = float(pos.get("tp1") or 0)
+    tp2 = float(pos.get("tp2") or 0)
+    long = pos["side"] == "long"
+    last_close = await _last_closed_close(pos["symbol"], tf)
+    if last_close is None:
+        return pos
+
+    if not pos.get("partial_closed"):
+        hit_tp1 = last_close >= tp1 if long else last_close <= tp1
+        if tp1 > 0 and hit_tp1:
+            remain = await _close_fraction(pos, tp1, cfg.tp1_pct / 100, "tp1")
+            pcfg = await get_paper_config()
+            be = await compute_breakeven(pos, cfg, pcfg.trading_mode)
+            await db.paper_positions.update_one(
+                {"id": pos["id"]},
+                {"$set": {"current_stop": round(be, 8), "breakeven_active": True,
+                          "quantity": round(remain, 8)}},
+            )
+            pos = {**pos, "current_stop": be, "breakeven_active": True,
+                   "partial_closed": True, "quantity": remain}
+        return pos
+
+    # After TP1: manage the remainder
+    if tp2 > 0:
+        hit_tp2 = last_close >= tp2 if long else last_close <= tp2
+        if hit_tp2:
+            await close_paper_position(pos, tp2, "win")
+            return {**pos, "quantity": 0}
     else:
-        pnl = (entry - price) * close_qty
-    pnl_pct = (pnl / (entry * close_qty)) * 100 if entry > 0 else 0.0
-    pcfg = await get_paper_config()
-    trade = PaperTrade(
-        signal_id=pos["signal_id"], symbol=pos["symbol"], side=pos["side"],
-        entry=entry, exit=round(price, 8), quantity=round(close_qty, 8),
-        pnl_usdt=round(pnl, 2), pnl_pct=round(pnl_pct, 2), outcome="partial",
-        opened_at=pos["opened_at"], closed_at=datetime.now(timezone.utc).isoformat(),
-    )
-    await db.paper_trades.insert_one(trade.model_dump())
-    cash = await get_paper_cash()
-    if pcfg.trading_mode == "spot" and pos["side"] == "long":
-        await set_paper_cash(cash + price * close_qty)  # unlock proportional notional
-    else:
-        await set_paper_cash(cash + pnl)
-    await db.paper_positions.update_one(
-        {"id": pos["id"]},
-        {"$set": {"quantity": round(remain_qty, 8), "partial_closed": True}},
-    )
-    logger.info("Partial close %s %.1f%% qty=%.6f pnl=%.2f",
-                pos["symbol"], cfg.partial_close_pct, close_qty, pnl)
+        trail = await apply_trailing_manager(pos, price, cfg)
+        if trail is not None:
+            await db.paper_positions.update_one(
+                {"id": pos["id"]}, {"$set": {"current_stop": round(trail, 8), "trailing_active": True}}
+            )
+            pos = {**pos, "current_stop": trail, "trailing_active": True}
+    return pos
+
+
 
 
 async def manage_open_position(pos: dict[str, Any], price: float, cfg: Config) -> dict[str, Any]:
     """Run the 3 additive managers + partial close. Returns the possibly-updated
     position dict (with fresh current_stop)."""
     updates: dict[str, Any] = {}
+    # Impulse strategy has its own TP1/TP2 execution path.
+    if pos.get("strategy") == "impulse_fvg":
+        return await manage_impulse_position(pos, price, cfg)
     # Partial close first (does not affect stop)
     await maybe_partial_close(pos, price, cfg)
     # Timeout -> breakeven
@@ -1175,17 +1262,29 @@ async def monitor_paper_positions() -> None:
             continue
         # Additive position management (timeout/breakeven/trailing/partial).
         pos = await manage_open_position(pos, price, cfg)
+        if float(pos.get("quantity") or 0) <= 0:
+            continue  # position fully closed by the manager (e.g. TP2)
         active_stop = float(pos.get("current_stop") or pos["stop_loss"])
+        # For impulse strategy the primary fixed target is TP2 (if any); the base
+        # take_profit equals TP1 which the manager already handles on candle close.
+        tp_check = pos["take_profit"]
+        if pos.get("strategy") == "impulse_fvg":
+            # Fixed TP2 close only AFTER TP1 partial is taken; before that the
+            # manager handles TP1 on candle close. If no TP2, rely on trailing.
+            if pos.get("partial_closed") and float(pos.get("tp2") or 0) > 0:
+                tp_check = float(pos["tp2"])
+            else:
+                tp_check = 0
         if pos["side"] == "long":
             if price <= active_stop:
                 await close_paper_position(pos, active_stop, "loss")
-            elif price >= pos["take_profit"]:
-                await close_paper_position(pos, pos["take_profit"], "win")
+            elif tp_check and price >= tp_check:
+                await close_paper_position(pos, tp_check, "win")
         else:
             if price >= active_stop:
                 await close_paper_position(pos, active_stop, "loss")
-            elif price <= pos["take_profit"]:
-                await close_paper_position(pos, pos["take_profit"], "win")
+            elif tp_check and price <= tp_check:
+                await close_paper_position(pos, tp_check, "win")
 
 
 # ---------------------------------------------------------------------------
@@ -1388,6 +1487,290 @@ async def analyze_pair(symbol: str, tf: str, cfg: Config) -> Optional[Signal]:
     )
 
 
+# ===========================================================================
+# STRATEGY 2: Impulse FVG + Consolidation + Multi-TP (additive, selectable)
+# ===========================================================================
+def detect_market_structure(candles: list[list[float]], window: int) -> str:
+    """Return 'up' (HH+HL), 'down' (LH+LL) or 'range' from swing structure."""
+    highs = [c[3] for c in candles]
+    lows = [c[4] for c in candles]
+    low_idx, high_idx = detect_pivots(highs, window)  # highs pivots
+    lo2, hi2 = detect_pivots(lows, window)
+    swing_highs = [highs[i] for i in high_idx][-2:]
+    swing_lows = [lows[i] for i in lo2][-2:]
+    if len(swing_highs) < 2 or len(swing_lows) < 2:
+        return "range"
+    hh = swing_highs[-1] > swing_highs[-2]
+    hl = swing_lows[-1] > swing_lows[-2]
+    lh = swing_highs[-1] < swing_highs[-2]
+    ll = swing_lows[-1] < swing_lows[-2]
+    if hh and hl:
+        return "up"
+    if lh and ll:
+        return "down"
+    return "range"
+
+
+def detect_all_fvgs(highs: list[float], lows: list[float], lookback: int) -> list[dict[str, Any]]:
+    """All still-open FVGs within lookback, each with kind/top/bottom/index/gap."""
+    n = len(highs)
+    start = max(2, n - lookback)
+    out: list[dict[str, Any]] = []
+    for i in range(start, n):
+        if highs[i - 2] < lows[i]:  # bullish gap
+            top, bottom = lows[i], highs[i - 2]
+            if not any(lows[j] <= bottom for j in range(i + 1, n)):
+                out.append({"kind": "bullish", "top": top, "bottom": bottom,
+                            "index": i, "gap": top - bottom})
+        if lows[i - 2] > highs[i]:  # bearish gap
+            top, bottom = lows[i - 2], highs[i]
+            if not any(highs[j] >= top for j in range(i + 1, n)):
+                out.append({"kind": "bearish", "top": top, "bottom": bottom,
+                            "index": i, "gap": top - bottom})
+    return out
+
+
+def find_consolidation(candles: list[list[float]], cfg: Config, side: str, atr: float
+                       ) -> Optional[dict[str, float]]:
+    """Rectangle from the K candles BEFORE the last (breakout) candle, tight
+    within consolidation_max_atr*ATR. Confirms a CLOSE breakout in trade side."""
+    k = cfg.consolidation_min_candles
+    if len(candles) < k + 2:
+        return None
+    prior = candles[-(k + 1):-1]  # exclude the breakout candle (last)
+    rect_high = max(c[3] for c in prior)
+    rect_low = min(c[4] for c in prior)
+    if (rect_high - rect_low) > cfg.consolidation_max_atr * atr:
+        return None
+    bo_close = candles[-1][2]
+    if side == "long" and bo_close > rect_high:
+        return {"high": rect_high, "low": rect_low}
+    if side == "short" and bo_close < rect_low:
+        return {"high": rect_high, "low": rect_low}
+    return None
+
+
+async def analyze_pair_impulse(symbol: str, tf: str, cfg: Config) -> Optional[Signal]:
+    """Impulse-FVG strategy: trend -> origin impulse FVG (TP2) -> consolidation
+    breakout (entry) -> SL under/over the box -> TP1 nearest FVG, TP2 origin FVG."""
+    candles = await kucoin.get_klines(symbol, tf)
+    if len(candles) < 60:
+        return None
+    highs = [c[3] for c in candles]
+    lows = [c[4] for c in candles]
+    closes = [c[2] for c in candles]
+
+    structure = detect_market_structure(candles, cfg.pivot_window)
+    if structure == "range":
+        return None
+    side = "long" if structure == "up" else "short"
+
+    atr = atr_wilder(highs, lows, closes, cfg.atr_period)
+    if not atr or atr <= 0:
+        return None
+
+    # Consolidation breakout in the trend direction (entry trigger).
+    rect = find_consolidation(candles, cfg, side, atr)
+    if rect is None:
+        return None
+
+    entry = closes[-1]
+    sl_buffer = max(cfg.atr_sl_multiplier * atr, entry * (cfg.sl_padding_pct / 100))
+    if side == "long":
+        stop_loss = rect["low"] - sl_buffer
+    else:
+        stop_loss = rect["high"] + sl_buffer
+    risk = abs(entry - stop_loss)
+    if risk <= 0:
+        return None
+
+    # Unfilled FVGs in trade direction, positioned as targets beyond entry.
+    fvgs = detect_all_fvgs(highs, lows, cfg.fvg_lookback)
+    if side == "long":
+        targets = [f for f in fvgs if f["kind"] == "bullish" and f["bottom"] > entry]
+        targets.sort(key=lambda f: f["bottom"])  # nearest first
+        tp_edge = lambda f: f["bottom"]
+    else:
+        targets = [f for f in fvgs if f["kind"] == "bearish" and f["top"] < entry]
+        targets.sort(key=lambda f: -f["top"])  # nearest first
+        tp_edge = lambda f: f["top"]
+
+    if not targets:
+        return None  # need at least TP1
+    tp1 = tp_edge(targets[0])  # nearest unfilled FVG edge
+    # Origin/important FVG = the largest-gap unfilled FVG in trend direction.
+    origin = max(targets, key=lambda f: f["gap"])
+    tp2 = tp_edge(origin) if origin is not targets[0] else 0.0
+    take_profit = tp1  # primary target for charting/base flow
+
+    return Signal(
+        symbol=symbol, timeframe=tf, side=side,
+        entry=round(entry, 8), stop_loss=round(stop_loss, 8),
+        take_profit=round(take_profit, 8), rr_ratio=cfg.rr_ratio,
+        confirmations=["Market Structure", "Impulse FVG", "Consolidation Breakout"],
+        strength=3, score=0.0, max_score=0.0,
+        strategy="impulse_fvg",
+        tp1=round(tp1, 8), tp2=round(tp2, 8),
+        consolidation_high=round(rect["high"], 8),
+        consolidation_low=round(rect["low"], 8),
+        rsi_value=0.0, volume_ratio=0.0,
+        created_at=datetime.now(timezone.utc).isoformat(),
+        fvg_top=round(origin["top"], 8), fvg_bottom=round(origin["bottom"], 8),
+        atr=round(atr, 8), atr_multiplier=cfg.atr_sl_multiplier,
+    )
+
+
+
+
+# ===========================================================================
+# STRATEGY 3: Counter-trend reversal at consolidation (spec-exact)
+# impulse -> FVG (with trend) -> consolidation -> reversal pattern AGAINST
+# trend -> enter AGAINST trend, target = impulse FVG edge. + strict RSI filters.
+# ===========================================================================
+def _higher_tf(tf: str) -> str:
+    return {"15m": "1h", "1h": "4h", "4h": "1d", "1d": "1d"}.get(tf, "1h")
+
+
+def detect_reversal_pattern(opens, highs, lows, closes, against: str) -> Optional[str]:
+    """Detect engulfing or star pattern oriented `against` ('bearish'|'bullish')."""
+    if len(closes) < 3:
+        return None
+    o1, c1 = opens[-2], closes[-2]
+    o0, c0 = opens[-1], closes[-1]
+    if against == "bearish":  # trend up -> want bearish reversal
+        # Bearish engulfing
+        if c1 > o1 and c0 < o0 and c0 <= o1 and o0 >= c1:
+            return "Bearish Engulfing"
+        # Evening star (3 candles)
+        o2, c2 = opens[-3], closes[-3]
+        mid_small = abs(c1 - o1) < abs(c2 - o2) * 0.5
+        if c2 > o2 and mid_small and c0 < o0 and c0 < (o2 + c2) / 2:
+            return "Evening Star"
+    else:  # trend down -> want bullish reversal
+        if c1 < o1 and c0 > o0 and c0 >= o1 and o0 <= c1:
+            return "Bullish Engulfing"
+        o2, c2 = opens[-3], closes[-3]
+        mid_small = abs(c1 - o1) < abs(c2 - o2) * 0.5
+        if c2 < o2 and mid_small and c0 > o0 and c0 > (o2 + c2) / 2:
+            return "Morning Star"
+    return None
+
+
+def _rsi_momentum_turn(rsis: list[Optional[float]], side: str, ob: float, os_: float) -> bool:
+    vals = [r for r in rsis[-4:] if r is not None]
+    if len(vals) < 2:
+        return False
+    prev, cur = vals[-2], vals[-1]
+    if side == "long":
+        return prev < os_ and cur > os_  # was <30, turning up
+    return prev > ob and cur < ob  # was >70, turning down
+
+
+async def analyze_pair_counter(symbol: str, tf: str, cfg: Config) -> Optional[Signal]:
+    candles = await kucoin.get_klines(symbol, tf)
+    if len(candles) < 60:
+        return None
+    opens = [c[1] for c in candles]
+    closes = [c[2] for c in candles]
+    highs = [c[3] for c in candles]
+    lows = [c[4] for c in candles]
+
+    # Step 1: trend
+    structure = detect_market_structure(candles, cfg.pivot_window)
+    if structure == "range":
+        return None
+    trend = structure  # 'up' or 'down'
+    entry_side = "short" if trend == "up" else "long"  # AGAINST the trend
+
+    atr = atr_wilder(highs, lows, closes, cfg.atr_period)
+    if not atr or atr <= 0:
+        return None
+
+    # Step 2: impulse FVG in the TREND direction (most significant = largest gap)
+    fvgs = detect_all_fvgs(highs, lows, cfg.fvg_lookback)
+    trend_kind = "bullish" if trend == "up" else "bearish"
+    impulse_fvgs = [f for f in fvgs if f["kind"] == trend_kind]
+    if not impulse_fvgs:
+        return None
+    origin = max(impulse_fvgs, key=lambda f: f["gap"])
+
+    # Step 3: consolidation (tight range) in the recent candles
+    k = cfg.consolidation_min_candles
+    box = candles[-(k + 1):-1]
+    if len(box) < k:
+        return None
+    if (max(c[3] for c in box) - min(c[4] for c in box)) > cfg.consolidation_max_atr * atr:
+        return None
+
+    # Step 4: reversal pattern AGAINST the trend
+    against = "bearish" if trend == "up" else "bullish"
+    pattern = detect_reversal_pattern(opens, highs, lows, closes, against)
+    if pattern is None:
+        return None  # continuation-oriented or none -> NEVER open
+
+    # Step 1bis: RSI filters (ALL three required)
+    rsis = rsi_wilder(closes, cfg.rsi_period)
+    # (a) higher-TF extreme
+    htf = _higher_tf(tf)
+    hcandles = await kucoin.get_klines(symbol, htf)
+    hrsis = rsi_wilder([c[2] for c in hcandles], cfg.rsi_period) if len(hcandles) > cfg.rsi_period else []
+    hval = next((r for r in reversed(hrsis) if r is not None), None)
+    if hval is None:
+        return None
+    if entry_side == "long" and hval > cfg.rsi_high_tf_os:
+        return None
+    if entry_side == "short" and hval < cfg.rsi_high_tf_ob:
+        return None
+    # (b) momentum turn on trade TF
+    if not _rsi_momentum_turn(rsis, entry_side, cfg.rsi_overbought, cfg.rsi_oversold):
+        return None
+    # (c) divergence coherent with entry
+    div = detect_rsi_divergence(closes, rsis, cfg.pivot_window)
+    if (entry_side == "long" and div != "bullish") or (entry_side == "short" and div != "bearish"):
+        return None
+
+    # Step 5/6: entry immediate; target = impulse FVG edge
+    entry = closes[-1]
+    # SL beyond the IMPULSE EXTREME (not the FVG edge)
+    i = origin["index"]
+    seg_hi = max(highs[max(0, i - 2):i + 1])
+    seg_lo = min(lows[max(0, i - 2):i + 1])
+    sl_buffer = max(cfg.atr_sl_multiplier * atr, entry * (cfg.sl_padding_pct / 100))
+    mid = (origin["top"] + origin["bottom"]) / 2  # 50% of the FVG zone
+    if entry_side == "long":
+        stop_loss = seg_lo - sl_buffer
+        tp1 = origin["bottom"]  # TP1 = touch of the FVG zone (near edge)
+        tp2 = mid               # TP2 = 50% of the FVG zone
+    else:
+        stop_loss = seg_hi + sl_buffer
+        tp1 = origin["top"]     # TP1 = touch of the FVG zone (near edge)
+        tp2 = mid               # TP2 = 50% of the FVG zone
+    risk = abs(entry - stop_loss)
+    if risk <= 0:
+        return None
+    # target must be beyond entry in trade direction
+    if (entry_side == "long" and tp1 <= entry) or (entry_side == "short" and tp1 >= entry):
+        return None
+
+    return Signal(
+        symbol=symbol, timeframe=tf, side=entry_side,
+        entry=round(entry, 8), stop_loss=round(stop_loss, 8),
+        take_profit=round(tp1, 8), rr_ratio=cfg.rr_ratio,
+        confirmations=["Counter-Trend", pattern, "RSI HTF Extreme",
+                       "RSI Momentum Turn", "RSI Divergence"],
+        strength=5, score=0.0, max_score=0.0,
+        strategy="counter_trend",
+        tp1=round(tp1, 8), tp2=round(tp2, 8),
+        consolidation_high=round(max(c[3] for c in box), 8),
+        consolidation_low=round(min(c[4] for c in box), 8),
+        rsi_value=round(next((r for r in reversed(rsis) if r is not None), 0) or 0, 2),
+        volume_ratio=0.0,
+        created_at=datetime.now(timezone.utc).isoformat(),
+        fvg_top=round(origin["top"], 8), fvg_bottom=round(origin["bottom"], 8),
+        atr=round(atr, 8), atr_multiplier=cfg.atr_sl_multiplier,
+    )
+
+
 scan_state = ScanState()
 
 
@@ -1438,9 +1821,18 @@ async def run_scan() -> dict[str, Any]:
         async def process(sym: str) -> None:
             for tf in cfg.timeframes:
                 try:
-                    sig = await analyze_pair(sym, tf, cfg)
-                    if sig:
-                        signals_found.append(sig)
+                    if cfg.strategy_mode in ("scoring", "both"):
+                        sig = await analyze_pair(sym, tf, cfg)
+                        if sig:
+                            signals_found.append(sig)
+                    if cfg.strategy_mode in ("impulse_fvg", "both"):
+                        sig2 = await analyze_pair_impulse(sym, tf, cfg)
+                        if sig2:
+                            signals_found.append(sig2)
+                    if cfg.strategy_mode in ("counter_trend", "both"):
+                        sig3 = await analyze_pair_counter(sym, tf, cfg)
+                        if sig3:
+                            signals_found.append(sig3)
                 except Exception as e:  # noqa: BLE001
                     logger.debug("analyze %s %s failed: %s", sym, tf, e)
 
@@ -1982,6 +2374,19 @@ async def paper_set_trading_mode(payload: dict[str, str]) -> dict[str, Any]:
     pcfg.trading_mode = mode
     await save_paper_config(pcfg)
     return {"ok": True, "trading_mode": mode}
+
+
+@api.post("/strategy-mode")
+async def set_strategy_mode(payload: dict[str, str]) -> dict[str, Any]:
+    """Select signal strategy: 'scoring', 'impulse_fvg' or 'both'."""
+    mode = payload.get("strategy_mode", "").lower()
+    if mode not in ("scoring", "impulse_fvg", "counter_trend", "both"):
+        raise HTTPException(status_code=400, detail="invalid strategy_mode")
+    cfg = await get_config()
+    cfg.strategy_mode = mode
+    await save_config(cfg)
+    return {"ok": True, "strategy_mode": mode}
+
 
 
 # ---------------------------------------------------------------------------

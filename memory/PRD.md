@@ -29,6 +29,25 @@ Scheduler asyncio in background esegue `run_scan()` ogni `scan_interval_minutes`
 - **(tabs)/settings** — Form completo per parametri + sezione Paper Trading (auto-execute, initial capital, risk %, max positions) + disclaimer
 - **detail/[id]** — Grafico candlestick SVG con zone FVG, linee entry/SL/TP, sub-grafico RSI + bottone sticky "Execute Paper"
 
+## Strategia 3: Counter-Trend Reversal (spec-exact, additiva)
+`strategy_mode="counter_trend"`: trend (struttura) → FVG d'impulso in direzione trend (gap maggiore) → consolidamento → **pattern di reversal CONTRO il trend** (engulfing/star) → entrata **contro-trend** → target sulla zona FVG d'impulso. Filtri RSI obbligatori (AND): RSI HTF estremo (≤20 long / ≥80 short), momentum turn sul TF del trade, divergenza prezzo/RSI coerente. SL oltre l'**estremo dell'impulso** (non il bordo FVG). **TP1 = tocco della zona FVG** (bordo vicino), **TP2 = 50% della zona** (midpoint); 65%/35%. Breakeven al doppio tocco dell'entry; trailing 1% dall'entry. Multi-TF, spot/leverage. Segnali rari per design (filtri RSI molto stretti).
+
+## Bugfix RSI alignment
+`get_klines` scarta la candela in formazione → logica di segnale e grafico usano le stesse candele CHIUSE con la stessa `rsi_wilder`. Verificato dal testing agent (22 passati).
+
+## Strategia 2: Impulse FVG + Consolidamento + TP multipli (additiva, selezionabile)
+Nuova strategia selezionabile via `strategy_mode` ("scoring" | "impulse_fvg" | "both"), senza modificare quella a punteggio né lo stop ATR:
+- **Trend** da struttura di mercato: HH+HL = up, LH+LL = down, altrimenti range (nessun setup)
+- **Candela d'impulso** → FVG d'origine = target finale TP2 (FVG non colmato di gap maggiore in direzione trend)
+- **Consolidamento** = rettangolo trigger (≥ `consolidation_min_candles` entro canale < `consolidation_max_atr`×ATR)
+- **Entry** su rottura in CHIUSURA del box, SOLO nella direzione del trend (long in up, short in down — mai invertito)
+- **SL** sotto/sopra il box (non l'FVG) + buffer ATR/spread esistente
+- **TP1** = bordo FVG non colmato più vicino (chiude `tp1_pct` 65%, poi sposta il resto a breakeven a chiusura oltre TP1); **TP2** = bordo FVG d'origine (35%); fallback trailing se manca TP2
+- Esecuzione TP1/TP2 gestita in `manage_impulse_position` nel monitor paper (il timeout/1R-partial generico non gira per queste posizioni)
+- Config: `strategy_mode`, `impulse_atr_mult`, `consolidation_min_candles`, `consolidation_max_atr`, `tp1_pct`, `tp2_pct`. Endpoint `POST /api/strategy-mode`
+- UI: selettore strategia (3 vie) + sezione "Impulse FVG Strategy" in Settings; TP1/TP2 e ragionamento (Market Structure / Impulse FVG / Consolidation Breakout) nel Detail
+- Verificato: 15/15 backend, invarianti di direzione rispettati (segnali impulse rari per design)
+
 ## Position Management: Timeout + Breakeven + Trailing (moduli additivi)
 Tre moduli nuovi, integrati SOLO nel monitor paper esistente (nessuna modifica a FVG/RSI/scoring/stop ATR):
 - **TimeoutManager**: tabella per timeframe (15m=14, 1h=7, 4h=5, 1d=3 candele). Se candele trascorse ≥ timeout e profit_in_R < 0.3 → sposta stop a breakeven
