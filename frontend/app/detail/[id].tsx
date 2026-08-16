@@ -136,7 +136,7 @@ export default function DetailScreen() {
             color={colors.onSurface}
           />
         </View>
-        {signal.strategy === "impulse_fvg" && (
+        {(signal.strategy === "impulse_fvg" || signal.strategy === "counter_trend") && (
           <View style={styles.gridRow}>
             <Metric label="TP1 (65%)" value={formatPrice(signal.tp1 || 0)} color={colors.success} />
             <Metric
@@ -509,6 +509,18 @@ function reasonFor(criterion: string, s: Signal, isLong: boolean): string {
       return isLong
         ? "Rottura in chiusura sopra il box di consolidamento: trigger d'ingresso long."
         : "Rottura in chiusura sotto il box di consolidamento: trigger d'ingresso short.";
+    case "Bullish Engulfing":
+    case "Morning Star":
+      return "Pattern di reversal rialzista dentro il consolidamento: la spinta ribassista dell'impulso si esaurisce prima della FVG.";
+    case "Bearish Engulfing":
+    case "Evening Star":
+      return "Pattern di reversal ribassista dentro il consolidamento: la spinta rialzista dell'impulso si esaurisce prima della FVG.";
+    case "RSI HTF Extreme":
+      return isLong
+        ? "RSI del timeframe superiore in ipervenduto: contesto favorevole a un rimbalzo."
+        : "RSI del timeframe superiore in ipercomprato: contesto favorevole a una discesa.";
+    case "RSI Momentum Turn":
+      return "RSI sta invertendo la direzione sul timeframe del trade: momentum in cambiamento a favore dell'ingresso.";
     default:
       return "Conferma tecnica aggiuntiva rilevata dall'algoritmo.";
   }

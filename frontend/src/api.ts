@@ -84,6 +84,7 @@ export type Config = {
   consolidation_max_atr: number;
   tp1_pct: number;
   tp2_pct: number;
+  post_tp1_advance_pct: number;
   max_pairs_per_scan: number;
   enabled_pairs: string[];
   excluded_pairs: string[];

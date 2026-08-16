@@ -101,3 +101,90 @@
 #====================================================================================================
 # Testing Data - Main Agent and testing sub agent both should log testing data below this section
 #====================================================================================================
+
+user_problem_statement: |
+  Parte 1: riscrivere la logica di entry della strategia counter_trend (chip "Rev Pre-FVG")
+  con reversal PRE-FVG nel consolidamento. Sequenza: impulso -> FVG lasciata indietro ->
+  consolidamento -> pattern reversal DENTRO il box -> breakout in chiusura. Direzione trade =
+  direzione breakout. Target = bordo opposto (lontano) della FVG nella direzione del breakout;
+  TP1 = midpoint FVG (65%), TP2 = bordo lontano (35%). SL oltre il box.
+  Parte 2: gestione SL post-TP1 -> a TP1 chiude 65% e mantiene lo SL ATR; solo quando il prezzo
+  avanza +0.5% oltre TP1 sposta lo SL a TP1+commissioni; altrimenti mantiene lo SL ATR. TP2 chiude il resto.
+
+backend:
+  - task: "Strategia Reversal Pre-FVG (riscrittura analyze_pair_counter)"
+    implemented: true
+    working: "NA"
+    file: "backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: true
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: "Riscritta analyze_pair_counter: box consolidamento -> direzione da breakout in chiusura -> pattern reversal dentro il box -> FVG target nella direzione del breakout (long=bearish FVG sopra, short=bullish FVG sotto) -> TP2=bordo lontano, TP1=midpoint -> SL oltre il box -> conferme volume+RSI. Validato con test sintetico (/tmp/test_counter_entry.py): LONG entry=box_high, SL<box_low, TP1=midpoint, TP2=far edge. Scan reale counter_trend 200 OK, 0 segnali (filtri rari per design). Serve retest con mocking di kucoin.get_klines per LONG e SHORT + gate R:R e invarianti direzione."
+  - task: "Gestione SL post-TP1 (manage_counter_position + post_tp1_advance_pct)"
+    implemented: true
+    working: "NA"
+    file: "backend/server.py"
+    stuck_count: 0
+    priority: "high"
+    needs_retesting: true
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: "Nuovo manage_counter_position instradato in manage_open_position per strategy=counter_trend; monitor tp_check esteso a counter_trend. A TP1 chiude tp1_pct 65% e MANTIENE lo SL ATR (no breakeven immediato). Dopo +post_tp1_advance_pct (0.5%) oltre TP1 sposta SL a TP1+fee; altrimenti resta ATR. TP2 chiude il resto. Validato macchina a stati con /tmp/test_counter.py (tutti i casi passati)."
+
+frontend:
+  - task: "Settings: chip 'Rev Pre-FVG' + sezione Reversal Pre-FVG Strategy"
+    implemented: true
+    working: "NA"
+    file: "frontend/app/(tabs)/settings.tsx"
+    stuck_count: 0
+    priority: "medium"
+    needs_retesting: true
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: "Chip strategy-counter_trend rinominato 'Rev Pre-FVG'. Nuova sezione con input consolidamento/TP1/TP2/post_tp1_advance_pct (testID input-ct-*). Verificato via screenshot: sezione visibile con avanzamento post-TP1=0.5. Aggiunto campo post_tp1_advance_pct al tipo Config in src/api.ts."
+  - task: "Detail: TP1/TP2 e spiegazioni per counter_trend"
+    implemented: true
+    working: "NA"
+    file: "frontend/app/detail/[id].tsx"
+    stuck_count: 0
+    priority: "low"
+    needs_retesting: true
+    status_history:
+        - working: "NA"
+          agent: "main"
+          comment: "Riga TP1(65%)/TP2(35%) ora mostrata anche per strategy=counter_trend; aggiunte spiegazioni reasonFor per pattern (Engulfing/Star), RSI HTF Extreme, RSI Momentum Turn."
+
+metadata:
+  created_by: "main_agent"
+  version: "1.1"
+  test_sequence: 9
+  run_ui: false
+
+test_plan:
+  current_focus:
+    - "Strategia Reversal Pre-FVG (riscrittura analyze_pair_counter)"
+    - "Gestione SL post-TP1 (manage_counter_position + post_tp1_advance_pct)"
+  stuck_tasks: []
+  test_all: false
+  test_priority: "high_first"
+
+agent_communication:
+    - agent: "main"
+      message: |
+        Implementate Parte 1 (entry reversal pre-FVG, riscrittura analyze_pair_counter) e Parte 2
+        (gestione SL post-TP1, manage_counter_position). Ho gia' validato con test sintetici locali
+        (/tmp/test_counter.py e /tmp/test_counter_entry.py) sia la macchina a stati post-TP1 sia
+        l'entry LONG. Serve testing BACKEND: mockare kucoin.get_klines per costruire scenari LONG e
+        SHORT deterministici e verificare: (1) direzione = breakout, (2) target = FVG opposta nella
+        direzione del breakout (long=bearish FVG sopra -> TP2=top, short=bullish FVG sotto -> TP2=bottom),
+        (3) TP1=midpoint, entry=box breakout level, SL oltre il box, (4) gate R:R (scarta se est_rr<min_rr_ratio),
+        (5) manage_counter_position: TP1 65% mantiene SL ATR, +0.5% -> SL a TP1+fee, altrimenti SL resta, TP2 chiude.
+        Endpoint: PUT /api/config {"strategy_mode":"counter_trend"}, POST /api/scan, GET /api/signals.
+        FRONTEND (solo smoke): chip 'Rev Pre-FVG' (testID strategy-counter_trend) mostra la sezione
+        "Reversal Pre-FVG Strategy" con input-ct-* e persiste post_tp1_advance_pct su Save.
+        NON regredire: strategie scoring/impulse_fvg, Reset History, portfolio.

@@ -118,6 +118,7 @@ class Config(BaseModel):
     rsi_high_tf_ob: float = 80.0  # higher-TF overbought (short)
     rsi_high_tf_os: float = 20.0  # higher-TF oversold (long)
     trailing_pct_from_entry: float = 1.0  # counter-trend trailing distance %
+    post_tp1_advance_pct: float = 0.5  # % beyond TP1 before moving SL to TP1 (net fees)
 
 
 class Signal(BaseModel):
@@ -1209,6 +1210,55 @@ async def manage_impulse_position(pos: dict[str, Any], price: float, cfg: Config
 
 
 
+async def manage_counter_position(pos: dict[str, Any], price: float, cfg: Config) -> dict[str, Any]:
+    """Pre-FVG reversal execution: close tp1_pct at TP1 on candle-close; keep the
+    ORIGINAL ATR stop until price advances post_tp1_advance_pct beyond TP1, then
+    move the stop to TP1 (net of fees); TP2 closes the remainder."""
+    tf = pos.get("timeframe", "1h")
+    tp1 = float(pos.get("tp1") or 0)
+    tp2 = float(pos.get("tp2") or 0)
+    long = pos["side"] == "long"
+    last_close = await _last_closed_close(pos["symbol"], tf)
+    if last_close is None:
+        return pos
+
+    if not pos.get("partial_closed"):
+        hit_tp1 = last_close >= tp1 if long else last_close <= tp1
+        if tp1 > 0 and hit_tp1:
+            remain = await _close_fraction(pos, tp1, cfg.tp1_pct / 100, "tp1")
+            # Keep the ORIGINAL ATR stop (do NOT move to breakeven yet).
+            await db.paper_positions.update_one(
+                {"id": pos["id"]}, {"$set": {"quantity": round(remain, 8)}}
+            )
+            pos = {**pos, "partial_closed": True, "quantity": remain}
+        return pos
+
+    # After TP1: move the stop to TP1 (net fees) only after +post_tp1_advance_pct
+    # beyond TP1. If that advance never happens, the original ATR stop stays.
+    if not pos.get("breakeven_active"):
+        advance = tp1 * (cfg.post_tp1_advance_pct / 100)
+        reached = (price >= tp1 + advance) if long else (price <= tp1 - advance)
+        if reached:
+            maker, taker = await get_trade_fees(pos["symbol"], cfg)
+            fee_cost = tp1 * (maker + taker)
+            new_stop = tp1 + fee_cost if long else tp1 - fee_cost
+            await db.paper_positions.update_one(
+                {"id": pos["id"]},
+                {"$set": {"current_stop": round(new_stop, 8), "breakeven_active": True}},
+            )
+            pos = {**pos, "current_stop": new_stop, "breakeven_active": True}
+
+    # TP2 closes the remainder (also handled on live price in the monitor).
+    if tp2 > 0:
+        hit_tp2 = last_close >= tp2 if long else last_close <= tp2
+        if hit_tp2:
+            await close_paper_position(pos, tp2, "win")
+            return {**pos, "quantity": 0}
+    return pos
+
+
+
+
 async def manage_open_position(pos: dict[str, Any], price: float, cfg: Config) -> dict[str, Any]:
     """Run the 3 additive managers + partial close. Returns the possibly-updated
     position dict (with fresh current_stop)."""
@@ -1216,6 +1266,9 @@ async def manage_open_position(pos: dict[str, Any], price: float, cfg: Config) -
     # Impulse strategy has its own TP1/TP2 execution path.
     if pos.get("strategy") == "impulse_fvg":
         return await manage_impulse_position(pos, price, cfg)
+    # Pre-FVG reversal strategy has its own TP1/TP2 + post-TP1 stop path.
+    if pos.get("strategy") == "counter_trend":
+        return await manage_counter_position(pos, price, cfg)
     # Partial close first (does not affect stop)
     await maybe_partial_close(pos, price, cfg)
     # Timeout -> breakeven
@@ -1268,7 +1321,7 @@ async def monitor_paper_positions() -> None:
         # For impulse strategy the primary fixed target is TP2 (if any); the base
         # take_profit equals TP1 which the manager already handles on candle close.
         tp_check = pos["take_profit"]
-        if pos.get("strategy") == "impulse_fvg":
+        if pos.get("strategy") in ("impulse_fvg", "counter_trend"):
             # Fixed TP2 close only AFTER TP1 partial is taken; before that the
             # manager handles TP1 on candle close. If no TP2, rely on trailing.
             if pos.get("partial_closed") and float(pos.get("tp2") or 0) > 0:
@@ -1667,6 +1720,15 @@ def _rsi_momentum_turn(rsis: list[Optional[float]], side: str, ob: float, os_: f
 
 
 async def analyze_pair_counter(symbol: str, tf: str, cfg: Config) -> Optional[Signal]:
+    """Pre-FVG reversal breakout strategy (spec-exact, replaces old counter-trend).
+
+    Sequence: an impulse leaves an unfilled FVG -> price consolidates in a tight
+    box -> a reversal candle pattern forms INSIDE the box -> price breaks the box.
+    Trade direction = the breakout direction. Target = the OPPOSITE (far) edge of
+    the FVG left behind by the impulse the reversal contradicts, in the same
+    direction as the breakout. Confirmations: volume spike on the breakout + the
+    RSI filters (HTF extreme, momentum turn, divergence coherent with entry).
+    """
     candles = await kucoin.get_klines(symbol, tf)
     if len(candles) < 60:
         return None
@@ -1674,99 +1736,122 @@ async def analyze_pair_counter(symbol: str, tf: str, cfg: Config) -> Optional[Si
     closes = [c[2] for c in candles]
     highs = [c[3] for c in candles]
     lows = [c[4] for c in candles]
-
-    # Step 1: trend
-    structure = detect_market_structure(candles, cfg.pivot_window)
-    if structure == "range":
-        return None
-    trend = structure  # 'up' or 'down'
-    entry_side = "short" if trend == "up" else "long"  # AGAINST the trend
+    vols = [c[5] for c in candles]
 
     atr = atr_wilder(highs, lows, closes, cfg.atr_period)
     if not atr or atr <= 0:
         return None
 
-    # Step 2: impulse FVG in the TREND direction (most significant = largest gap)
-    fvgs = detect_all_fvgs(highs, lows, cfg.fvg_lookback)
-    trend_kind = "bullish" if trend == "up" else "bearish"
-    impulse_fvgs = [f for f in fvgs if f["kind"] == trend_kind]
-    if not impulse_fvgs:
-        return None
-    origin = max(impulse_fvgs, key=lambda f: f["gap"])
-
-    # Step 3: consolidation (tight range) in the recent candles
+    # Step 1: consolidation box = the K candles BEFORE the last (breakout) candle.
     k = cfg.consolidation_min_candles
+    if len(candles) < k + 2:
+        return None
     box = candles[-(k + 1):-1]
-    if len(box) < k:
-        return None
-    if (max(c[3] for c in box) - min(c[4] for c in box)) > cfg.consolidation_max_atr * atr:
+    box_high = max(c[3] for c in box)
+    box_low = min(c[4] for c in box)
+    if (box_high - box_low) > cfg.consolidation_max_atr * atr:
         return None
 
-    # Step 4: reversal pattern AGAINST the trend
-    against = "bearish" if trend == "up" else "bullish"
-    pattern = detect_reversal_pattern(opens, highs, lows, closes, against)
+    # Step 2: breakout direction from the last CLOSED candle (close-confirmed).
+    bo_close = closes[-1]
+    if bo_close > box_high:
+        side = "long"
+    elif bo_close < box_low:
+        side = "short"
+    else:
+        return None
+
+    # Step 3: reversal pattern INSIDE the consolidation (before the breakout).
+    #   long  -> bullish reversal (bullish engulfing / morning star)
+    #   short -> bearish reversal (bearish engulfing / evening star)
+    against = "bullish" if side == "long" else "bearish"
+    pattern = detect_reversal_pattern(
+        [c[1] for c in box], [c[3] for c in box],
+        [c[4] for c in box], [c[2] for c in box], against,
+    )
     if pattern is None:
-        return None  # continuation-oriented or none -> NEVER open
+        return None
 
-    # Step 1bis: RSI filters (ALL three required)
+    # Step 4: the impulse FVG the reversal contradicts, in the breakout direction.
+    #   long  -> a BEARISH FVG above  (impulse was down; price fills upward)
+    #   short -> a BULLISH FVG below  (impulse was up; price fills downward)
+    entry = box_high if side == "long" else box_low
+    fvgs = detect_all_fvgs(highs, lows, cfg.fvg_lookback)
+    if side == "long":
+        targets = [f for f in fvgs if f["kind"] == "bearish" and f["top"] > entry]
+        targets.sort(key=lambda f: f["top"])  # nearest far-edge first
+    else:
+        targets = [f for f in fvgs if f["kind"] == "bullish" and f["bottom"] < entry]
+        targets.sort(key=lambda f: -f["bottom"])
+    if not targets:
+        return None
+    target_fvg = targets[0]
+    far_edge = target_fvg["top"] if side == "long" else target_fvg["bottom"]
+    midpoint = (target_fvg["top"] + target_fvg["bottom"]) / 2
+
+    # TP2 = far (opposite) edge of the FVG; TP1 = an intermediate level inside it.
+    tp2 = far_edge
+    tp1 = midpoint
+    if side == "long":
+        if tp1 <= entry:
+            tp1 = entry + (tp2 - entry) * 0.5
+        if tp2 <= entry:
+            return None
+    else:
+        if tp1 >= entry:
+            tp1 = entry - (entry - tp2) * 0.5
+        if tp2 >= entry:
+            return None
+
+    # Step 5: stop beyond the consolidation box (ATR/structure buffer).
+    sl_buffer = max(cfg.atr_sl_multiplier * atr, entry * (cfg.sl_padding_pct / 100))
+    stop_loss = (box_low - sl_buffer) if side == "long" else (box_high + sl_buffer)
+    risk = abs(entry - stop_loss)
+    if risk <= 0:
+        return None
+    est_rr = abs(tp2 - entry) / risk
+    if est_rr < cfg.min_rr_ratio:
+        return None
+
+    # Step 6: confirmations — volume spike on breakout + RSI filters.
+    vol_ratio = volume_spike_ratio(vols, cfg.volume_ma_period)
+    if vol_ratio < cfg.volume_spike_multiplier:
+        return None
     rsis = rsi_wilder(closes, cfg.rsi_period)
-    # (a) higher-TF extreme
+    # (a) higher-TF extreme (oversold for long / overbought for short)
     htf = _higher_tf(tf)
     hcandles = await kucoin.get_klines(symbol, htf)
     hrsis = rsi_wilder([c[2] for c in hcandles], cfg.rsi_period) if len(hcandles) > cfg.rsi_period else []
     hval = next((r for r in reversed(hrsis) if r is not None), None)
     if hval is None:
         return None
-    if entry_side == "long" and hval > cfg.rsi_high_tf_os:
+    if side == "long" and hval > cfg.rsi_high_tf_os:
         return None
-    if entry_side == "short" and hval < cfg.rsi_high_tf_ob:
+    if side == "short" and hval < cfg.rsi_high_tf_ob:
         return None
-    # (b) momentum turn on trade TF
-    if not _rsi_momentum_turn(rsis, entry_side, cfg.rsi_overbought, cfg.rsi_oversold):
+    # (b) momentum turn on the trade timeframe
+    if not _rsi_momentum_turn(rsis, side, cfg.rsi_overbought, cfg.rsi_oversold):
         return None
-    # (c) divergence coherent with entry
+    # (c) divergence coherent with the trade direction
     div = detect_rsi_divergence(closes, rsis, cfg.pivot_window)
-    if (entry_side == "long" and div != "bullish") or (entry_side == "short" and div != "bearish"):
-        return None
-
-    # Step 5/6: entry immediate; target = impulse FVG edge
-    entry = closes[-1]
-    # SL beyond the IMPULSE EXTREME (not the FVG edge)
-    i = origin["index"]
-    seg_hi = max(highs[max(0, i - 2):i + 1])
-    seg_lo = min(lows[max(0, i - 2):i + 1])
-    sl_buffer = max(cfg.atr_sl_multiplier * atr, entry * (cfg.sl_padding_pct / 100))
-    mid = (origin["top"] + origin["bottom"]) / 2  # 50% of the FVG zone
-    if entry_side == "long":
-        stop_loss = seg_lo - sl_buffer
-        tp1 = origin["bottom"]  # TP1 = touch of the FVG zone (near edge)
-        tp2 = mid               # TP2 = 50% of the FVG zone
-    else:
-        stop_loss = seg_hi + sl_buffer
-        tp1 = origin["top"]     # TP1 = touch of the FVG zone (near edge)
-        tp2 = mid               # TP2 = 50% of the FVG zone
-    risk = abs(entry - stop_loss)
-    if risk <= 0:
-        return None
-    # target must be beyond entry in trade direction
-    if (entry_side == "long" and tp1 <= entry) or (entry_side == "short" and tp1 >= entry):
+    if (side == "long" and div != "bullish") or (side == "short" and div != "bearish"):
         return None
 
     return Signal(
-        symbol=symbol, timeframe=tf, side=entry_side,
+        symbol=symbol, timeframe=tf, side=side,
         entry=round(entry, 8), stop_loss=round(stop_loss, 8),
         take_profit=round(tp1, 8), rr_ratio=cfg.rr_ratio,
-        confirmations=["Counter-Trend", pattern, "RSI HTF Extreme",
-                       "RSI Momentum Turn", "RSI Divergence"],
-        strength=5, score=0.0, max_score=0.0,
+        confirmations=["Consolidation Breakout", pattern, "Volume Spike",
+                       "RSI HTF Extreme", "RSI Momentum Turn", "RSI Divergence"],
+        strength=6, score=0.0, max_score=0.0,
         strategy="counter_trend",
         tp1=round(tp1, 8), tp2=round(tp2, 8),
-        consolidation_high=round(max(c[3] for c in box), 8),
-        consolidation_low=round(min(c[4] for c in box), 8),
+        consolidation_high=round(box_high, 8),
+        consolidation_low=round(box_low, 8),
         rsi_value=round(next((r for r in reversed(rsis) if r is not None), 0) or 0, 2),
-        volume_ratio=0.0,
+        volume_ratio=round(vol_ratio, 2),
         created_at=datetime.now(timezone.utc).isoformat(),
-        fvg_top=round(origin["top"], 8), fvg_bottom=round(origin["bottom"], 8),
+        fvg_top=round(target_fvg["top"], 8), fvg_bottom=round(target_fvg["bottom"], 8),
         atr=round(atr, 8), atr_multiplier=cfg.atr_sl_multiplier,
     )
 

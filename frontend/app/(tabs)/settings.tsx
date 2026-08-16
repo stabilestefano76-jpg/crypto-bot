@@ -107,7 +107,7 @@ export default function SettingsScreen() {
               {([
                 ["scoring", "Scoring"],
                 ["impulse_fvg", "Impulse FVG"],
-                ["counter_trend", "Counter-Trend"],
+                ["counter_trend", "Rev Pre-FVG"],
                 ["both", "Entrambe"],
               ] as const).map(([val, label]) => {
                 const active = cfg.strategy_mode === val;
@@ -129,9 +129,53 @@ export default function SettingsScreen() {
             </View>
             <Text style={styles.scoreHintText}>
               Scoring = confluenza a punteggio. Impulse FVG = trend + impulso +
-              breakout del consolidamento con TP1/TP2. Entrambe = attive insieme.
+              breakout del consolidamento con TP1/TP2. Rev Pre-FVG = impulso →
+              FVG → consolidamento → reversal → breakout verso il fill FVG.
+              Entrambe = attive insieme.
             </Text>
           </Section>
+
+          {(cfg.strategy_mode === "counter_trend" || cfg.strategy_mode === "both") && (
+            <Section title="Reversal Pre-FVG Strategy">
+              <NumRow
+                label="Min. candele consolidamento"
+                value={cfg.consolidation_min_candles}
+                onChange={(v) => update({ consolidation_min_candles: v })}
+                testID="input-ct-consol-min"
+              />
+              <NumRow
+                label="Max ampiezza box (×ATR)"
+                value={cfg.consolidation_max_atr}
+                onChange={(v) => update({ consolidation_max_atr: v })}
+                step={0.1}
+                testID="input-ct-consol-atr"
+              />
+              <NumRow
+                label="Quota TP1 (%)"
+                value={cfg.tp1_pct}
+                onChange={(v) => update({ tp1_pct: v })}
+                testID="input-ct-tp1-pct"
+              />
+              <NumRow
+                label="Quota TP2 (%)"
+                value={cfg.tp2_pct}
+                onChange={(v) => update({ tp2_pct: v })}
+                testID="input-ct-tp2-pct"
+              />
+              <NumRow
+                label="Avanzamento post-TP1 (%)"
+                value={cfg.post_tp1_advance_pct}
+                onChange={(v) => update({ post_tp1_advance_pct: v })}
+                step={0.1}
+                testID="input-ct-post-tp1"
+              />
+              <Text style={styles.scoreHintText}>
+                Dopo TP1 chiude {cfg.tp1_pct}%; quando il prezzo avanza di{" "}
+                {cfg.post_tp1_advance_pct}% oltre TP1, lo stop del residuo si
+                sposta a TP1 (netto commissioni). Altrimenti resta lo stop ATR.
+              </Text>
+            </Section>
+          )}
 
           {(cfg.strategy_mode === "impulse_fvg" || cfg.strategy_mode === "both") && (
             <Section title="Impulse FVG Strategy">

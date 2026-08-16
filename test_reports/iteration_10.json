@@ -1,0 +1,26 @@
+{
+  "summary": "Backend + frontend smoke testing for the new 'Reversal Pre-FVG' (counter_trend) strategy. Rewrote /app/backend/tests/test_counter_trend.py into a pytest suite (14 tests, ALL PASSING) covering analyze_pair_counter LONG + SHORT mirror entry logic, R:R gate, direction invariant (no-breakout returns None), full manage_counter_position state machine (before TP1, at TP1 -> 65% partial with ATR SL kept, +0.5% advance -> SL moved to TP1+maker+taker fees & breakeven_active=True, <0.5% -> SL stays, TP2 -> close_paper_position win), and regression HTTP endpoints (PUT /api/config with strategy_mode=counter_trend persists, POST /api/scan returns 200, GET /api/signals returns {signals,count}, scoring & impulse_fvg modes still scan). Frontend smoke on /settings: tapping testID 'strategy-counter_trend' (label 'Rev Pre-FVG') reveals the 'Reversal Pre-FVG Strategy' section with all 5 inputs (input-ct-consol-min / -consol-atr / -tp1-pct / -tp2-pct / -post-tp1); Save Configuration persists strategy_mode=counter_trend to backend (verified via GET /api/config).",
+  "backend_issues": {"critical": [], "minor": []},
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": []
+  },
+  "test_report_links": [
+    "/app/backend/tests/test_counter_trend.py",
+    "/app/test_reports/pytest/pytest_results.xml"
+  ],
+  "action_items": [],
+  "critical_code_review_comments": [
+    "analyze_pair_counter (server.py:1722-1856) matches the spec exactly: box_high/low entry, ATR-buffered SL beyond the box, target FVG = bearish above for LONG / bullish below for SHORT, TP2 = FVG far edge, TP1 = midpoint, breakout via last CLOSED candle close beyond box edge, volume+RSI HTF+momentum+divergence gates all enforced.",
+    "manage_counter_position (server.py:1213-1257) correctly keeps original ATR SL after TP1 partial and only moves SL to tp1+fee(maker+taker) once price advances >= post_tp1_advance_pct beyond TP1."
+  ],
+  "updated_files": ["/app/backend/tests/test_counter_trend.py"],
+  "success_rate": {"backend": "100% (14/14)", "frontend": "100% (smoke)"},
+  "seed_data_creation": "None. Only Config.strategy_mode is toggled through the public /api/config endpoint during regression tests.",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Full pytest suite for the Reversal Pre-FVG strategy lives in /app/backend/tests/test_counter_trend.py. To run it standalone: `EXPO_PUBLIC_BACKEND_URL=... python -m pytest backend/tests/test_counter_trend.py -v`. The suite monkeypatches server.kucoin.get_klines and server.rsi_wilder / _rsi_momentum_turn / detect_rsi_divergence to isolate structural logic. Unrelated test file /app/backend/tests/test_impulse_strategy.py errors at collection when EXPO_PUBLIC_BACKEND_URL isn't exported (not touched by this iteration).",
+  "rca_of_issue": "N/A — no bugs found. Only ambiguity encountered was inner_text() on Expo web returning uppercase-transformed text; resolved by matching case-insensitively in the Playwright smoke."
+}

@@ -1,273 +1,325 @@
-"""Counter-Trend strategy backend tests.
+"""Tests for the NEW 'Reversal Pre-FVG' (counter_trend) strategy.
 
-Covers:
-- POST /api/strategy-mode (counter_trend / both / scoring / invalid)
-- GET /api/config exposes rsi_high_tf_ob, rsi_high_tf_os, trailing_pct_from_entry
-- POST /api/scan with strategy_mode=counter_trend completes w/o error
-- Counter-trend TP mapping (tp1 == FVG near edge, tp2 == midpoint) validated
-  through analyze_pair_counter code path AND live signals if present
-- Direction safety: entry AGAINST trend; tp1 beyond entry in trade direction
-- RSI misalignment fix: /api/candles returns equal-length candles+rsi arrays;
-  last candle is CLOSED (kucoin.get_klines drops the forming candle)
-- Regression: /api/signals, /api/paper/portfolio, /api/paper/execute/{id},
-  /api/stop-debug/log, /api/slippage/log, /api/setup-debug/log, /api/feed/status
+Replaces the previous counter-trend tests. Covers:
+- analyze_pair_counter: LONG breakout (bearish FVG above the box)
+- analyze_pair_counter: SHORT mirror (bullish FVG below the box)
+- R:R gate rejects |tp2-entry|/risk < min_rr_ratio
+- Direction invariant: no signal if last close doesn't break either box edge
+- manage_counter_position state machine (before TP1, at TP1, +0.5% advance,
+  <0.5% advance, TP2)
+- Regression HTTP endpoints under strategy_mode=counter_trend
 """
-import os
-import time
-import asyncio
-import requests
-import pytest
+from __future__ import annotations
 
-BASE_URL = os.environ.get("EXPO_PUBLIC_BACKEND_URL", "").rstrip("/")
-if not BASE_URL:
-    # fall back to whatever the frontend .env exposes
+import asyncio
+import copy
+import os
+import sys
+
+import pytest
+import requests
+
+sys.path.insert(0, "/app/backend")
+import server  # noqa: E402
+
+
+def _read_base_url() -> str:
+    v = os.environ.get("EXPO_PUBLIC_BACKEND_URL", "").rstrip("/")
+    if v:
+        return v
     with open("/app/frontend/.env") as f:
         for line in f:
             if line.startswith("EXPO_PUBLIC_BACKEND_URL="):
-                BASE_URL = line.split("=", 1)[1].strip().strip('"').rstrip("/")
-                break
+                return line.split("=", 1)[1].strip().strip('"').rstrip("/")
+    return ""
 
+
+BASE_URL = _read_base_url()
 assert BASE_URL, "EXPO_PUBLIC_BACKEND_URL is not set"
 
 
+# ---------------------------------------------------------------------------
+# Deterministic candle builders. Candle format: [t, open, close, high, low, vol]
+# ---------------------------------------------------------------------------
+def _filler(n: int, start: float = 100.5) -> list[list[float]]:
+    out, t, p = [], 0, start
+    for k in range(n):
+        o = p
+        c = p + (0.1 if k % 2 else -0.1)
+        h = max(o, c) + 0.2
+        low = min(o, c) - 0.2
+        out.append([t, o, c, h, low, 100.0])
+        t += 1
+        p = c
+    return out
+
+
+def build_long_scenario() -> list[list[float]]:
+    """LONG: bearish FVG above ~98..102, tight box ~97.5..98.2, bullish
+    engulfing inside, breakout close > box_high."""
+    candles = _filler(60)
+    t = candles[-1][0] + 1
+    candles.append([t, 103.0, 102.2, 103.2, 102.0, 120.0]); t += 1
+    candles.append([t, 101.0, 98.6, 101.5, 98.5, 130.0]); t += 1
+    candles.append([t, 98.3, 97.8, 98.0, 97.7, 140.0]); t += 1  # bearish FVG 98..102
+    candles.append([t, 98.0, 97.6, 98.1, 97.5, 90.0]); t += 1
+    candles.append([t, 97.7, 97.6, 97.8, 97.5, 90.0]); t += 1
+    candles.append([t, 97.55, 98.15, 98.2, 97.5, 95.0]); t += 1  # bullish engulfing
+    candles.append([t, 98.2, 98.5, 98.6, 98.15, 10000.0]); t += 1  # breakout
+    return candles
+
+
+def build_short_scenario() -> list[list[float]]:
+    """SHORT: bullish FVG below ~98..102, tight box ~101.8..102.5, bearish
+    engulfing, breakout close < box_low."""
+    candles = _filler(60, start=99.5)
+    t = candles[-1][0] + 1
+    candles.append([t, 97.0, 97.8, 98.0, 96.8, 120.0]); t += 1  # i-2 high=98.0
+    candles.append([t, 98.5, 101.5, 101.8, 98.4, 130.0]); t += 1
+    candles.append([t, 101.7, 102.2, 102.3, 102.0, 140.0]); t += 1  # bullish FVG 98..102
+    candles.append([t, 102.0, 102.4, 102.5, 101.9, 90.0]); t += 1
+    candles.append([t, 102.4, 102.4, 102.5, 101.9, 90.0]); t += 1
+    candles.append([t, 102.45, 101.85, 102.5, 101.8, 95.0]); t += 1  # bearish engulfing
+    candles.append([t, 101.8, 101.5, 101.85, 101.4, 10000.0]); t += 1  # breakout
+    return candles
+
+
+# ---------------------------------------------------------------------------
+# Fixtures
+# ---------------------------------------------------------------------------
+@pytest.fixture
+def cfg():
+    return server.Config()
+
+
+@pytest.fixture
+def patch_rsi_filters(monkeypatch):
+    """Force RSI-based gates to pass. Values keyed off the last candle direction:
+    - last close rising  -> LONG scenario  -> RSI 15 (HTF oversold), bullish divergence
+    - last close falling -> SHORT scenario -> RSI 85 (HTF overbought), bearish divergence
+    """
+
+    def _rsi(closes, period=14):
+        v = 15.0 if closes[-1] >= closes[-2] else 85.0
+        return [v] * len(closes)
+
+    monkeypatch.setattr(server, "rsi_wilder", _rsi)
+    monkeypatch.setattr(server, "_rsi_momentum_turn", lambda rsis, side, ob, os_: True)
+
+    def _div(closes, rsis, w):
+        return "bullish" if closes[-1] >= closes[-2] else "bearish"
+
+    monkeypatch.setattr(server, "detect_rsi_divergence", _div)
+
+
+@pytest.fixture
+def patch_klines(monkeypatch):
+    holder = {"candles": []}
+
+    async def _fk(symbol, tf):
+        return list(holder["candles"])
+
+    monkeypatch.setattr(server.kucoin, "get_klines", _fk)
+    return holder
+
+
+# ---------------------------------------------------------------------------
+# analyze_pair_counter entry tests
+# ---------------------------------------------------------------------------
+class TestAnalyzePairCounter:
+    def test_long_entry_signal(self, cfg, patch_rsi_filters, patch_klines):
+        patch_klines["candles"] = build_long_scenario()
+        sig = asyncio.run(server.analyze_pair_counter("BTC-USDT", "1h", cfg))
+        assert sig is not None, "expected LONG signal"
+        assert sig.side == "long"
+        assert abs(sig.entry - 98.2) < 1e-6
+        assert sig.stop_loss < 97.5
+        assert abs(sig.tp2 - 102.0) < 1e-6  # far edge of bearish FVG (top)
+        assert sig.entry < sig.tp1 < sig.tp2
+        assert abs(sig.fvg_top - 102.0) < 1e-6
+        assert abs(sig.fvg_bottom - 98.0) < 1e-6
+        assert sig.strategy == "counter_trend"
+        assert "Consolidation Breakout" in sig.confirmations
+        assert any("Engulfing" in c or "Star" in c for c in sig.confirmations)
+
+    def test_short_entry_signal(self, cfg, patch_rsi_filters, patch_klines):
+        patch_klines["candles"] = build_short_scenario()
+        sig = asyncio.run(server.analyze_pair_counter("BTC-USDT", "1h", cfg))
+        assert sig is not None, "expected SHORT signal"
+        assert sig.side == "short"
+        assert abs(sig.entry - 101.8) < 1e-6
+        assert sig.stop_loss > 102.5
+        assert abs(sig.tp2 - 98.0) < 1e-6  # far edge of bullish FVG (bottom)
+        assert sig.tp2 < sig.tp1 < sig.entry
+        assert abs(sig.fvg_top - 102.0) < 1e-6
+        assert abs(sig.fvg_bottom - 98.0) < 1e-6
+        assert sig.strategy == "counter_trend"
+        assert "Consolidation Breakout" in sig.confirmations
+        assert any("Engulfing" in c or "Star" in c for c in sig.confirmations)
+
+    def test_no_breakout_returns_none(self, cfg, patch_rsi_filters, patch_klines):
+        candles = build_long_scenario()
+        # Replace breakout candle: closes inside the box, no breakout
+        candles[-1] = [candles[-1][0], 97.9, 97.95, 98.1, 97.7, 500.0]
+        patch_klines["candles"] = candles
+        sig = asyncio.run(server.analyze_pair_counter("BTC-USDT", "1h", cfg))
+        assert sig is None
+
+    def test_rr_gate_rejects_low_rr(self, cfg, patch_rsi_filters, patch_klines):
+        patch_klines["candles"] = build_long_scenario()
+        cfg.min_rr_ratio = 999.0
+        sig = asyncio.run(server.analyze_pair_counter("BTC-USDT", "1h", cfg))
+        assert sig is None
+
+
+# ---------------------------------------------------------------------------
+# manage_counter_position state machine
+# ---------------------------------------------------------------------------
+class _FakeCollection:
+    def __init__(self, store):
+        self.store = store
+
+    async def update_one(self, q, upd):
+        self.store.setdefault("updates", []).append(copy.deepcopy(upd["$set"]))
+        self.store.update(upd["$set"])
+
+
+@pytest.fixture
+def state_env(monkeypatch, cfg):
+    store: dict = {}
+    monkeypatch.setattr(server.db, "paper_positions", _FakeCollection(store))
+
+    closed: dict = {}
+
+    async def fake_close(pos, price, outcome):
+        closed["price"] = price
+        closed["outcome"] = outcome
+        return None
+
+    monkeypatch.setattr(server, "close_paper_position", fake_close)
+
+    frac_calls: list = []
+
+    async def fake_close_fraction(pos, price, frac, outcome, set_partial=True):
+        frac_calls.append((price, frac, outcome))
+        return float(pos["quantity"]) * (1 - frac)
+
+    monkeypatch.setattr(server, "_close_fraction", fake_close_fraction)
+
+    async def fake_fees(symbol, cfg_):
+        return (0.001, 0.001)
+
+    monkeypatch.setattr(server, "get_trade_fees", fake_fees)
+
+    last_close = {"v": 0.0}
+
+    async def fake_last_closed(symbol, tf):
+        return last_close["v"]
+
+    monkeypatch.setattr(server, "_last_closed_close", fake_last_closed)
+
+    return {"store": store, "closed": closed, "frac_calls": frac_calls,
+            "last_close": last_close, "cfg": cfg}
+
+
+def _long_pos():
+    return {
+        "id": "p1", "symbol": "BTC-USDT", "timeframe": "1h", "side": "long",
+        "entry": 98.2, "fill_price": 98.2, "stop_loss": 97.0, "current_stop": 97.0,
+        "quantity": 10.0, "tp1": 99.0, "tp2": 100.0, "partial_closed": False,
+        "breakeven_active": False, "opened_at": "2026-01-01T00:00:00+00:00",
+    }
+
+
+class TestManageCounterPosition:
+    def test_a_before_tp1_no_partial(self, state_env):
+        state_env["last_close"]["v"] = 98.5
+        p = asyncio.run(server.manage_counter_position(_long_pos(), 98.5, state_env["cfg"]))
+        assert not p.get("partial_closed")
+        assert state_env["frac_calls"] == []
+
+    def test_b_hit_tp1_partial_65pct_stop_stays_atr(self, state_env):
+        state_env["last_close"]["v"] = 99.0
+        p = asyncio.run(server.manage_counter_position(_long_pos(), 99.0, state_env["cfg"]))
+        assert state_env["frac_calls"], "expected partial close call at TP1"
+        _, frac, outcome = state_env["frac_calls"][-1]
+        assert abs(frac - 0.65) < 1e-9
+        assert outcome == "tp1"
+        assert p.get("partial_closed") is True
+        assert state_env["store"].get("breakeven_active") is None
+
+    def test_c_post_tp1_advance_moves_stop_to_tp1_plus_fees(self, state_env):
+        pos2 = {**_long_pos(), "partial_closed": True, "quantity": 3.5,
+                "breakeven_active": False}
+        state_env["last_close"]["v"] = 99.4
+        # 99.6 > 99.0 * (1 + 0.5%) = 99.495
+        asyncio.run(server.manage_counter_position(pos2, 99.6, state_env["cfg"]))
+        assert state_env["store"].get("breakeven_active") is True
+        expected = 99.0 + 99.0 * (0.001 + 0.001)
+        assert abs(state_env["store"]["current_stop"] - expected) < 1e-6
+
+    def test_d_advance_below_threshold_stop_stays(self, state_env):
+        pos3 = {**_long_pos(), "partial_closed": True, "quantity": 3.5,
+                "breakeven_active": False}
+        state_env["last_close"]["v"] = 99.1
+        asyncio.run(server.manage_counter_position(pos3, 99.1, state_env["cfg"]))
+        assert state_env["store"].get("breakeven_active") is None
+
+    def test_e_hit_tp2_closes_remainder_as_win(self, state_env):
+        pos4 = {**_long_pos(), "partial_closed": True, "quantity": 3.5,
+                "breakeven_active": True}
+        state_env["last_close"]["v"] = 100.0
+        asyncio.run(server.manage_counter_position(pos4, 100.0, state_env["cfg"]))
+        assert state_env["closed"].get("price") == 100.0
+        assert state_env["closed"].get("outcome") == "win"
+
+
+# ---------------------------------------------------------------------------
+# Regression HTTP endpoints
+# ---------------------------------------------------------------------------
 @pytest.fixture(scope="module")
-def api():
+def http():
     s = requests.Session()
     s.headers.update({"Content-Type": "application/json"})
     return s
 
 
-# ---------------------------------------------------------------------------
-# 1. Strategy-mode endpoint
-# ---------------------------------------------------------------------------
-class TestStrategyMode:
-    def test_set_counter_trend(self, api):
-        r = api.post(f"{BASE_URL}/api/strategy-mode",
-                     json={"strategy_mode": "counter_trend"})
+class TestRegressionEndpoints:
+    def test_put_config_strategy_counter_trend(self, http):
+        r0 = http.get(f"{BASE_URL}/api/config", timeout=30)
+        assert r0.status_code == 200
+        current = r0.json()
+        payload = {**current, "strategy_mode": "counter_trend"}
+        r = http.put(f"{BASE_URL}/api/config", json=payload, timeout=30)
         assert r.status_code == 200, r.text
+        assert r.json().get("strategy_mode") == "counter_trend"
+        r2 = http.get(f"{BASE_URL}/api/config", timeout=30)
+        assert r2.status_code == 200
+        assert r2.json().get("strategy_mode") == "counter_trend"
+
+    def test_scan_endpoint_counter_trend(self, http):
+        r = http.post(f"{BASE_URL}/api/scan", timeout=90)
+        assert r.status_code == 200, r.text
+
+    def test_signals_endpoint_shape(self, http):
+        r = http.get(f"{BASE_URL}/api/signals", timeout=30)
+        assert r.status_code == 200
         body = r.json()
-        assert body.get("ok") is True
-        assert body.get("strategy_mode") == "counter_trend"
-        # reflected in /api/config
-        c = api.get(f"{BASE_URL}/api/config").json()
-        assert c["strategy_mode"] == "counter_trend"
+        assert "signals" in body and isinstance(body["signals"], list)
+        assert "count" in body and isinstance(body["count"], int)
 
-    def test_set_both(self, api):
-        r = api.post(f"{BASE_URL}/api/strategy-mode", json={"strategy_mode": "both"})
+    def test_scoring_strategy_still_ok(self, http):
+        r0 = http.get(f"{BASE_URL}/api/config", timeout=30)
+        c = r0.json()
+        http.put(f"{BASE_URL}/api/config",
+                 json={**c, "strategy_mode": "scoring"}, timeout=30)
+        r = http.post(f"{BASE_URL}/api/scan", timeout=90)
         assert r.status_code == 200
-        assert api.get(f"{BASE_URL}/api/config").json()["strategy_mode"] == "both"
 
-    def test_set_scoring(self, api):
-        r = api.post(f"{BASE_URL}/api/strategy-mode", json={"strategy_mode": "scoring"})
+    def test_impulse_strategy_still_ok(self, http):
+        r0 = http.get(f"{BASE_URL}/api/config", timeout=30)
+        c = r0.json()
+        http.put(f"{BASE_URL}/api/config",
+                 json={**c, "strategy_mode": "impulse_fvg"}, timeout=30)
+        r = http.post(f"{BASE_URL}/api/scan", timeout=90)
         assert r.status_code == 200
-        assert api.get(f"{BASE_URL}/api/config").json()["strategy_mode"] == "scoring"
-
-    def test_set_impulse_fvg(self, api):
-        r = api.post(f"{BASE_URL}/api/strategy-mode", json={"strategy_mode": "impulse_fvg"})
-        assert r.status_code == 200
-        assert api.get(f"{BASE_URL}/api/config").json()["strategy_mode"] == "impulse_fvg"
-
-    def test_invalid_rejected(self, api):
-        r = api.post(f"{BASE_URL}/api/strategy-mode", json={"strategy_mode": "moon"})
-        assert r.status_code == 400
-        # ensure config not changed to garbage
-        assert api.get(f"{BASE_URL}/api/config").json()["strategy_mode"] in (
-            "scoring", "impulse_fvg", "counter_trend", "both"
-        )
-
-
-# ---------------------------------------------------------------------------
-# 2. /api/config exposes new counter-trend fields
-# ---------------------------------------------------------------------------
-class TestConfigFields:
-    def test_new_fields_present(self, api):
-        c = api.get(f"{BASE_URL}/api/config").json()
-        # counter-trend specific
-        assert "rsi_high_tf_ob" in c
-        assert "rsi_high_tf_os" in c
-        assert "trailing_pct_from_entry" in c
-        assert c["rsi_high_tf_ob"] == 80
-        assert c["rsi_high_tf_os"] == 20
-        assert c["trailing_pct_from_entry"] == 1.0
-        # existing fields kept
-        for k in ("strategy_mode", "atr_period", "rsi_period", "rsi_overbought",
-                  "rsi_oversold", "consolidation_min_candles",
-                  "consolidation_max_atr", "tp1_pct", "tp2_pct", "atr_sl_multiplier"):
-            assert k in c, f"missing config key: {k}"
-
-
-# ---------------------------------------------------------------------------
-# 3. Scan with counter_trend runs w/o error
-# ---------------------------------------------------------------------------
-class TestScanCounterTrend:
-    def test_scan_runs(self, api):
-        # switch mode first
-        api.post(f"{BASE_URL}/api/strategy-mode", json={"strategy_mode": "counter_trend"})
-        r = api.post(f"{BASE_URL}/api/scan")
-        assert r.status_code == 200
-        assert r.json().get("started") is True
-
-        # poll /api/status for scan_state until not scanning (max 90s)
-        for _ in range(45):
-            time.sleep(2)
-            st = api.get(f"{BASE_URL}/api/status").json()
-            if not st.get("is_scanning", False):
-                break
-        # After scan, ensure no exception surfaces via status (scanned_pairs field)
-        st = api.get(f"{BASE_URL}/api/status").json()
-        assert "is_scanning" in st
-        # scanned pairs count exposed under various names — best-effort
-        assert any(k in st for k in ("last_scanned_pairs", "scanned_pairs", "pairs_scanned"))
-        # revert
-        api.post(f"{BASE_URL}/api/strategy-mode", json={"strategy_mode": "both"})
-
-
-# ---------------------------------------------------------------------------
-# 4. Counter-trend TP mapping (TP1 near edge, TP2 midpoint) + direction safety
-#    Validated via direct call to analyze_pair_counter code with synthetic data.
-# ---------------------------------------------------------------------------
-class TestCounterTrendTPMapping:
-    def test_signal_tp_mapping_from_live_or_code(self, api):
-        # Prefer live signals if any counter_trend produced by prior scan
-        resp = api.get(f"{BASE_URL}/api/signals").json()
-        sigs = resp["signals"] if isinstance(resp, dict) else resp
-        ct = [s for s in sigs if s.get("strategy") == "counter_trend"]
-
-        if ct:
-            for s in ct:
-                top = s["fvg_top"]
-                bottom = s["fvg_bottom"]
-                mid = round((top + bottom) / 2, 8)
-                entry = s["entry"]
-                if s["side"] == "long":
-                    assert abs(s["tp1"] - bottom) < 1e-6, (
-                        f"long tp1 must == fvg_bottom, got {s['tp1']} vs {bottom}")
-                    assert s["tp1"] > entry, "tp1 must be beyond entry for long"
-                else:
-                    assert abs(s["tp1"] - top) < 1e-6, (
-                        f"short tp1 must == fvg_top, got {s['tp1']} vs {top}")
-                    assert s["tp1"] < entry, "tp1 must be beyond entry for short"
-                assert abs(s["tp2"] - mid) < 1e-6, (
-                    f"tp2 must == midpoint, got {s['tp2']} vs {mid}")
-        else:
-            pytest.skip("No live counter_trend signals — validated via code review "
-                        "of analyze_pair_counter (see backend/server.py:1740-1747).")
-
-
-# ---------------------------------------------------------------------------
-# 5. Direct sanity-test of analyze_pair_counter TP mapping via monkey-patched klines
-# ---------------------------------------------------------------------------
-class TestAnalyzePairCounterDirect:
-    """
-    Import server module and call analyze_pair_counter with synthetic candles
-    engineered to satisfy every gate (structure, impulse FVG, consolidation,
-    reversal pattern, HTF RSI extreme, momentum turn, divergence coherent).
-    """
-
-    def test_long_setup_tp_mapping(self):
-        import importlib, sys
-        sys.path.insert(0, "/app/backend")
-        server = importlib.import_module("server")
-
-        # Build a bearish structure with LH+LL then setup a bullish reversal.
-        # We only assert that IF analyze_pair_counter returns a Signal, the
-        # TP1/TP2 mapping is correct — engineering all filters via mock candles
-        # is impractical, so we assert via the code path in server.py directly.
-        src = open("/app/backend/server.py").read()
-        # TP1 near edge, TP2 midpoint for LONG
-        assert 'tp1 = origin["bottom"]' in src, "LONG TP1 must be origin.bottom (near edge)"
-        assert 'tp1 = origin["top"]' in src, "SHORT TP1 must be origin.top (near edge)"
-        assert 'mid = (origin["top"] + origin["bottom"]) / 2' in src, "TP2 midpoint must be 50% of FVG"
-        assert 'tp2 = mid' in src, "TP2 must be set to midpoint"
-        # SL beyond IMPULSE extreme (not FVG edge)
-        assert "seg_hi = max(highs[max(0, i - 2):i + 1])" in src
-        assert "seg_lo = min(lows[max(0, i - 2):i + 1])" in src
-        assert "stop_loss = seg_lo - sl_buffer" in src
-        assert "stop_loss = seg_hi + sl_buffer" in src
-        # Direction safety
-        assert 'entry_side = "short" if trend == "up" else "long"' in src
-
-    def test_reversal_pattern_gate(self):
-        # If no reversal pattern -> NEVER open (return None)
-        src = open("/app/backend/server.py").read()
-        assert "pattern = detect_reversal_pattern(opens, highs, lows, closes, against)" in src
-        assert "if pattern is None:" in src
-
-
-# ---------------------------------------------------------------------------
-# 6. RSI misalignment fix: /api/candles returns equal-length candles+rsi,
-#    last candle is closed (forming candle dropped in get_klines).
-# ---------------------------------------------------------------------------
-class TestRsiAlignment:
-    def test_candles_rsi_length_equal(self, api):
-        r = api.get(f"{BASE_URL}/api/candles/BTC-USDT", params={"timeframe": "1h"})
-        assert r.status_code == 200
-        data = r.json()
-        assert data["symbol"] == "BTC-USDT"
-        assert data["timeframe"] == "1h"
-        assert isinstance(data["candles"], list) and len(data["candles"]) > 30
-        assert isinstance(data["rsi"], list)
-        assert len(data["candles"]) == len(data["rsi"]), (
-            f"candles ({len(data['candles'])}) and rsi ({len(data['rsi'])}) length mismatch"
-        )
-
-    def test_last_candle_is_closed(self, api):
-        r = api.get(f"{BASE_URL}/api/candles/BTC-USDT", params={"timeframe": "1h"})
-        data = r.json()
-        last_ts = data["candles"][-1]["t"]
-        # KuCoin 1h candles are in seconds; "closed" means last_ts + 3600 <= now
-        now_s = time.time()
-        # allow small drift (200s) for network / clock skew
-        assert (now_s - last_ts) >= 3600 - 200, (
-            f"last candle timestamp {last_ts} vs now {now_s}: forming candle not dropped"
-        )
-
-    def test_get_klines_drops_forming_code(self):
-        src = open("/app/backend/server.py").read()
-        # get_klines: drop the last, still-forming candle
-        assert "raw = raw[:-1]" in src, "get_klines must drop the last (forming) candle"
-        # candles endpoint uses the SAME rsi_wilder(cfg.rsi_period)
-        assert "rsis = rsi_wilder(closes, cfg.rsi_period)" in src
-
-
-# ---------------------------------------------------------------------------
-# 7. Regression endpoints
-# ---------------------------------------------------------------------------
-class TestRegression:
-    @pytest.mark.parametrize("path", [
-        "/api/signals",
-        "/api/paper/portfolio",
-        "/api/stop-debug/log",
-        "/api/slippage/log",
-        "/api/setup-debug/log",
-        "/api/feed/status",
-        "/api/config",
-        "/api/status",
-    ])
-    def test_endpoint_200(self, api, path):
-        r = api.get(f"{BASE_URL}{path}")
-        assert r.status_code == 200, f"{path} -> {r.status_code}: {r.text[:200]}"
-
-    def test_paper_execute_flow(self, api):
-        resp = api.get(f"{BASE_URL}/api/signals").json()
-        sigs = resp["signals"] if isinstance(resp, dict) else resp
-        if not sigs:
-            pytest.skip("no live signals to paper-execute")
-        sid = sigs[0]["id"]
-        # reset first for clean state
-        api.post(f"{BASE_URL}/api/paper/reset")
-        r = api.post(f"{BASE_URL}/api/paper/execute/{sid}")
-        # accept 200 or 400 (already open / capital rule) — endpoint must exist
-        assert r.status_code in (200, 400), r.text
-
-    def test_scoring_still_works(self, api):
-        # switch to scoring
-        api.post(f"{BASE_URL}/api/strategy-mode", json={"strategy_mode": "scoring"})
-        r = api.post(f"{BASE_URL}/api/scan")
-        assert r.status_code == 200
-        # ensure existing scoring signals persist / retrievable
-        resp = api.get(f"{BASE_URL}/api/signals").json()
-        sigs = resp["signals"] if isinstance(resp, dict) else resp
-        assert isinstance(sigs, list)
-        # restore both
-        api.post(f"{BASE_URL}/api/strategy-mode", json={"strategy_mode": "both"})

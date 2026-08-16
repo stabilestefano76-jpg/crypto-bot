@@ -32,8 +32,24 @@ Scheduler asyncio in background esegue `run_scan()` ogni `scan_interval_minutes`
 ## Reset Signal History (Parte 3)
 Pulsante "Reset" nell'header della Signal History → modal di conferma ("Azione irreversibile") → `DELETE /api/signals` cancella tutto lo storico segnali. Non tocca generazione segnali, Portfolio o Settings. Verificato dal testing agent (11/11 backend + flusso UI).
 
-## Strategia 3: Counter-Trend Reversal (spec-exact, additiva)
-`strategy_mode="counter_trend"`: trend (struttura) → FVG d'impulso in direzione trend (gap maggiore) → consolidamento → **pattern di reversal CONTRO il trend** (engulfing/star) → entrata **contro-trend** → target sulla zona FVG d'impulso. Filtri RSI obbligatori (AND): RSI HTF estremo (≤20 long / ≥80 short), momentum turn sul TF del trade, divergenza prezzo/RSI coerente. SL oltre l'**estremo dell'impulso** (non il bordo FVG). **TP1 = tocco della zona FVG** (bordo vicino), **TP2 = 50% della zona** (midpoint); 65%/35%. Breakeven al doppio tocco dell'entry; trailing 1% dall'entry. Multi-TF, spot/leverage. Segnali rari per design (filtri RSI molto stretti).
+## Strategia 3: Reversal Pre-FVG con breakout del consolidamento (sostituisce la vecchia counter_trend)
+`strategy_mode="counter_trend"` (chip UI "Rev Pre-FVG") — logica riscritta secondo spec-exact dell'utente:
+- **Sequenza**: impulso → FVG non colmata lasciata indietro → **consolidamento** (box stretto ≤ `consolidation_max_atr`×ATR su `consolidation_min_candles`) → **pattern di reversal DENTRO il box** (engulfing/star) → **breakout in chiusura** del box.
+- **Direzione del trade = direzione del breakout** (rottura sopra il massimo del box → LONG; sotto il minimo → SHORT). NON più basata sul market structure macro.
+- **Target = FVG lasciata dall'impulso, nella direzione del breakout**: LONG → FVG ribassista sopra (fill verso l'alto); SHORT → FVG rialzista sotto (fill verso il basso).
+- **TP2 = bordo opposto (lontano) della FVG** (35%); **TP1 = livello intermedio dentro la FVG** (midpoint, 65%). Entry = livello di breakout (box_high per long / box_low per short).
+- **SL iniziale**: oltre il box (long: box_low − buffer; short: box_high + buffer), buffer = max(ATR×`atr_sl_multiplier`, entry×`sl_padding_pct`). Gate R:R su TP2 ≥ `min_rr_ratio`.
+- **Conferme (AND)**: volume spike sul breakout + filtri RSI già definiti (HTF estremo, momentum turn sul TF del trade, divergenza coerente). Segnali rari per design.
+- Rimossa la vecchia logica: entry immediato al pattern contro-trend, SL sull'estremo dell'impulso, TP1=bordo vicino/TP2=50%.
+
+## Parte 2: Gestione Stop-Loss post-TP1 (per la strategia Reversal Pre-FVG)
+`manage_counter_position` (nuovo, sostituisce il breakeven generico per queste posizioni):
+- A TP1 (chiusura candela oltre TP1) chiude `tp1_pct` 65%; **lo SL resta lo stop ATR originale** (NIENTE breakeven immediato — rimosso il vecchio "breakeven al secondo/doppio tocco").
+- Per il residuo 35%: quando il prezzo avanza di **`post_tp1_advance_pct` (default 0.5%) oltre TP1**, lo SL si sposta esattamente a **TP1 + commissioni** (maker+taker via API KuCoin). Se il +0.5% non viene mai raggiunto, lo SL ATR resta.
+- TP2 chiude il residuo (gestito sia a chiusura candela in `manage_counter_position` sia su prezzo live nel monitor).
+- Config nuovo: `post_tp1_advance_pct`. Monitor `tp_check` esteso a `counter_trend` (come impulse_fvg).
+- UI: sezione "Reversal Pre-FVG Strategy" in Settings (min candele, ampiezza box, TP1/TP2, avanzamento post-TP1); TP1/TP2 mostrati nel Detail anche per counter_trend + spiegazioni pattern/RSI. Chip rinominato "Rev Pre-FVG" (key invariata `counter_trend`).
+- Validato con test sintetici: entry LONG breakout (SL sotto box, TP1=midpoint FVG, TP2=bordo lontano) e macchina a stati post-TP1 (TP1 65% → SL resta ATR → +0.5% → SL a TP1+fee → TP2 win).
 
 ## Bugfix RSI alignment
 `get_klines` scarta la candela in formazione → logica di segnale e grafico usano le stesse candele CHIUSE con la stessa `rsi_wilder`. Verificato dal testing agent (22 passati).
