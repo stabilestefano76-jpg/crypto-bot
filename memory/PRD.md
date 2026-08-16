@@ -29,6 +29,9 @@ Scheduler asyncio in background esegue `run_scan()` ogni `scan_interval_minutes`
 - **(tabs)/settings** — Form completo per parametri + sezione Paper Trading (auto-execute, initial capital, risk %, max positions) + disclaimer
 - **detail/[id]** — Grafico candlestick SVG con zone FVG, linee entry/SL/TP, sub-grafico RSI + bottone sticky "Execute Paper"
 
+## Reset Signal History (Parte 3)
+Pulsante "Reset" nell'header della Signal History → modal di conferma ("Azione irreversibile") → `DELETE /api/signals` cancella tutto lo storico segnali. Non tocca generazione segnali, Portfolio o Settings. Verificato dal testing agent (11/11 backend + flusso UI).
+
 ## Strategia 3: Counter-Trend Reversal (spec-exact, additiva)
 `strategy_mode="counter_trend"`: trend (struttura) → FVG d'impulso in direzione trend (gap maggiore) → consolidamento → **pattern di reversal CONTRO il trend** (engulfing/star) → entrata **contro-trend** → target sulla zona FVG d'impulso. Filtri RSI obbligatori (AND): RSI HTF estremo (≤20 long / ≥80 short), momentum turn sul TF del trade, divergenza prezzo/RSI coerente. SL oltre l'**estremo dell'impulso** (non il bordo FVG). **TP1 = tocco della zona FVG** (bordo vicino), **TP2 = 50% della zona** (midpoint); 65%/35%. Breakeven al doppio tocco dell'entry; trailing 1% dall'entry. Multi-TF, spot/leverage. Segnali rari per design (filtri RSI molto stretti).
 

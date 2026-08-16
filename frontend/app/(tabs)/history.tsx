@@ -2,6 +2,8 @@ import { useCallback, useEffect, useState } from "react";
 import {
   ActivityIndicator,
   FlatList,
+  Modal,
+  Pressable,
   RefreshControl,
   StyleSheet,
   Text,
@@ -30,6 +32,19 @@ export default function HistoryScreen() {
     avg_slippage_pct: number;
   } | null>(null);
   const [feed, setFeed] = useState<{ ws_connected: boolean; cached_symbols: number } | null>(null);
+  const [confirmReset, setConfirmReset] = useState(false);
+  const [resetting, setResetting] = useState(false);
+
+  const doReset = async () => {
+    setResetting(true);
+    try {
+      await api.clearSignals();
+      setConfirmReset(false);
+      await load();
+    } finally {
+      setResetting(false);
+    }
+  };
   const [stopDbg, setStopDbg] = useState<{
     premature: number;
     valid: number;
@@ -82,7 +97,16 @@ export default function HistoryScreen() {
           <Text style={styles.title} testID="history-title">
             Signal History
           </Text>
-          {feed && (
+          <View style={{ flexDirection: "row", alignItems: "center", gap: spacing.sm }}>
+            <Pressable
+              onPress={() => setConfirmReset(true)}
+              style={({ pressed }) => [styles.resetBtn, pressed && { opacity: 0.6 }]}
+              testID="reset-history-button"
+            >
+              <Ionicons name="trash-outline" size={13} color={colors.error} />
+              <Text style={styles.resetText}>Reset</Text>
+            </Pressable>
+            {feed && (
             <View
               style={[
                 styles.wsBadge,
@@ -112,6 +136,7 @@ export default function HistoryScreen() {
               </Text>
             </View>
           )}
+          </View>
         </View>
         {stats && (
           <View style={styles.statsRow} testID="history-stats">
@@ -339,6 +364,46 @@ export default function HistoryScreen() {
           renderItem={({ item }) => <HistoryRow s={item} />}
         />
       )}
+
+      <Modal
+        visible={confirmReset}
+        transparent
+        animationType="fade"
+        onRequestClose={() => setConfirmReset(false)}
+      >
+        <View style={styles.modalRoot}>
+          <Pressable style={styles.modalBackdrop} onPress={() => setConfirmReset(false)} />
+          <View style={styles.modalCard} testID="reset-confirm-modal">
+            <Ionicons name="warning" size={28} color={colors.error} />
+            <Text style={styles.modalTitle}>Reset Signal History</Text>
+            <Text style={styles.modalBody}>
+              Sei sicuro di voler cancellare tutto lo storico dei segnali? Azione
+              irreversibile.
+            </Text>
+            <View style={styles.modalActions}>
+              <Pressable
+                onPress={() => setConfirmReset(false)}
+                style={[styles.modalBtn, styles.modalCancel]}
+                testID="reset-cancel"
+              >
+                <Text style={styles.modalCancelText}>Annulla</Text>
+              </Pressable>
+              <Pressable
+                onPress={doReset}
+                disabled={resetting}
+                style={[styles.modalBtn, styles.modalConfirm]}
+                testID="reset-confirm"
+              >
+                {resetting ? (
+                  <ActivityIndicator color="#fff" size="small" />
+                ) : (
+                  <Text style={styles.modalConfirmText}>Cancella tutto</Text>
+                )}
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </View>
   );
 }
@@ -407,6 +472,37 @@ const styles = StyleSheet.create({
     gap: spacing.md,
   },
   title: { fontSize: 22, fontWeight: "800", color: colors.onSurface },
+  resetBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    gap: 4,
+    paddingHorizontal: spacing.sm,
+    paddingVertical: 5,
+    borderRadius: radius.sm,
+    borderWidth: 1,
+    borderColor: colors.error,
+  },
+  resetText: { color: colors.error, fontWeight: "800", fontSize: 11 },
+  modalRoot: { flex: 1, alignItems: "center", justifyContent: "center", padding: spacing.xl },
+  modalBackdrop: { ...StyleSheet.absoluteFillObject, backgroundColor: "rgba(0,0,0,0.65)" },
+  modalCard: {
+    width: "100%",
+    backgroundColor: colors.surfaceSecondary,
+    borderRadius: radius.lg,
+    borderWidth: 1,
+    borderColor: colors.borderStrong,
+    padding: spacing.lg,
+    alignItems: "center",
+    gap: spacing.sm,
+  },
+  modalTitle: { color: colors.onSurface, fontWeight: "800", fontSize: font.lg },
+  modalBody: { color: colors.onSurfaceSecondary, fontSize: font.sm, textAlign: "center", lineHeight: 18 },
+  modalActions: { flexDirection: "row", gap: spacing.sm, marginTop: spacing.sm, width: "100%" },
+  modalBtn: { flex: 1, paddingVertical: 12, borderRadius: radius.md, alignItems: "center" },
+  modalCancel: { backgroundColor: colors.surfaceTertiary, borderWidth: 1, borderColor: colors.border },
+  modalCancelText: { color: colors.onSurface, fontWeight: "700" },
+  modalConfirm: { backgroundColor: colors.error },
+  modalConfirmText: { color: "#fff", fontWeight: "800" },
   titleRow: {
     flexDirection: "row",
     alignItems: "center",

@@ -2039,6 +2039,15 @@ async def list_pairs(limit: int = 200) -> dict[str, Any]:
     return {"pairs": out[:limit]}
 
 
+@api.delete("/signals")
+async def clear_signals() -> dict[str, Any]:
+    """Reset the Signal History: delete all stored signals. Does not affect
+    signal generation, Portfolio, or Settings."""
+    res = await db.signals.delete_many({})
+    return {"ok": True, "deleted": res.deleted_count}
+
+
+
 @api.get("/signals")
 async def list_signals(
     side: Optional[str] = Query(None, pattern="^(long|short)$"),

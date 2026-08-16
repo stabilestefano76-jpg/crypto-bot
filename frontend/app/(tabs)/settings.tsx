@@ -107,6 +107,7 @@ export default function SettingsScreen() {
               {([
                 ["scoring", "Scoring"],
                 ["impulse_fvg", "Impulse FVG"],
+                ["counter_trend", "Counter-Trend"],
                 ["both", "Entrambe"],
               ] as const).map(([val, label]) => {
                 const active = cfg.strategy_mode === val;
@@ -712,9 +713,10 @@ const styles = StyleSheet.create({
     marginBottom: 4,
   },
   scoreHintText: { color: colors.onSurface, flex: 1, fontSize: 11, lineHeight: 16 },
-  stratRow: { flexDirection: "row", gap: spacing.sm, marginBottom: spacing.sm },
+  stratRow: { flexDirection: "row", flexWrap: "wrap", gap: spacing.sm, marginBottom: spacing.sm },
   stratChip: {
-    flex: 1,
+    flexGrow: 1,
+    flexBasis: "46%",
     paddingVertical: 10,
     borderRadius: radius.md,
     backgroundColor: colors.surfaceTertiary,

@@ -1,0 +1,27 @@
+{
+  "summary": "Frontend regression testing for the newly added Counter-Trend strategy chip in Settings. All 4 chips (Scoring, Impulse FVG, Counter-Trend, Entrambe) render in a 2x2 layout with correct testIDs. Tapping Counter-Trend highlights it (bg=rgb(245,179,0) = colors.brand). Saving persists strategy_mode='counter_trend' to backend via PUT /api/config; after a full reload the chip remains highlighted. All 4 modes were exercised end-to-end (frontend tap -> save -> backend GET /api/config -> match). POST /api/scan under counter_trend returns 200. Backend PUT /api/config with all 4 strategy_mode values via curl also passes.",
+  "backend_issues": {
+    "critical": [],
+    "minor": []
+  },
+  "frontend_issues": {
+    "ui_bugs": [],
+    "integration_issues": [],
+    "design_issues": [],
+    "react_native_issues": []
+  },
+  "test_report_links": [],
+  "action_items": [
+    "OPTIONAL / OUT-OF-SCOPE (pre-existing): NumRow TextInput's onEndEditing does not fire in the Expo web preview when the field is blurred by clicking outside or pressing Enter, so numeric edits (e.g., min_score_threshold 4 -> 3.5) are not committed to state and don't persist on Save. This is unrelated to the Counter-Trend addition (NumRow was not modified) and likely works on native. If web parity is desired, add an onBlur/onSubmitEditing that also commits the value in /app/frontend/app/(tabs)/settings.tsx NumRow (~line 555)."
+  ],
+  "critical_code_review_comments": [
+    "settings.tsx is 755 lines; consider extracting NumRow/TextRow/ToggleRow and the strategy chips into their own files for readability (>700 line threshold)."
+  ],
+  "updated_files": [],
+  "success_rate": {"backend": "100%", "frontend": "100%"},
+  "seed_data_creation": "None. Config was mutated during tests and restored to original state (strategy_mode='both' was the starting value; final state left at counter_trend/min_score=4 after cycling).",
+  "retest_needed": false,
+  "should_main_agent_self_test": false,
+  "context_for_next_testing_agent": "Counter-Trend chip feature is fully wired. testIDs: strategy-scoring, strategy-impulse_fvg, strategy-counter_trend, strategy-both. Backend enum in server.py:111 accepts all four. Note: NumRow onEndEditing does not commit on web preview (pre-existing) - use native for numeric-input regressions.",
+  "rca_of_issue": "N/A - no bug in the feature under test."
+}

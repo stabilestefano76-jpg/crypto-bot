@@ -184,6 +184,8 @@ export const api = {
     req<{ total: number; active: number; wins: number; losses: number; win_rate: number }>(
       "/history/stats"
     ),
+  clearSignals: () =>
+    req<{ ok: boolean; deleted: number }>("/signals", { method: "DELETE" }),
   paperConfig: () => req<PaperConfig>("/paper/config"),
   savePaperConfig: (cfg: PaperConfig) =>
     req<PaperConfig>("/paper/config", { method: "PUT", body: JSON.stringify(cfg) }),
