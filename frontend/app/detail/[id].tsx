@@ -11,11 +11,11 @@ import {
 import { useLocalSearchParams, useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
-import Svg, { Line, Rect, Path, Text as SvgText } from "react-native-svg";
+import Svg, { Line, Path, Text as SvgText } from "react-native-svg";
 import { api, Candle, Signal } from "@/src/api";
 import { colors, font, radius, spacing } from "@/src/theme";
+import TradingViewChart from "@/src/components/TradingViewChart";
 
-const CHART_HEIGHT = 220;
 const RSI_HEIGHT = 80;
 
 export default function DetailScreen() {
@@ -102,10 +102,20 @@ export default function DetailScreen() {
           style={styles.chartCard}
           onLayout={(e) => setChartWidth(e.nativeEvent.layout.width)}
         >
-          <PriceChart
-            width={chartWidth}
+          <TradingViewChart
+            symbol={signal.symbol}
+            timeframe={signal.timeframe}
             candles={candles}
-            signal={signal}
+            levels={{
+              entry: signal.entry,
+              sl: signal.stop_loss,
+              tp1: signal.tp1 || signal.take_profit,
+              tp2: signal.tp2,
+              fvgTop: signal.fvg_top,
+              fvgBottom: signal.fvg_bottom,
+              side: signal.side,
+            }}
+            height={280}
           />
           <View style={styles.rsiCard}>
             <RsiChart width={chartWidth} rsi={rsi} />
@@ -278,133 +288,6 @@ export default function DetailScreen() {
         </Pressable>
       </View>
     </View>
-  );
-}
-
-function PriceChart({
-  width,
-  candles,
-  signal,
-}: {
-  width: number;
-  candles: Candle[];
-  signal: Signal;
-}) {
-  if (candles.length === 0) return null;
-  const pad = 8;
-  const h = CHART_HEIGHT;
-  const w = width - spacing.lg * 2;
-  const view = candles.slice(-80);
-  const highs = view.map((c) => c.h);
-  const lows = view.map((c) => c.l);
-  const min = Math.min(...lows, signal.stop_loss, signal.fvg_bottom) * 0.998;
-  const max = Math.max(...highs, signal.take_profit, signal.fvg_top) * 1.002;
-  const range = max - min || 1;
-  const scaleY = (v: number) => pad + ((max - v) / range) * (h - pad * 2);
-  const barW = Math.max(2, (w - pad * 2) / view.length - 1);
-
-  const fvgY1 = scaleY(signal.fvg_top);
-  const fvgY2 = scaleY(signal.fvg_bottom);
-
-  const entryY = scaleY(signal.entry);
-  const slY = scaleY(signal.stop_loss);
-  const tpY = scaleY(signal.take_profit);
-
-  return (
-    <Svg width={w} height={h}>
-      {/* grid */}
-      {[0.25, 0.5, 0.75].map((f) => (
-        <Line
-          key={f}
-          x1={pad}
-          x2={w - pad}
-          y1={pad + f * (h - pad * 2)}
-          y2={pad + f * (h - pad * 2)}
-          stroke={colors.divider}
-          strokeWidth={1}
-        />
-      ))}
-
-      {/* FVG zone */}
-      <Rect
-        x={pad}
-        y={Math.min(fvgY1, fvgY2)}
-        width={w - pad * 2}
-        height={Math.abs(fvgY2 - fvgY1)}
-        fill={
-          signal.side === "long" ? "rgba(0,192,118,0.15)" : "rgba(255,85,74,0.15)"
-        }
-        stroke={signal.side === "long" ? colors.success : colors.error}
-        strokeDasharray="3 3"
-        strokeWidth={1}
-      />
-
-      {/* candles */}
-      {view.map((c, i) => {
-        const x = pad + i * ((w - pad * 2) / view.length);
-        const up = c.c >= c.o;
-        const color = up ? colors.success : colors.error;
-        const yHigh = scaleY(c.h);
-        const yLow = scaleY(c.l);
-        const yO = scaleY(c.o);
-        const yC = scaleY(c.c);
-        return (
-          <React.Fragment key={`k${i}`}>
-            <Line
-              x1={x + barW / 2}
-              x2={x + barW / 2}
-              y1={yHigh}
-              y2={yLow}
-              stroke={color}
-              strokeWidth={1}
-            />
-            <Rect
-              x={x}
-              y={Math.min(yO, yC)}
-              width={barW}
-              height={Math.max(1, Math.abs(yC - yO))}
-              fill={color}
-            />
-          </React.Fragment>
-        );
-      })}
-
-      {/* levels */}
-      <LevelLine y={entryY} width={w} pad={pad} color={colors.brand} label="ENTRY" />
-      <LevelLine y={slY} width={w} pad={pad} color={colors.error} label="SL" />
-      <LevelLine y={tpY} width={w} pad={pad} color={colors.success} label="TP" />
-    </Svg>
-  );
-}
-
-function LevelLine({
-  y,
-  width,
-  pad,
-  color,
-  label,
-}: {
-  y: number;
-  width: number;
-  pad: number;
-  color: string;
-  label: string;
-}) {
-  return (
-    <>
-      <Line
-        x1={pad}
-        x2={width - pad}
-        y1={y}
-        y2={y}
-        stroke={color}
-        strokeDasharray="4 4"
-        strokeWidth={1.2}
-      />
-      <SvgText x={width - pad - 30} y={y - 2} fill={color} fontSize={9} fontWeight="700">
-        {label}
-      </SvgText>
-    </>
   );
 }
 

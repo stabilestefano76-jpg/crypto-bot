@@ -85,6 +85,13 @@ export default function SettingsScreen() {
     );
   }
 
+  const stratOn = (val: string): boolean =>
+    cfg.enabled_strategies && cfg.enabled_strategies.length
+      ? cfg.enabled_strategies.includes(val)
+      : cfg.strategy_mode === "both"
+        ? val === "scoring" || val === "impulse_fvg"
+        : cfg.strategy_mode === val;
+
   return (
     <KeyboardAvoidingView
       style={{ flex: 1 }}
@@ -102,40 +109,57 @@ export default function SettingsScreen() {
           contentContainerStyle={styles.body}
           keyboardShouldPersistTaps="handled"
         >
-          <Section title="Strategia segnali">
-            <View style={styles.stratRow}>
-              {([
-                ["scoring", "Scoring"],
-                ["impulse_fvg", "Impulse FVG"],
-                ["counter_trend", "Rev Pre-FVG"],
-                ["both", "Entrambe"],
-              ] as const).map(([val, label]) => {
-                const active = cfg.strategy_mode === val;
-                return (
-                  <Pressable
-                    key={val}
-                    onPress={() => update({ strategy_mode: val })}
-                    style={[styles.stratChip, active && styles.stratChipActive]}
-                    testID={`strategy-${val}`}
-                  >
-                    <Text
-                      style={[styles.stratText, active && { color: colors.onBrand }]}
-                    >
-                      {label}
-                    </Text>
-                  </Pressable>
-                );
-              })}
-            </View>
+          <Section title="Strategie segnali (parallele)">
+            {(() => {
+              const enabled: string[] =
+                cfg.enabled_strategies && cfg.enabled_strategies.length
+                  ? cfg.enabled_strategies
+                  : cfg.strategy_mode === "both"
+                    ? ["scoring", "impulse_fvg"]
+                    : [cfg.strategy_mode];
+              const toggle = (val: string) => {
+                const set = new Set(enabled);
+                if (set.has(val)) set.delete(val);
+                else set.add(val);
+                update({ enabled_strategies: Array.from(set) });
+              };
+              return (
+                <View style={styles.stratRow}>
+                  {([
+                    ["scoring", "Scoring"],
+                    ["impulse_fvg", "Impulse FVG"],
+                    ["counter_trend", "Rev Pre-FVG"],
+                    ["fvg_reversal", "FVG Reversal"],
+                  ] as const).map(([val, label]) => {
+                    const active = enabled.includes(val);
+                    return (
+                      <Pressable
+                        key={val}
+                        onPress={() => toggle(val)}
+                        style={[styles.stratChip, active && styles.stratChipActive]}
+                        testID={`strategy-${val}`}
+                      >
+                        <Text
+                          style={[styles.stratText, active && { color: colors.onBrand }]}
+                        >
+                          {label}
+                        </Text>
+                      </Pressable>
+                    );
+                  })}
+                </View>
+              );
+            })()}
             <Text style={styles.scoreHintText}>
+              Selezione multipla: girano in parallelo a capitale condiviso.
               Scoring = confluenza a punteggio. Impulse FVG = trend + impulso +
-              breakout del consolidamento con TP1/TP2. Rev Pre-FVG = impulso →
-              FVG → consolidamento → reversal → breakout verso il fill FVG.
-              Entrambe = attive insieme.
+              breakout con TP1/TP2. Rev Pre-FVG = breakout del consolidamento
+              verso il fill FVG. FVG Reversal = contro-trend sul ritracciamento
+              verso la FVG (parametri indipendenti).
             </Text>
           </Section>
 
-          {(cfg.strategy_mode === "counter_trend" || cfg.strategy_mode === "both") && (
+          {stratOn("counter_trend") && (
             <Section title="Reversal Pre-FVG Strategy">
               <NumRow
                 label="Min. candele consolidamento"
@@ -177,7 +201,59 @@ export default function SettingsScreen() {
             </Section>
           )}
 
-          {(cfg.strategy_mode === "impulse_fvg" || cfg.strategy_mode === "both") && (
+          {stratOn("fvg_reversal") && (
+            <Section title="FVG Reversal Strategy">
+              <NumRow
+                label="Quota TP1 (%)"
+                value={cfg.fvgr_tp1_pct}
+                onChange={(v) => update({ fvgr_tp1_pct: v })}
+                testID="input-fvgr-tp1"
+              />
+              <NumRow
+                label="Quota TP2 (%)"
+                value={cfg.fvgr_tp2_pct}
+                onChange={(v) => update({ fvgr_tp2_pct: v })}
+                testID="input-fvgr-tp2"
+              />
+              <NumRow
+                label="Avanzamento post-TP1 (%)"
+                value={cfg.fvgr_post_tp1_advance_pct}
+                onChange={(v) => update({ fvgr_post_tp1_advance_pct: v })}
+                step={0.1}
+                testID="input-fvgr-post-tp1"
+              />
+              <NumRow
+                label="Trailing stop (%)"
+                value={cfg.fvgr_trailing_pct}
+                onChange={(v) => update({ fvgr_trailing_pct: v })}
+                step={0.1}
+                testID="input-fvgr-trailing"
+              />
+              <NumRow
+                label="SL ATR multiplier"
+                value={cfg.fvgr_atr_sl_multiplier}
+                onChange={(v) => update({ fvgr_atr_sl_multiplier: v })}
+                step={0.1}
+                testID="input-fvgr-atr"
+              />
+              <NumRow
+                label="Min R:R"
+                value={cfg.fvgr_min_rr_ratio}
+                onChange={(v) => update({ fvgr_min_rr_ratio: v })}
+                step={0.1}
+                testID="input-fvgr-rr"
+              />
+              <Text style={styles.scoreHintText}>
+                Contro-trend sul ritracciamento verso la FVG di impulso. Entrata
+                sul pattern di reversal; target dentro la FVG. Dopo TP1 chiude{" "}
+                {cfg.fvgr_tp1_pct}%; oltre +{cfg.fvgr_post_tp1_advance_pct}% da TP1
+                lo stop va a TP1 (netto fee); trailing {cfg.fvgr_trailing_pct}% in
+                profitto. Parametri indipendenti dalle altre strategie.
+              </Text>
+            </Section>
+          )}
+
+          {stratOn("impulse_fvg") && (
             <Section title="Impulse FVG Strategy">
               <NumRow
                 label="Soglia ATR candela impulso"

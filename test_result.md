@@ -188,3 +188,34 @@ agent_communication:
         FRONTEND (solo smoke): chip 'Rev Pre-FVG' (testID strategy-counter_trend) mostra la sezione
         "Reversal Pre-FVG Strategy" con input-ct-* e persiste post_tp1_advance_pct su Save.
         NON regredire: strategie scoring/impulse_fvg, Reset History, portfolio.
+
+## Bybit migration + FVG Reversal (Fase 1 & 2)
+backend:
+  - task: "Migrazione KuCoin -> Bybit EU v5 (dati pubblici)"
+    implemented: true
+    working: true
+    file: "backend/server.py"
+    status_history:
+      - working: true
+        agent: "main"
+        comment: "BybitClient (get_symbols/get_tickers/get_klines normalizzati), PriceFeed su WS Bybit v5, fees/funding/spread adattati, /exchange firma HMAC Bybit v5. Verificato: candele live 200 ascending, /pairs USDC+EUR, scan 20-25 coppie con segnali, WS connesso (ws_connected true). Vincoli EU: spot USDC/EUR (no USDT), nessun linear."
+  - task: "Strategia FVG Reversal + selezione parallela (enabled_strategies)"
+    implemented: true
+    working: true
+    file: "backend/server.py"
+    status_history:
+      - working: true
+        agent: "main"
+        comment: "analyze_pair_fvg_reversal (contro-trend su ritracciamento, param fvgr_*), manage_fvg_reversal_position (TP1 65%/post-TP1 SL->TP1+fee/trailing/TP2), dispatch parallelo via active_strategies. Test sintetico /tmp/test_fvgr.py: entry+gestione TUTTI PASS. Scan parallelo 4 strategie senza errori."
+frontend:
+  - task: "UI multi-select strategie + sezione FVG Reversal"
+    implemented: true
+    working: true
+    file: "frontend/app/(tabs)/settings.tsx"
+    status_history:
+      - working: true
+        agent: "main"
+        comment: "Chip multi-select (enabled_strategies) + sezione FVG Reversal Strategy con parametri indipendenti. Screenshot conferma toggle multipli e sezioni condizionali. api.ts Config aggiornato."
+agent_communication:
+  - agent: "main"
+    message: "Fase 1 (Bybit dati pubblici) e Fase 2 (FVG Reversal parallela) complete e verificate. Prossimo: Fase 3 (esecuzione reale Bybit + toggle paper/reale + ON/OFF + risk sizing 10/20/50/100 con esposizione combinata), Fase 4 (chiudi-tutte/parziale + rifinitura grafico live)."

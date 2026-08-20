@@ -1,5 +1,23 @@
 # KuSignal Bot - PRD
 
+## ⚠️ Migrazione Exchange: KuCoin → Bybit EU (in corso, Fase 1 completata)
+- **Fase 1 (DONE)**: sostituito interamente il layer dati KuCoin con **Bybit EU v5** (`https://api.bybit.eu`, WS `wss://stream.bybit.eu/v5/public/{spot|linear}`). Nuovo `BybitClient` (get_symbols/get_tickers/get_klines normalizzati alle stesse shape di prima), `PriceFeed` riscritto su WS Bybit v5, `get_trade_fees`/`get_funding_rate`/`_current_spread` adattati, credenziali/`/exchange/*` passate a firma HMAC Bybit v5 (id doc "bybit", passphrase rimossa). `exchange.category` = spot|linear sincronizzato da `trading_mode`.
+- **Vincoli Bybit EU (MiCA) scoperti**:
+  - Spot EU quotato in **USDC** (113 coppie) / EUR, NON USDT (solo 4 USDT). Default `quote_filter`="USDC", `min_24h_volume_usdt`=100k.
+  - **Nessun mercato leverage/perpetui (linear) su bybit.eu** (category=linear → 0 strumenti). La modalità "leverage" non ha mercato derivati sull'entità EU.
+  - Simboli senza trattino ("BTCUSDC"). Klines: ms→s, colonne [t,o,h,l,c,v] rimappate a [t,o,c,h,l,v]; scartata l'ultima candela in formazione.
+- Verifica Fase 1: `/api/candles` live (200 candele ascending), `/api/pairs` USDC, scan 19 coppie/3 segnali, WS connesso e prezzi in cache. Nessun riferimento KuCoin residuo.
+## ✅ Fase 2 (DONE) — Strategia "FVG Reversal" + selezione parallela
+- Nuova strategia `analyze_pair_fvg_reversal` (contro-trend sul ritracciamento verso la FVG d'impulso; entrata sul reversal, target dentro la FVG; SL oltre l'estremo dell'impulso; TP1=bordo vicino, TP2=midpoint 65/35). Parametri INDIPENDENTI `fvgr_*` (rsi extremes, tp1/tp2, post_tp1, trailing, atr mult, min_rr).
+- Gestione dedicata `manage_fvg_reversal_position`: TP1 65% → SL invariato → oltre +fvgr_post_tp1_advance% da TP1 sposta SL a TP1(±fee) → trailing fvgr_trailing% in profitto → TP2 chiude il resto.
+- **Selezione parallela**: `enabled_strategies: list[str]` (scoring|impulse_fvg|counter_trend|fvg_reversal). Lo scan esegue TUTTE le strategie abilitate in parallelo, capitale condiviso, ogni segnale taggato con `strategy`. Fallback legacy su `strategy_mode`.
+- Coppie: quote multipli `USDC,EUR` (helper split). UI settings: chip multi-select + sezione "FVG Reversal Strategy" con i parametri indipendenti.
+- Verifiche: scan parallelo 4 strategie senza errori; test sintetici FVG Reversal (entry short SL>entry, TP1/TP2 dentro FVG; gestione TP1 65% / post-TP1 SL→TP1-fee / TP2) TUTTI PASS. Coppie EUR presenti (18).
+
+
+
+
+
 ## Overview
 Mobile React Native / Expo app che scansiona periodicamente le coppie spot USDT su KuCoin e genera segnali di trading in caso di **confluenza** tra: divergenza RSI, Fair Value Gap (FVG) aperto, spike di volume ed allineamento EMA.
 

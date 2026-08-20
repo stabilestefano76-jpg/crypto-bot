@@ -42,12 +42,16 @@ logger = logging.getLogger("kusignal")
 # ---------------------------------------------------------------------------
 # KuCoin constants
 # ---------------------------------------------------------------------------
-KUCOIN_BASE = "https://api.kucoin.com"
+# ---------------------------------------------------------------------------
+# Bybit EU (MiCA) v5 — market data endpoints
+# ---------------------------------------------------------------------------
+BYBIT_BASE = "https://api.bybit.eu"
+BYBIT_WS_PUBLIC = "wss://stream.bybit.eu/v5/public"
 TF_MAP = {
-    "15m": "15min",
-    "1h": "1hour",
-    "4h": "4hour",
-    "1d": "1day",
+    "15m": "15",
+    "1h": "60",
+    "4h": "240",
+    "1d": "D",
 }
 TF_SECONDS = {"15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
 DEFAULT_TIMEFRAMES = ["1h", "4h"]
@@ -59,8 +63,8 @@ CANDLE_LIMIT = 200  # candles fetched per pair/tf
 class Config(BaseModel):
     scan_interval_minutes: int = 5
     timeframes: list[str] = Field(default_factory=lambda: DEFAULT_TIMEFRAMES.copy())
-    quote_filter: str = "USDT"  # only pairs quoted in this asset
-    min_24h_volume_usdt: float = 500_000.0
+    quote_filter: str = "USDC,EUR"  # Bybit EU spot quotes (comma-separated)
+    min_24h_volume_usdt: float = 100_000.0
     rsi_period: int = 14
     rsi_overbought: float = 70.0
     rsi_oversold: float = 30.0
@@ -119,6 +123,17 @@ class Config(BaseModel):
     rsi_high_tf_os: float = 20.0  # higher-TF oversold (long)
     trailing_pct_from_entry: float = 1.0  # counter-trend trailing distance %
     post_tp1_advance_pct: float = 0.5  # % beyond TP1 before moving SL to TP1 (net fees)
+    # --- Parallel strategy selection ---
+    enabled_strategies: list[str] = Field(default_factory=list)  # empty = derive from strategy_mode
+    # --- FVG Reversal strategy (independent params, contro-trend on retracement) ---
+    fvgr_rsi_high_tf_ob: float = 80.0
+    fvgr_rsi_high_tf_os: float = 20.0
+    fvgr_tp1_pct: float = 65.0
+    fvgr_tp2_pct: float = 35.0
+    fvgr_post_tp1_advance_pct: float = 0.5
+    fvgr_trailing_pct: float = 1.0  # trailing distance % (from best price), when in profit
+    fvgr_atr_sl_multiplier: float = 1.5
+    fvgr_min_rr_ratio: float = 1.5
 
 
 class Signal(BaseModel):
@@ -218,7 +233,7 @@ class PaperTrade(BaseModel):
 class ExchangeConnectRequest(BaseModel):
     api_key: str
     api_secret: str
-    api_passphrase: str
+    api_passphrase: Optional[str] = None  # unused for Bybit; kept for compatibility
 
 
 # ---------------------------------------------------------------------------
@@ -478,10 +493,23 @@ def detect_fvg_reversal(
 # ---------------------------------------------------------------------------
 # KuCoin client
 # ---------------------------------------------------------------------------
-class KuCoinClient:
+def _bybit_category(trading_mode: str) -> str:
+    """Map the bot's trading_mode to a Bybit v5 market category."""
+    return "linear" if trading_mode == "leverage" else "spot"
+
+
+class BybitClient:
+    """Bybit EU v5 public market-data client. Returns data normalized to the
+    same shapes the rest of the bot expects (drop-in for the old KuCoin client):
+      - get_symbols(): [{symbol, quoteCurrency, enableTrading}]
+      - get_tickers(): [{symbol, last, volValue}]
+      - get_klines():  [[time_s, open, close, high, low, volume], ...] ascending
+    """
+
     def __init__(self) -> None:
-        self._client = httpx.AsyncClient(base_url=KUCOIN_BASE, timeout=15.0)
-        self._sema = asyncio.Semaphore(15)  # respect rate limits
+        self._client = httpx.AsyncClient(base_url=BYBIT_BASE, timeout=15.0)
+        self._sema = asyncio.Semaphore(15)
+        self.category = "spot"  # updated from paper trading_mode
 
     async def close(self) -> None:
         await self._client.aclose()
@@ -498,70 +526,91 @@ class KuCoinClient:
                     return r.json()
                 except (httpx.HTTPError, httpx.ReadTimeout) as e:
                     if attempt == 2:
-                        logger.warning("KuCoin GET failed %s: %s", path, e)
+                        logger.warning("Bybit GET failed %s: %s", path, e)
                         return None
                     await asyncio.sleep(0.5)
             return None
 
     async def get_symbols(self) -> list[dict[str, Any]]:
-        data = await self._get("/api/v2/symbols")
-        if not data or data.get("code") != "200000":
+        data = await self._get(
+            "/v5/market/instruments-info", params={"category": self.category}
+        )
+        if not data or data.get("retCode") != 0:
             return []
-        return data.get("data", [])
+        out: list[dict[str, Any]] = []
+        for it in data.get("result", {}).get("list", []):
+            out.append({
+                "symbol": it.get("symbol"),
+                "quoteCurrency": it.get("quoteCoin"),
+                "enableTrading": it.get("status") == "Trading",
+            })
+        return out
 
     async def get_tickers(self) -> list[dict[str, Any]]:
-        data = await self._get("/api/v1/market/allTickers")
-        if not data or data.get("code") != "200000":
+        data = await self._get(
+            "/v5/market/tickers", params={"category": self.category}
+        )
+        if not data or data.get("retCode") != 0:
             return []
-        return data.get("data", {}).get("ticker", [])
+        out: list[dict[str, Any]] = []
+        for t in data.get("result", {}).get("list", []):
+            out.append({
+                "symbol": t.get("symbol"),
+                "last": t.get("lastPrice"),
+                "volValue": t.get("turnover24h"),  # 24h quote volume
+                "changeRate": t.get("price24hPcnt"),  # 24h change (fraction)
+            })
+        return out
 
     async def get_klines(self, symbol: str, tf: str) -> list[list[float]]:
-        kucoin_tf = TF_MAP.get(tf)
-        if not kucoin_tf:
+        bybit_tf = TF_MAP.get(tf)
+        if not bybit_tf:
             return []
         data = await self._get(
-            "/api/v1/market/candles",
-            params={"symbol": symbol, "type": kucoin_tf},
+            "/v5/market/kline",
+            params={
+                "category": self.category,
+                "symbol": symbol,
+                "interval": bybit_tf,
+                "limit": CANDLE_LIMIT + 1,
+            },
         )
-        if not data or data.get("code") != "200000":
+        if not data or data.get("retCode") != 0:
             return []
-        # KuCoin returns [time, open, close, high, low, volume, turnover] descending
-        raw = data.get("data", [])
-        raw.reverse()
-        # BUGFIX (RSI misalignment): drop the last, still-forming candle so that
-        # BOTH signal logic and chart rendering reference the same CLOSED candles
-        # using the same rsi_wilder function.
+        # Bybit returns newest-first: [start_ms, open, high, low, close, volume, turnover]
+        raw = data.get("result", {}).get("list", [])
+        raw = list(reversed(raw))  # ascending by time
+        # Drop the last, still-forming candle so signal logic and chart rendering
+        # both reference the same CLOSED candles.
         if len(raw) > 1:
             raw = raw[:-1]
-        candles = []
+        candles: list[list[float]] = []
         for row in raw[-CANDLE_LIMIT:]:
             try:
-                candles.append(
-                    [
-                        float(row[0]),  # time
-                        float(row[1]),  # open
-                        float(row[2]),  # close
-                        float(row[3]),  # high
-                        float(row[4]),  # low
-                        float(row[5]),  # volume
-                    ]
-                )
+                candles.append([
+                    float(row[0]) / 1000.0,  # time (ms -> s)
+                    float(row[1]),           # open
+                    float(row[4]),           # close
+                    float(row[2]),           # high
+                    float(row[3]),           # low
+                    float(row[5]),           # volume
+                ])
             except (ValueError, IndexError):
                 continue
         return candles
 
 
-kucoin = KuCoinClient()
+exchange = BybitClient()
 
 
 # ---------------------------------------------------------------------------
-# Real-time price feed via KuCoin public WebSocket
+# Real-time price feed via Bybit v5 public WebSocket
 # ---------------------------------------------------------------------------
 class PriceFeed:
-    """Maintains a live cache of last-trade prices via KuCoin WS.
+    """Maintains a live cache of last prices via Bybit v5 public WS.
 
-    Falls back to REST if the socket drops. Subscribes to the symbols of
-    currently open paper positions so SL/TP can trigger with minimal delay.
+    Subscribes to the tickers of currently open paper positions so SL/TP can
+    trigger with minimal delay. Falls back to REST if the socket drops.
     """
 
     def __init__(self) -> None:
@@ -575,41 +624,24 @@ class PriceFeed:
     def get(self, symbol: str) -> Optional[float]:
         return self.prices.get(symbol)
 
-    async def _get_token(self) -> Optional[tuple[str, str]]:
-        try:
-            async with httpx.AsyncClient(base_url=KUCOIN_BASE, timeout=10.0) as c:
-                r = await c.post("/api/v1/bullet-public")
-                data = r.json()
-                if data.get("code") != "200000":
-                    return None
-                token = data["data"]["token"]
-                endpoint = data["data"]["instanceServers"][0]["endpoint"]
-                return token, endpoint
-        except (httpx.HTTPError, KeyError, IndexError) as e:
-            logger.warning("WS token fetch failed: %s", e)
-            return None
-
     async def desired_symbols(self) -> list[str]:
         docs = await db.paper_positions.find({}, {"symbol": 1, "_id": 0}).to_list(1000)
         return sorted({d["symbol"] for d in docs})
+
+    def _ws_url(self) -> str:
+        return f"{BYBIT_WS_PUBLIC}/{exchange.category}"
 
     async def run(self) -> None:
         import websockets  # local import, dep added
 
         while True:
-            tok = await self._get_token()
-            if not tok:
-                await asyncio.sleep(5)
-                continue
-            token, endpoint = tok
-            url = f"{endpoint}?token={token}"
+            url = self._ws_url()
             try:
                 async with websockets.connect(url, ping_interval=None) as ws:
                     self._ws = ws
                     self._connected = True
                     self._subscribed.clear()
-                    logger.info("KuCoin WS connected")
-                    # background ping every 15s
+                    logger.info("Bybit WS connected: %s", url)
                     ping_task = asyncio.create_task(self._ping_loop(ws))
                     sub_task = asyncio.create_task(self._resub_loop(ws))
                     try:
@@ -619,7 +651,7 @@ class PriceFeed:
                         ping_task.cancel()
                         sub_task.cancel()
             except Exception as e:  # noqa: BLE001
-                logger.warning("KuCoin WS error, reconnecting: %s", e)
+                logger.warning("Bybit WS error, reconnecting: %s", e)
             self._connected = False
             self._ws = None
             await asyncio.sleep(3)
@@ -627,9 +659,9 @@ class PriceFeed:
     async def _ping_loop(self, ws: Any) -> None:
         import json as _json
         while True:
-            await asyncio.sleep(15)
+            await asyncio.sleep(20)
             try:
-                await ws.send(_json.dumps({"id": str(int(time.time() * 1000)), "type": "ping"}))
+                await ws.send(_json.dumps({"op": "ping"}))
             except Exception:
                 return
 
@@ -641,22 +673,18 @@ class PriceFeed:
                 want = set(await self.desired_symbols())
                 to_add = want - self._subscribed
                 to_remove = self._subscribed - want
-                for sym in to_add:
+                if to_add:
                     await ws.send(_json.dumps({
-                        "id": str(int(time.time() * 1000)),
-                        "type": "subscribe",
-                        "topic": f"/market/ticker:{sym}",
-                        "response": True,
+                        "op": "subscribe",
+                        "args": [f"tickers.{s}" for s in to_add],
                     }))
-                    self._subscribed.add(sym)
-                for sym in to_remove:
+                    self._subscribed |= to_add
+                if to_remove:
                     await ws.send(_json.dumps({
-                        "id": str(int(time.time() * 1000)),
-                        "type": "unsubscribe",
-                        "topic": f"/market/ticker:{sym}",
-                        "response": True,
+                        "op": "unsubscribe",
+                        "args": [f"tickers.{s}" for s in to_remove],
                     }))
-                    self._subscribed.discard(sym)
+                    self._subscribed -= to_remove
             except Exception:
                 return
             await asyncio.sleep(3)
@@ -667,14 +695,15 @@ class PriceFeed:
             msg = _json.loads(raw)
         except (ValueError, TypeError):
             return
-        if msg.get("type") != "message":
-            return
         topic = msg.get("topic", "")
-        if not topic.startswith("/market/ticker:"):
+        if not topic.startswith("tickers."):
             return
-        symbol = topic.split(":", 1)[1]
+        symbol = topic.split(".", 1)[1]
         data = msg.get("data", {})
-        price = data.get("price") or data.get("bestBid")
+        # spot pushes full snapshots; linear pushes deltas that may omit lastPrice
+        price = data.get("lastPrice")
+        if price is None:
+            return
         try:
             self.prices[symbol] = float(price)
             self.updated_at[symbol] = time.time()
@@ -687,13 +716,15 @@ class PriceFeed:
         ts = self.updated_at.get(symbol, 0)
         if p and (time.time() - ts) < 10:
             return p
-        # REST fallback
         try:
-            async with httpx.AsyncClient(base_url=KUCOIN_BASE, timeout=8.0) as c:
-                r = await c.get("/api/v1/market/orderbook/level1", params={"symbol": symbol})
+            async with httpx.AsyncClient(base_url=BYBIT_BASE, timeout=8.0) as c:
+                r = await c.get(
+                    "/v5/market/tickers",
+                    params={"category": exchange.category, "symbol": symbol},
+                )
                 d = r.json()
-                if d.get("code") == "200000" and d.get("data"):
-                    return float(d["data"]["price"])
+                if d.get("retCode") == 0 and d.get("result", {}).get("list"):
+                    return float(d["result"]["list"][0]["lastPrice"])
         except (httpx.HTTPError, KeyError, TypeError, ValueError):
             pass
         return None
@@ -741,8 +772,11 @@ async def get_paper_config() -> PaperConfig:
         await db.paper_config.update_one(
             {"_id": PAPER_CFG_ID}, {"$set": cfg.model_dump()}, upsert=True
         )
-        return cfg
-    return PaperConfig(**doc)
+    else:
+        cfg = PaperConfig(**doc)
+    # Keep the Bybit market category in sync with the bot's trading mode.
+    exchange.category = _bybit_category(cfg.trading_mode)
+    return cfg
 
 
 async def save_paper_config(cfg: PaperConfig) -> PaperConfig:
@@ -939,36 +973,30 @@ _funding_cache: dict[str, float] = {}
 
 
 async def get_trade_fees(symbol: str, cfg: Config) -> tuple[float, float]:
-    """Maker/taker fee rates via KuCoin (authenticated). Falls back to
-    default_fee_rate with a warning if credentials/endpoint unavailable."""
+    """Maker/taker fee rates. Bybit spot/linear default taker is ~0.1% / 0.055%.
+    For paper trading we use the configured default_fee_rate; real per-symbol
+    fees via the signed Bybit API are wired in the execution phase."""
     if symbol in _fee_cache:
         return _fee_cache[symbol]
     maker = taker = cfg.default_fee_rate
-    try:
-        r = await _kucoin_signed_get(f"/api/v1/trade-fees?symbols={symbol}")
-        data = r.json()
-        if data.get("code") == "200000" and data.get("data"):
-            d = data["data"][0]
-            maker = float(d.get("makerFeeRate", maker))
-            taker = float(d.get("takerFeeRate", taker))
-        else:
-            logger.warning("Fee API for %s returned %s; using default", symbol, data.get("code"))
-    except Exception as e:  # noqa: BLE001
-        logger.warning("Fee API unavailable for %s (%s); using default fee", symbol, e)
     _fee_cache[symbol] = (maker, taker)
     return maker, taker
 
 
 async def get_funding_rate(symbol: str, cfg: Config) -> float:
-    """Current funding rate via KuCoin Futures public API. Falls back to last
-    known value (or 0) with a warning; never blocks execution."""
-    contract = symbol.replace("-", "")  # e.g. BTC-USDT -> BTCUSDT (best effort)
+    """Current funding rate via Bybit v5 (linear only). Spot has no funding.
+    Falls back to last known value (or 0); never blocks execution."""
+    if exchange.category != "linear":
+        return 0.0
     try:
-        async with httpx.AsyncClient(base_url="https://api-futures.kucoin.com", timeout=8.0) as c:
-            r = await c.get(f"/api/v1/funding-rate/{contract}/current")
+        async with httpx.AsyncClient(base_url=BYBIT_BASE, timeout=8.0) as c:
+            r = await c.get(
+                "/v5/market/tickers",
+                params={"category": "linear", "symbol": symbol},
+            )
             data = r.json()
-            if data.get("code") == "200000" and data.get("data"):
-                val = float(data["data"].get("value", 0.0))
+            if data.get("retCode") == 0 and data.get("result", {}).get("list"):
+                val = float(data["result"]["list"][0].get("fundingRate") or 0.0)
                 _funding_cache[symbol] = val
                 return val
     except Exception as e:  # noqa: BLE001
@@ -977,14 +1005,18 @@ async def get_funding_rate(symbol: str, cfg: Config) -> float:
 
 
 async def _current_spread(symbol: str) -> float:
-    """Approx average bid-ask spread from KuCoin level1 (proxy for last-20-tick avg)."""
+    """Approx bid-ask spread from Bybit v5 orderbook (best bid/ask)."""
     try:
-        async with httpx.AsyncClient(base_url=KUCOIN_BASE, timeout=8.0) as c:
-            r = await c.get("/api/v1/market/orderbook/level1", params={"symbol": symbol})
+        async with httpx.AsyncClient(base_url=BYBIT_BASE, timeout=8.0) as c:
+            r = await c.get(
+                "/v5/market/orderbook",
+                params={"category": exchange.category, "symbol": symbol, "limit": 1},
+            )
             d = r.json()
-            if d.get("code") == "200000" and d.get("data"):
-                bid = float(d["data"].get("bestBid") or 0)
-                ask = float(d["data"].get("bestAsk") or 0)
+            if d.get("retCode") == 0 and d.get("result"):
+                res = d["result"]
+                bid = float(res["b"][0][0]) if res.get("b") else 0.0
+                ask = float(res["a"][0][0]) if res.get("a") else 0.0
                 if bid > 0 and ask > 0:
                     return max(0.0, ask - bid)
     except Exception:  # noqa: BLE001
@@ -1076,7 +1108,7 @@ async def apply_trailing_manager(pos: dict[str, Any], price: float, cfg: Config)
     current_candle = (time.time() // tf_sec) * tf_sec
     if current_candle <= float(pos.get("last_trail_candle_t") or 0):
         return None  # only recompute on new candle close
-    candles = await kucoin.get_klines(pos["symbol"], tf)
+    candles = await exchange.get_klines(pos["symbol"], tf)
     if len(candles) < 20:
         return None
     ref = _recent_swing(candles, pos["side"], cfg.pivot_window)
@@ -1159,7 +1191,7 @@ async def maybe_partial_close(pos: dict[str, Any], price: float, cfg: Config) ->
 
 async def _last_closed_close(symbol: str, tf: str) -> Optional[float]:
     """Close of the last FULLY closed candle (index -2) for close-confirmation."""
-    candles = await kucoin.get_klines(symbol, tf)
+    candles = await exchange.get_klines(symbol, tf)
     if len(candles) < 2:
         return None
     return candles[-2][2]
@@ -1259,6 +1291,62 @@ async def manage_counter_position(pos: dict[str, Any], price: float, cfg: Config
 
 
 
+async def manage_fvg_reversal_position(pos: dict[str, Any], price: float, cfg: Config) -> dict[str, Any]:
+    """FVG Reversal execution: TP1 (fvgr_tp1_pct) partial on candle close; keep
+    the structure stop until price advances fvgr_post_tp1_advance_pct beyond TP1,
+    then move stop to TP1 (net fees); trailing fvgr_trailing_pct once in profit;
+    TP2 closes the remainder."""
+    tf = pos.get("timeframe", "1h")
+    tp1 = float(pos.get("tp1") or 0)
+    tp2 = float(pos.get("tp2") or 0)
+    long = pos["side"] == "long"
+    last_close = await _last_closed_close(pos["symbol"], tf)
+    if last_close is None:
+        return pos
+
+    if not pos.get("partial_closed"):
+        hit = last_close >= tp1 if long else last_close <= tp1
+        if tp1 > 0 and hit:
+            remain = await _close_fraction(pos, tp1, cfg.fvgr_tp1_pct / 100, "tp1")
+            await db.paper_positions.update_one(
+                {"id": pos["id"]}, {"$set": {"quantity": round(remain, 8)}}
+            )
+            pos = {**pos, "partial_closed": True, "quantity": remain}
+    else:
+        if not pos.get("breakeven_active"):
+            adv = tp1 * (cfg.fvgr_post_tp1_advance_pct / 100)
+            reached = (price >= tp1 + adv) if long else (price <= tp1 - adv)
+            if reached:
+                maker, taker = await get_trade_fees(pos["symbol"], cfg)
+                fee = tp1 * (maker + taker)
+                ns = tp1 + fee if long else tp1 - fee
+                await db.paper_positions.update_one(
+                    {"id": pos["id"]},
+                    {"$set": {"current_stop": round(ns, 8), "breakeven_active": True}},
+                )
+                pos = {**pos, "current_stop": ns, "breakeven_active": True}
+
+    # Trailing stop fvgr_trailing_pct from price, active once in profit.
+    entry = float(pos.get("fill_price") or pos.get("entry") or 0)
+    in_profit = (price > entry) if long else (price < entry)
+    if entry > 0 and in_profit and cfg.fvgr_trailing_pct > 0:
+        cur = float(pos.get("current_stop") or pos.get("stop_loss") or 0)
+        trail = price * (1 - cfg.fvgr_trailing_pct / 100) if long else price * (1 + cfg.fvgr_trailing_pct / 100)
+        ns = max(cur, trail) if long else min(cur, trail)
+        if (long and ns > cur) or ((not long) and ns < cur):
+            await db.paper_positions.update_one(
+                {"id": pos["id"]}, {"$set": {"current_stop": round(ns, 8)}}
+            )
+            pos = {**pos, "current_stop": ns}
+
+    if tp2 > 0 and pos.get("partial_closed"):
+        hit2 = last_close >= tp2 if long else last_close <= tp2
+        if hit2:
+            await close_paper_position(pos, tp2, "win")
+            return {**pos, "quantity": 0}
+    return pos
+
+
 async def manage_open_position(pos: dict[str, Any], price: float, cfg: Config) -> dict[str, Any]:
     """Run the 3 additive managers + partial close. Returns the possibly-updated
     position dict (with fresh current_stop)."""
@@ -1269,6 +1357,9 @@ async def manage_open_position(pos: dict[str, Any], price: float, cfg: Config) -
     # Pre-FVG reversal strategy has its own TP1/TP2 + post-TP1 stop path.
     if pos.get("strategy") == "counter_trend":
         return await manage_counter_position(pos, price, cfg)
+    # FVG Reversal strategy: TP1/TP2 + post-TP1 stop + trailing.
+    if pos.get("strategy") == "fvg_reversal":
+        return await manage_fvg_reversal_position(pos, price, cfg)
     # Partial close first (does not affect stop)
     await maybe_partial_close(pos, price, cfg)
     # Timeout -> breakeven
@@ -1302,7 +1393,7 @@ async def monitor_paper_positions() -> None:
     rest_map: dict[str, float] = {}
     need_rest = any(price_feed.get(p["symbol"]) is None for p in positions)
     if need_rest:
-        tickers = await kucoin.get_tickers()
+        tickers = await exchange.get_tickers()
         for t in tickers:
             try:
                 rest_map[t["symbol"]] = float(t.get("last") or 0)
@@ -1321,7 +1412,7 @@ async def monitor_paper_positions() -> None:
         # For impulse strategy the primary fixed target is TP2 (if any); the base
         # take_profit equals TP1 which the manager already handles on candle close.
         tp_check = pos["take_profit"]
-        if pos.get("strategy") in ("impulse_fvg", "counter_trend"):
+        if pos.get("strategy") in ("impulse_fvg", "counter_trend", "fvg_reversal"):
             # Fixed TP2 close only AFTER TP1 partial is taken; before that the
             # manager handles TP1 on candle close. If no TP2, rely on trailing.
             if pos.get("partial_closed") and float(pos.get("tp2") or 0) > 0:
@@ -1344,7 +1435,7 @@ async def monitor_paper_positions() -> None:
 # Signal generation
 # ---------------------------------------------------------------------------
 async def analyze_pair(symbol: str, tf: str, cfg: Config) -> Optional[Signal]:
-    candles = await kucoin.get_klines(symbol, tf)
+    candles = await exchange.get_klines(symbol, tf)
     if len(candles) < 60:
         return None
 
@@ -1606,7 +1697,7 @@ def find_consolidation(candles: list[list[float]], cfg: Config, side: str, atr: 
 async def analyze_pair_impulse(symbol: str, tf: str, cfg: Config) -> Optional[Signal]:
     """Impulse-FVG strategy: trend -> origin impulse FVG (TP2) -> consolidation
     breakout (entry) -> SL under/over the box -> TP1 nearest FVG, TP2 origin FVG."""
-    candles = await kucoin.get_klines(symbol, tf)
+    candles = await exchange.get_klines(symbol, tf)
     if len(candles) < 60:
         return None
     highs = [c[3] for c in candles]
@@ -1729,7 +1820,7 @@ async def analyze_pair_counter(symbol: str, tf: str, cfg: Config) -> Optional[Si
     direction as the breakout. Confirmations: volume spike on the breakout + the
     RSI filters (HTF extreme, momentum turn, divergence coherent with entry).
     """
-    candles = await kucoin.get_klines(symbol, tf)
+    candles = await exchange.get_klines(symbol, tf)
     if len(candles) < 60:
         return None
     opens = [c[1] for c in candles]
@@ -1820,7 +1911,7 @@ async def analyze_pair_counter(symbol: str, tf: str, cfg: Config) -> Optional[Si
     rsis = rsi_wilder(closes, cfg.rsi_period)
     # (a) higher-TF extreme (oversold for long / overbought for short)
     htf = _higher_tf(tf)
-    hcandles = await kucoin.get_klines(symbol, htf)
+    hcandles = await exchange.get_klines(symbol, htf)
     hrsis = rsi_wilder([c[2] for c in hcandles], cfg.rsi_period) if len(hcandles) > cfg.rsi_period else []
     hval = next((r for r in reversed(hrsis) if r is not None), None)
     if hval is None:
@@ -1859,6 +1950,114 @@ async def analyze_pair_counter(symbol: str, tf: str, cfg: Config) -> Optional[Si
 scan_state = ScanState()
 
 
+async def analyze_pair_fvg_reversal(symbol: str, tf: str, cfg: Config) -> Optional[Signal]:
+    """FVG Reversal (independent strategy): the FVG forms WITH the trend from a
+    strong impulse; the bot trades AGAINST the trend on the retracement back
+    toward that FVG. Entry = a reversal candle pattern during the retracement;
+    target = inside the trend FVG. Uses its own `fvgr_*` parameters."""
+    candles = await exchange.get_klines(symbol, tf)
+    if len(candles) < 60:
+        return None
+    opens = [c[1] for c in candles]
+    closes = [c[2] for c in candles]
+    highs = [c[3] for c in candles]
+    lows = [c[4] for c in candles]
+
+    structure = detect_market_structure(candles, cfg.pivot_window)
+    if structure == "range":
+        return None
+    trend = structure  # 'up' or 'down'
+    entry_side = "short" if trend == "up" else "long"  # AGAINST the trend
+
+    atr = atr_wilder(highs, lows, closes, cfg.atr_period)
+    if not atr or atr <= 0:
+        return None
+
+    # Impulse FVG in the TREND direction (most significant = largest gap).
+    fvgs = detect_all_fvgs(highs, lows, cfg.fvg_lookback)
+    trend_kind = "bullish" if trend == "up" else "bearish"
+    impulse_fvgs = [f for f in fvgs if f["kind"] == trend_kind]
+    if not impulse_fvgs:
+        return None
+    origin = max(impulse_fvgs, key=lambda f: f["gap"])
+
+    # Reversal pattern AGAINST the trend during the retracement.
+    against = "bearish" if trend == "up" else "bullish"
+    pattern = detect_reversal_pattern(opens, highs, lows, closes, against)
+    if pattern is None:
+        return None
+
+    # RSI filters (independent thresholds).
+    rsis = rsi_wilder(closes, cfg.rsi_period)
+    htf = _higher_tf(tf)
+    hcandles = await exchange.get_klines(symbol, htf)
+    hrsis = rsi_wilder([c[2] for c in hcandles], cfg.rsi_period) if len(hcandles) > cfg.rsi_period else []
+    hval = next((r for r in reversed(hrsis) if r is not None), None)
+    if hval is None:
+        return None
+    if entry_side == "long" and hval > cfg.fvgr_rsi_high_tf_os:
+        return None
+    if entry_side == "short" and hval < cfg.fvgr_rsi_high_tf_ob:
+        return None
+    if not _rsi_momentum_turn(rsis, entry_side, cfg.rsi_overbought, cfg.rsi_oversold):
+        return None
+    div = detect_rsi_divergence(closes, rsis, cfg.pivot_window)
+    if (entry_side == "long" and div != "bullish") or (entry_side == "short" and div != "bearish"):
+        return None
+
+    entry = closes[-1]
+    # SL beyond the IMPULSE EXTREME (never before the FVG zone).
+    i = origin["index"]
+    seg_hi = max(highs[max(0, i - 2):i + 1])
+    seg_lo = min(lows[max(0, i - 2):i + 1])
+    sl_buffer = max(cfg.fvgr_atr_sl_multiplier * atr, entry * (cfg.sl_padding_pct / 100))
+    mid = (origin["top"] + origin["bottom"]) / 2  # internal FVG sub-zone
+    if entry_side == "long":
+        stop_loss = seg_lo - sl_buffer
+        tp1 = origin["bottom"]  # near edge (first touch of the FVG)
+        tp2 = mid               # deeper internal sub-zone
+    else:
+        stop_loss = seg_hi + sl_buffer
+        tp1 = origin["top"]
+        tp2 = mid
+    risk = abs(entry - stop_loss)
+    if risk <= 0:
+        return None
+    if (entry_side == "long" and tp1 <= entry) or (entry_side == "short" and tp1 >= entry):
+        return None
+    est_rr = abs(tp1 - entry) / risk
+    if est_rr < cfg.fvgr_min_rr_ratio:
+        return None
+
+    vol_ratio = volume_spike_ratio([c[5] for c in candles], cfg.volume_ma_period)
+    return Signal(
+        symbol=symbol, timeframe=tf, side=entry_side,
+        entry=round(entry, 8), stop_loss=round(stop_loss, 8),
+        take_profit=round(tp1, 8), rr_ratio=cfg.rr_ratio,
+        confirmations=["FVG Reversal", pattern, "RSI HTF Extreme",
+                       "RSI Momentum Turn", "RSI Divergence"],
+        strength=5, score=0.0, max_score=0.0,
+        strategy="fvg_reversal",
+        tp1=round(tp1, 8), tp2=round(tp2, 8),
+        consolidation_high=0.0, consolidation_low=0.0,
+        rsi_value=round(next((r for r in reversed(rsis) if r is not None), 0) or 0, 2),
+        volume_ratio=round(vol_ratio, 2),
+        created_at=datetime.now(timezone.utc).isoformat(),
+        fvg_top=round(origin["top"], 8), fvg_bottom=round(origin["bottom"], 8),
+        atr=round(atr, 8), atr_multiplier=cfg.fvgr_atr_sl_multiplier,
+    )
+
+
+def active_strategies(cfg: Config) -> set[str]:
+    """Set of strategies to run this scan. Parallel selection via
+    `enabled_strategies`; falls back to the legacy single `strategy_mode`."""
+    if cfg.enabled_strategies:
+        return set(cfg.enabled_strategies)
+    if cfg.strategy_mode == "both":
+        return {"scoring", "impulse_fvg"}
+    return {cfg.strategy_mode}
+
+
 async def run_scan() -> dict[str, Any]:
     if scan_state.is_scanning:
         return {"skipped": True, "reason": "already scanning"}
@@ -1867,7 +2066,7 @@ async def run_scan() -> dict[str, Any]:
     try:
         cfg = await get_config()
         # 1) Fetch tickers with volume for filtering
-        tickers = await kucoin.get_tickers()
+        tickers = await exchange.get_tickers()
         # Build map symbol -> volValue (24h quote volume)
         vol_map: dict[str, float] = {}
         for t in tickers:
@@ -1876,7 +2075,8 @@ async def run_scan() -> dict[str, Any]:
             except (TypeError, ValueError):
                 continue
 
-        symbols = await kucoin.get_symbols()
+        symbols = await exchange.get_symbols()
+        quotes = {q.strip() for q in (cfg.quote_filter or "").split(",") if q.strip()}
         pairs: list[str] = []
         for s in symbols:
             if not s.get("enableTrading"):
@@ -1884,7 +2084,7 @@ async def run_scan() -> dict[str, Any]:
             sym = s.get("symbol")
             if not sym:
                 continue
-            if cfg.quote_filter and s.get("quoteCurrency") != cfg.quote_filter:
+            if quotes and s.get("quoteCurrency") not in quotes:
                 continue
             if cfg.excluded_pairs and sym in cfg.excluded_pairs:
                 continue
@@ -1903,21 +2103,27 @@ async def run_scan() -> dict[str, Any]:
         # Reset discarded-setup log so bottleneck analysis reflects this scan.
         await db.setup_debug_log.delete_many({})
 
+        active = active_strategies(cfg)
+
         async def process(sym: str) -> None:
             for tf in cfg.timeframes:
                 try:
-                    if cfg.strategy_mode in ("scoring", "both"):
+                    if "scoring" in active:
                         sig = await analyze_pair(sym, tf, cfg)
                         if sig:
                             signals_found.append(sig)
-                    if cfg.strategy_mode in ("impulse_fvg", "both"):
+                    if "impulse_fvg" in active:
                         sig2 = await analyze_pair_impulse(sym, tf, cfg)
                         if sig2:
                             signals_found.append(sig2)
-                    if cfg.strategy_mode in ("counter_trend", "both"):
+                    if "counter_trend" in active:
                         sig3 = await analyze_pair_counter(sym, tf, cfg)
                         if sig3:
                             signals_found.append(sig3)
+                    if "fvg_reversal" in active:
+                        sig4 = await analyze_pair_fvg_reversal(sym, tf, cfg)
+                        if sig4:
+                            signals_found.append(sig4)
                 except Exception as e:  # noqa: BLE001
                     logger.debug("analyze %s %s failed: %s", sym, tf, e)
 
@@ -2005,7 +2211,7 @@ async def resolve_premature_stops() -> None:
         tf = log.get("timeframe", "1h")
         tf_sec = TF_SECONDS.get(tf, 3600)
         closed_epoch = datetime.fromisoformat(log["closed_at"]).timestamp()
-        candles = await kucoin.get_klines(log["symbol"], tf)
+        candles = await exchange.get_klines(log["symbol"], tf)
         # candles: [t, o, c, h, l, v] ascending, t in seconds
         after = [c for c in candles if c[0] >= closed_epoch]
         if not after:
@@ -2060,6 +2266,7 @@ async def premature_stop_loop() -> None:
 # ---------------------------------------------------------------------------
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    await get_paper_config()  # sync exchange.category from trading_mode
     scan_task = asyncio.create_task(scheduler_loop())
     monitor_task = asyncio.create_task(paper_monitor_loop())
     ws_task = asyncio.create_task(price_feed.run())
@@ -2069,7 +2276,7 @@ async def lifespan(_app: FastAPI):
     monitor_task.cancel()
     ws_task.cancel()
     premature_task.cancel()
-    await kucoin.close()
+    await exchange.close()
     client.close()
 
 
@@ -2100,11 +2307,12 @@ async def update_config(cfg: Config) -> Config:
 @api.get("/pairs")
 async def list_pairs(limit: int = 200) -> dict[str, Any]:
     cfg = await get_config()
-    tickers = await kucoin.get_tickers()
+    tickers = await exchange.get_tickers()
+    quotes = {q.strip() for q in (cfg.quote_filter or "").split(",") if q.strip()}
     out: list[dict[str, Any]] = []
     for t in tickers:
         sym = t.get("symbol", "")
-        if cfg.quote_filter and not sym.endswith("-" + cfg.quote_filter):
+        if quotes and not any(sym.endswith(q) for q in quotes):
             continue
         try:
             vol = float(t.get("volValue") or 0)
@@ -2162,7 +2370,7 @@ async def get_signal(signal_id: str) -> dict[str, Any]:
 
 @api.get("/candles/{symbol}")
 async def get_candles(symbol: str, timeframe: str = "1h") -> dict[str, Any]:
-    candles = await kucoin.get_klines(symbol, timeframe)
+    candles = await exchange.get_klines(symbol, timeframe)
     closes = [c[2] for c in candles]
     cfg = await get_config()
     rsis = rsi_wilder(closes, cfg.rsi_period) if closes else []
@@ -2220,7 +2428,7 @@ async def paper_portfolio() -> dict[str, Any]:
     cash = await get_paper_cash()
     positions = await db.paper_positions.find({}, {"_id": 0}).to_list(1000)
     # Mark to market
-    tickers = await kucoin.get_tickers()
+    tickers = await exchange.get_tickers()
     price_map: dict[str, float] = {}
     for t in tickers:
         try:
@@ -2393,7 +2601,7 @@ async def paper_close_manual(position_id: str) -> dict[str, Any]:
     pos = await db.paper_positions.find_one({"id": position_id}, {"_id": 0})
     if not pos:
         raise HTTPException(status_code=404, detail="Position not found")
-    tickers = await kucoin.get_tickers()
+    tickers = await exchange.get_tickers()
     price = 0.0
     for t in tickers:
         if t.get("symbol") == pos["symbol"]:
@@ -2484,96 +2692,85 @@ async def set_strategy_mode(payload: dict[str, str]) -> dict[str, Any]:
 
 
 # ---------------------------------------------------------------------------
-# KuCoin authenticated integration (connection test only, no order execution)
+# Bybit EU authenticated integration (connection test + balance; execution
+# lives in the execution phase). Bybit v5 HMAC-SHA256 signing.
 # ---------------------------------------------------------------------------
-async def _kucoin_signed_get(path: str) -> httpx.Response:
-    doc = await db.exchange_creds.find_one({"_id": "kucoin"}, {"_id": 0})
+async def _bybit_signed_get(path: str, query: str = "") -> httpx.Response:
+    doc = await db.exchange_creds.find_one({"_id": "bybit"}, {"_id": 0})
     if not doc:
-        raise HTTPException(status_code=400, detail="No KuCoin credentials stored")
+        raise HTTPException(status_code=400, detail="No Bybit credentials stored")
     api_key = decrypt_str(doc["api_key"])
     api_secret = decrypt_str(doc["api_secret"])
-    api_passphrase = decrypt_str(doc["api_passphrase"])
     ts = str(int(time.time() * 1000))
-    str_to_sign = ts + "GET" + path
-    sig = base64.b64encode(
-        hmac.new(api_secret.encode(), str_to_sign.encode(), hashlib.sha256).digest()
-    ).decode()
-    passphrase = base64.b64encode(
-        hmac.new(api_secret.encode(), api_passphrase.encode(), hashlib.sha256).digest()
-    ).decode()
+    recv = "5000"
+    pre_sign = ts + api_key + recv + query
+    sig = hmac.new(api_secret.encode(), pre_sign.encode(), hashlib.sha256).hexdigest()
     headers = {
-        "KC-API-KEY": api_key,
-        "KC-API-SIGN": sig,
-        "KC-API-TIMESTAMP": ts,
-        "KC-API-PASSPHRASE": passphrase,
-        "KC-API-KEY-VERSION": "2",
+        "X-BAPI-API-KEY": api_key,
+        "X-BAPI-TIMESTAMP": ts,
+        "X-BAPI-RECV-WINDOW": recv,
+        "X-BAPI-SIGN": sig,
     }
-    async with httpx.AsyncClient(base_url=KUCOIN_BASE, timeout=10.0) as c:
-        return await c.get(path, headers=headers)
+    url = path + (("?" + query) if query else "")
+    async with httpx.AsyncClient(base_url=BYBIT_BASE, timeout=10.0) as c:
+        return await c.get(url, headers=headers)
 
 
 @api.get("/exchange/status")
 async def exchange_status() -> dict[str, Any]:
-    doc = await db.exchange_creds.find_one({"_id": "kucoin"}, {"_id": 0})
+    doc = await db.exchange_creds.find_one({"_id": "bybit"}, {"_id": 0})
     if not doc:
-        return {"connected": False, "exchange": "kucoin"}
+        return {"connected": False, "exchange": "bybit"}
     try:
-        r = await _kucoin_signed_get("/api/v1/accounts")
-        if r.status_code != 200:
-            return {
-                "connected": False,
-                "exchange": "kucoin",
-                "error": f"HTTP {r.status_code}",
-                "api_key_masked": doc.get("api_key_masked", ""),
-            }
+        r = await _bybit_signed_get(
+            "/v5/account/wallet-balance", "accountType=UNIFIED"
+        )
         data = r.json()
-        if data.get("code") != "200000":
+        if r.status_code != 200 or data.get("retCode") != 0:
             return {
                 "connected": False,
-                "exchange": "kucoin",
-                "error": data.get("msg", "unknown"),
+                "exchange": "bybit",
+                "error": data.get("retMsg", f"HTTP {r.status_code}"),
                 "api_key_masked": doc.get("api_key_masked", ""),
             }
-        # Sum USDT balances across accounts
         usdt_total = 0.0
-        for acc in data.get("data", []):
-            if acc.get("currency") == "USDT":
-                try:
-                    usdt_total += float(acc.get("balance") or 0)
-                except (TypeError, ValueError):
-                    continue
+        for acc in data.get("result", {}).get("list", []):
+            for coin in acc.get("coin", []):
+                if coin.get("coin") == "USDT":
+                    try:
+                        usdt_total += float(coin.get("walletBalance") or 0)
+                    except (TypeError, ValueError):
+                        continue
         return {
             "connected": True,
-            "exchange": "kucoin",
+            "exchange": "bybit",
             "api_key_masked": doc.get("api_key_masked", ""),
             "usdt_balance": round(usdt_total, 2),
             "connected_at": doc.get("connected_at"),
         }
     except (httpx.HTTPError, InvalidToken) as e:
-        return {"connected": False, "exchange": "kucoin", "error": str(e)}
+        return {"connected": False, "exchange": "bybit", "error": str(e)}
 
 
 @api.post("/exchange/connect")
 async def exchange_connect(req: ExchangeConnectRequest) -> dict[str, Any]:
-    if not req.api_key or not req.api_secret or not req.api_passphrase:
-        raise HTTPException(status_code=400, detail="All fields required")
+    if not req.api_key or not req.api_secret:
+        raise HTTPException(status_code=400, detail="API key and secret required")
     doc = {
         "api_key": encrypt_str(req.api_key),
         "api_secret": encrypt_str(req.api_secret),
-        "api_passphrase": encrypt_str(req.api_passphrase),
         "api_key_masked": (req.api_key[:4] + "…" + req.api_key[-4:])
         if len(req.api_key) > 8
         else "***",
         "connected_at": datetime.now(timezone.utc).isoformat(),
     }
     await db.exchange_creds.update_one(
-        {"_id": "kucoin"}, {"$set": doc}, upsert=True
+        {"_id": "bybit"}, {"$set": doc}, upsert=True
     )
     # Test connection immediately
     status_res = await exchange_status()
     if not status_res.get("connected"):
-        # Roll back on failure to avoid storing invalid creds silently
-        await db.exchange_creds.delete_one({"_id": "kucoin"})
+        await db.exchange_creds.delete_one({"_id": "bybit"})
         raise HTTPException(
             status_code=400,
             detail=f"Connection failed: {status_res.get('error', 'unknown')}",
@@ -2583,7 +2780,7 @@ async def exchange_connect(req: ExchangeConnectRequest) -> dict[str, Any]:
 
 @api.post("/exchange/disconnect")
 async def exchange_disconnect() -> dict[str, Any]:
-    await db.exchange_creds.delete_one({"_id": "kucoin"})
+    await db.exchange_creds.delete_one({"_id": "bybit"})
     return {"ok": True}
 
 

@@ -85,6 +85,13 @@ export type Config = {
   tp1_pct: number;
   tp2_pct: number;
   post_tp1_advance_pct: number;
+  enabled_strategies?: string[];
+  fvgr_tp1_pct: number;
+  fvgr_tp2_pct: number;
+  fvgr_post_tp1_advance_pct: number;
+  fvgr_trailing_pct: number;
+  fvgr_atr_sl_multiplier: number;
+  fvgr_min_rr_ratio: number;
   max_pairs_per_scan: number;
   enabled_pairs: string[];
   excluded_pairs: string[];
