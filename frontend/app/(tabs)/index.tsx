@@ -92,7 +92,7 @@ export default function SignalsScreen() {
         <View style={styles.headerRow}>
           <View>
             <Text style={styles.title} testID="app-title">
-              KuSignal Bot
+              BitSignal Bot
             </Text>
             <View style={styles.statusRow}>
               <View

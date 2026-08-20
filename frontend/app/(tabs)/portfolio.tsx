@@ -148,7 +148,7 @@ export default function PortfolioScreen() {
           />
         }
       >
-        {/* Quick controls: Mode toggle + Capital + Connect KuCoin */}
+        {/* Quick controls: Mode toggle + Capital + Connect Bybit */}
         <View style={styles.controlsCard} testID="quick-controls">
           <Text style={styles.controlsLabel}>Market Type</Text>
           <View style={styles.modeRow}>
@@ -311,7 +311,7 @@ export default function PortfolioScreen() {
               <View style={styles.connectedLeft}>
                 <View style={styles.connectedDot} />
                 <View>
-                  <Text style={styles.connectedTitle}>KuCoin connected</Text>
+                  <Text style={styles.connectedTitle}>Bybit connected</Text>
                   <Text style={styles.connectedSub}>
                     {exchange.api_key_masked} · ${exchange.usdt_balance?.toFixed(2) ?? "0.00"} USDT
                   </Text>
@@ -338,7 +338,7 @@ export default function PortfolioScreen() {
               testID="connect-kucoin-button"
             >
               <Ionicons name="link" size={18} color={colors.onBrand} />
-              <Text style={styles.connectBtnText}>Connect KuCoin API</Text>
+              <Text style={styles.connectBtnText}>Connect Bybit API</Text>
             </Pressable>
           )}
         </View>
@@ -511,7 +511,6 @@ function ConnectModal({
 }) {
   const [apiKey, setApiKey] = useState("");
   const [apiSecret, setApiSecret] = useState("");
-  const [apiPassphrase, setApiPassphrase] = useState("");
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
 
@@ -522,11 +521,9 @@ function ConnectModal({
       await api.exchangeConnect({
         api_key: apiKey.trim(),
         api_secret: apiSecret.trim(),
-        api_passphrase: apiPassphrase.trim(),
       });
       setApiKey("");
       setApiSecret("");
-      setApiPassphrase("");
       onConnected();
     } catch (e: any) {
       setError(e.message || "Connection failed");
@@ -549,13 +546,13 @@ function ConnectModal({
         <Pressable style={styles.modalBackdrop} onPress={onClose} />
         <View style={styles.modalCard} testID="connect-modal">
           <View style={styles.modalHeader}>
-            <Text style={styles.modalTitle}>Connect KuCoin</Text>
+            <Text style={styles.modalTitle}>Connect Bybit</Text>
             <Pressable onPress={onClose} hitSlop={12}>
               <Ionicons name="close" size={22} color={colors.onSurface} />
             </Pressable>
           </View>
           <Text style={styles.modalHint}>
-            Paste the API key created in KuCoin → API Management. Use{" "}
+            Paste the API key created in Bybit → API Management. Use{" "}
             <Text style={{ color: colors.brand, fontWeight: "800" }}>
               read + trade permissions only
             </Text>
@@ -583,26 +580,15 @@ function ConnectModal({
             autoCorrect={false}
             testID="input-api-secret"
           />
-          <TextInput
-            style={styles.modalInput}
-            placeholder="API Passphrase"
-            placeholderTextColor={colors.onSurfaceTertiary}
-            value={apiPassphrase}
-            onChangeText={setApiPassphrase}
-            secureTextEntry
-            autoCapitalize="none"
-            autoCorrect={false}
-            testID="input-api-passphrase"
-          />
 
           {error && <Text style={styles.modalError}>{error}</Text>}
 
           <Pressable
             onPress={submit}
-            disabled={submitting || !apiKey || !apiSecret || !apiPassphrase}
+            disabled={submitting || !apiKey || !apiSecret}
             style={({ pressed }) => [
               styles.modalSubmit,
-              (submitting || !apiKey || !apiSecret || !apiPassphrase) && {
+              (submitting || !apiKey || !apiSecret) && {
                 opacity: 0.5,
               },
               pressed && { opacity: 0.7 },

@@ -2286,7 +2286,7 @@ api = APIRouter(prefix="/api")
 
 @api.get("/")
 async def root() -> dict[str, str]:
-    return {"service": "kusignal-bot", "status": "ok"}
+    return {"service": "bitsignal-bot", "status": "ok"}
 
 
 @api.get("/status", response_model=ScanState)
