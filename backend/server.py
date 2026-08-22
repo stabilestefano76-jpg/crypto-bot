@@ -2176,12 +2176,32 @@ async def run_scan() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Background scheduler
 # ---------------------------------------------------------------------------
+SIGNAL_MAX_AGE_HOURS = {"15m": 0.25, "1h": 1, "4h": 4}
+
+
+async def expire_stale_signals() -> None:
+    now = datetime.now(timezone.utc)
+    cursor = db.signals.find({"status": "active"})
+    async for sig in cursor:
+        try:
+            created = datetime.fromisoformat(sig["created_at"])
+        except Exception:  # noqa: BLE001
+            continue
+        max_hours = SIGNAL_MAX_AGE_HOURS.get(sig.get("timeframe"), 4)
+        age_hours = (now - created).total_seconds() / 3600
+        if age_hours > max_hours:
+            await db.signals.update_one(
+                {"_id": sig["_id"]}, {"$set": {"status": "expired"}}
+            )
+
+
 async def scheduler_loop() -> None:
     # small warm-up delay
     await asyncio.sleep(5)
     while True:
         cfg = await get_config()
         try:
+            await expire_stale_signals()
             await run_scan()
         except Exception as e:  # noqa: BLE001
             logger.exception("Scan loop error: %s", e)
