@@ -61,7 +61,7 @@ CANDLE_LIMIT = 200  # candles fetched per pair/tf
 # Pydantic models
 # ---------------------------------------------------------------------------
 class Config(BaseModel):
-    scan_interval_minutes: int = 5
+    scan_interval_minutes: int = 1
     timeframes: list[str] = Field(default_factory=lambda: DEFAULT_TIMEFRAMES.copy())
     quote_filter: str = "USDC,EUR"  # Bybit EU spot quotes (comma-separated)
     min_24h_volume_usdt: float = 100_000.0
