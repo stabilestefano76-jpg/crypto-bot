@@ -43,10 +43,10 @@ logger = logging.getLogger("kusignal")
 # KuCoin constants
 # ---------------------------------------------------------------------------
 # ---------------------------------------------------------------------------
-# Bybit EU (MiCA) v5 — market data endpoints
+# Bybit GLOBAL v5 — market data endpoints (api.bybit.com / stream.bybit.com)
 # ---------------------------------------------------------------------------
-BYBIT_BASE = "https://api.bybit.eu"
-BYBIT_WS_PUBLIC = "wss://stream.bybit.eu/v5/public"
+BYBIT_BASE = "https://api.bybit.com"
+BYBIT_WS_PUBLIC = "wss://stream.bybit.com/v5/public"
 TF_MAP = {
     "15m": "15",
     "1h": "60",
