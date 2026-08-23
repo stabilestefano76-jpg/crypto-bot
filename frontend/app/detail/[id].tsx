@@ -30,6 +30,7 @@ export default function DetailScreen() {
   const [error, setError] = useState<string | null>(null);
   const [executing, setExecuting] = useState(false);
   const [executeMsg, setExecuteMsg] = useState<string | null>(null);
+  const [livePrice, setLivePrice] = useState<number | null>(null);
 
   useEffect(() => {
     (async () => {
@@ -46,6 +47,26 @@ export default function DetailScreen() {
       }
     })();
   }, [id]);
+
+  // Poll the live price (WS-backed) every 3s while on the detail screen.
+  useEffect(() => {
+    if (!signal?.symbol) return;
+    let alive = true;
+    const tick = async () => {
+      try {
+        const r = await api.livePrice(signal.symbol);
+        if (alive && typeof r.price === "number") setLivePrice(r.price);
+      } catch {
+        /* ignore */
+      }
+    };
+    tick();
+    const t = setInterval(tick, 3000);
+    return () => {
+      alive = false;
+      clearInterval(t);
+    };
+  }, [signal?.symbol]);
 
   if (loading) {
     return (
@@ -84,7 +105,8 @@ export default function DetailScreen() {
             {signal.symbol}
           </Text>
           <Text style={styles.subline}>
-            {signal.timeframe} · Last {last ? formatPrice(last.c) : "—"}
+            {signal.timeframe} · Candela {last ? formatPrice(last.c) : "—"} · Live{" "}
+            {livePrice != null ? formatPrice(livePrice) : "…"}
           </Text>
         </View>
         <View
@@ -123,7 +145,7 @@ export default function DetailScreen() {
         </View>
 
         <View style={styles.gridRow}>
-          <Metric label="Entry" value={formatPrice(signal.entry)} color={colors.brand} />
+          <Metric label="Entry (piano)" value={formatPrice(signal.entry)} color={colors.brand} />
           <Metric
             label="Stop Loss"
             value={formatPrice(signal.stop_loss)}
@@ -144,6 +166,18 @@ export default function DetailScreen() {
             label="Volume Ratio"
             value={`${signal.volume_ratio}×`}
             color={colors.onSurface}
+          />
+        </View>
+        <View style={styles.gridRow}>
+          <Metric
+            label="Chiusura candela"
+            value={last ? formatPrice(last.c) : "—"}
+            color={colors.onSurface}
+          />
+          <Metric
+            label="Prezzo live"
+            value={livePrice != null ? formatPrice(livePrice) : "…"}
+            color={colors.brand}
           />
         </View>
         {(signal.strategy === "impulse_fvg" || signal.strategy === "counter_trend") && (

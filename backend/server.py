@@ -2385,6 +2385,21 @@ async def get_candles(symbol: str, timeframe: str = "1h") -> dict[str, Any]:
     }
 
 
+@api.get("/price/{symbol}")
+async def get_live_price(symbol: str) -> dict[str, Any]:
+    """Current live price: WebSocket cache (PriceFeed.get) if fresh, else a REST
+    fallback. Used by the UI to show the live price next to the signal candle
+    close."""
+    ws = price_feed.get(symbol)
+    ws_fresh = ws is not None and (time.time() - price_feed.updated_at.get(symbol, 0)) < 10
+    price = ws if ws_fresh else await price_feed.price_or_rest(symbol)
+    return {
+        "symbol": symbol,
+        "price": price,
+        "source": "ws" if ws_fresh else "rest",
+    }
+
+
 @api.post("/scan")
 async def trigger_scan() -> dict[str, Any]:
     # Fire-and-forget so client isn't blocked for minutes

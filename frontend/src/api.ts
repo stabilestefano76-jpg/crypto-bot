@@ -240,6 +240,10 @@ export const api = {
     ),
   exchangeDisconnect: () =>
     req<{ ok: boolean }>("/exchange/disconnect", { method: "POST" }),
+  livePrice: (symbol: string) =>
+    req<{ symbol: string; price: number | null; source: string }>(
+      `/price/${encodeURIComponent(symbol)}`
+    ),
   slippageLog: () =>
     req<{
       logs: {
