@@ -3014,7 +3014,6 @@ async def scalping_config_get() -> dict[str, Any]:
         "scalping_volume_multiplier": cfg.scalping_volume_multiplier,
     }
 
-app.include_router(api)
 
 
 # ---------------------------------------------------------------------------
@@ -3250,3 +3249,5 @@ async def close_scalping_positions() -> None:
 
     wallet["cash"] = cash
     await save_scalping_wallet(wallet)
+
+app.include_router(api)
