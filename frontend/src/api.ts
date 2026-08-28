@@ -381,3 +381,9 @@ export const scalpingWalletApi = {
       { method: "POST", body: JSON.stringify({ amount }) }
     ),
 };
+
+export const scalpingWithdraw = (amount: number) =>
+  req<{ ok: boolean; scalping_cash: number; main_cash: number }>(
+    "/scalping/withdraw",
+    { method: "POST", body: JSON.stringify({ amount }) }
+  );

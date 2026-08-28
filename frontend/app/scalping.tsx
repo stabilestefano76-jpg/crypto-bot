@@ -16,6 +16,7 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import {
   scalpingWalletApi,
+  scalpingWithdraw,
   ScalpingPortfolio,
   ScalpingPosition,
 } from "@/src/api";
@@ -47,6 +48,7 @@ export default function ScalpingScreen() {
   const [modalVisible, setModalVisible] = useState(false);
   const [amountText, setAmountText] = useState("");
   const [transferring, setTransferring] = useState(false);
+  const [transferMode, setTransferMode] = useState<"deposit" | "withdraw">("deposit");
 
   const load = useCallback(async () => {
     try {
@@ -80,7 +82,11 @@ export default function ScalpingScreen() {
     }
     setTransferring(true);
     try {
-      await scalpingWalletApi.transfer(amount);
+      if (transferMode === "deposit") {
+        await scalpingWalletApi.transfer(amount);
+      } else {
+        await scalpingWithdraw(amount);
+      }
       setModalVisible(false);
       setAmountText("");
       await load();
@@ -188,16 +194,36 @@ export default function ScalpingScreen() {
                 </Text>
               </View>
             </View>
-            <Pressable
-              style={({ pressed }) => [
-                styles.transferBtn,
-                pressed && { opacity: 0.7 },
-              ]}
-              onPress={() => setModalVisible(true)}
-            >
-              <Ionicons name="swap-horizontal" size={16} color={colors.onBrand} />
-              <Text style={styles.transferBtnText}>Trasferisci fondi</Text>
-            </Pressable>
+            <View style={styles.transferRow}>
+              <Pressable
+                style={({ pressed }) => [
+                  styles.transferBtn,
+                  { flex: 1 },
+                  pressed && { opacity: 0.7 },
+                ]}
+                onPress={() => {
+                  setTransferMode("deposit");
+                  setModalVisible(true);
+                }}
+              >
+                <Ionicons name="arrow-down-circle" size={16} color={colors.onBrand} />
+                <Text style={styles.transferBtnText}>Deposita</Text>
+              </Pressable>
+              <Pressable
+                style={({ pressed }) => [
+                  styles.withdrawBtn,
+                  { flex: 1 },
+                  pressed && { opacity: 0.7 },
+                ]}
+                onPress={() => {
+                  setTransferMode("withdraw");
+                  setModalVisible(true);
+                }}
+              >
+                <Ionicons name="arrow-up-circle" size={16} color={colors.onSurface} />
+                <Text style={styles.withdrawBtnText}>Preleva</Text>
+              </Pressable>
+            </View>
           </View>
 
           <Text style={styles.sectionTitle}>
@@ -224,9 +250,13 @@ export default function ScalpingScreen() {
       <Modal visible={modalVisible} transparent animationType="fade">
         <View style={styles.modalOverlay}>
           <View style={styles.modalBox}>
-            <Text style={styles.modalTitle}>Trasferisci fondi</Text>
+            <Text style={styles.modalTitle}>
+              {transferMode === "deposit" ? "Deposita fondi" : "Preleva fondi"}
+            </Text>
             <Text style={styles.modalSubtitle}>
-              Sposta fondi dal portafoglio principale a quello dello Scalping Bot.
+              {transferMode === "deposit"
+                ? "Sposta fondi dal portafoglio principale a quello dello Scalping Bot."
+                : "Riporta fondi dallo Scalping Bot al portafoglio principale."}
             </Text>
             <TextInput
               style={styles.modalInput}
@@ -316,9 +346,19 @@ const styles = StyleSheet.create({
     backgroundColor: colors.brand,
     borderRadius: radius.pill,
     paddingVertical: spacing.sm,
-    marginTop: spacing.xs,
   },
   transferBtnText: { color: colors.onBrand, fontWeight: "700", fontSize: font.base },
+  transferRow: { flexDirection: "row", gap: spacing.sm, marginTop: spacing.xs },
+  withdrawBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    backgroundColor: colors.surfaceTertiary,
+    borderRadius: radius.pill,
+    paddingVertical: spacing.sm,
+  },
+  withdrawBtnText: { color: colors.onSurface, fontWeight: "700", fontSize: font.base },
   sectionTitle: {
     color: colors.onSurface,
     fontSize: font.base,
