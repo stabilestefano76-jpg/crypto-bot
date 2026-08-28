@@ -3088,10 +3088,13 @@ async def scalping_portfolio() -> dict[str, Any]:
     for p in positions:
         cur = price_map.get(p["symbol"], p["entry"])
         if p["side"] == "long":
-            pnl = (cur - p["entry"]) * p["quantity"]
+            gross_pnl = (cur - p["entry"]) * p["quantity"]
         else:
-            pnl = (p["entry"] - cur) * p["quantity"]
+            gross_pnl = (p["entry"] - cur) * p["quantity"]
         notional = p["entry"] * p["quantity"]
+        exit_notional = cur * p["quantity"]
+        est_fees = (notional + exit_notional) * SCALPING_FEE_PCT
+        pnl = gross_pnl - est_fees
         pnl_pct = (pnl / notional) * 100 if notional > 0 else 0.0
         unrealized += pnl
         allocated += notional
@@ -3132,9 +3135,10 @@ async def scalping_portfolio() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Scalping Bot: auto-execution of real (paper) positions
 # ---------------------------------------------------------------------------
-SCALPING_SL_PCT = 0.004   # 0.4% stop loss
-SCALPING_TP_PCT = 0.008   # 0.8% take profit (2:1 reward/risk)
+SCALPING_SL_PCT = 0.004   # 0.4% gross stop loss (net ~0.6% after fees)
+SCALPING_TP_PCT = 0.014   # 1.4% gross take profit (net ~1.2% after fees, 2:1 reward/risk)
 SCALPING_WALLET_RISK_PCT = 0.20  # % of scalping cash used per trade
+SCALPING_FEE_PCT = 0.001  # 0.10% Bybit spot fee per side (open + close = 0.20% round trip)
 
 
 async def open_scalping_position(doc: dict[str, Any]) -> None:
@@ -3226,9 +3230,12 @@ async def close_scalping_positions() -> None:
             continue
 
         if p["side"] == "long":
-            pnl = (cur - p["entry"]) * p["quantity"]
+            gross_pnl = (cur - p["entry"]) * p["quantity"]
         else:
-            pnl = (p["entry"] - cur) * p["quantity"]
+            gross_pnl = (p["entry"] - cur) * p["quantity"]
+        exit_notional = cur * p["quantity"]
+        fees = (p["notional"] + exit_notional) * SCALPING_FEE_PCT
+        pnl = gross_pnl - fees
 
         cash += p["notional"] + pnl
 
