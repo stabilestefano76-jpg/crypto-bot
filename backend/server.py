@@ -3055,9 +3055,7 @@ async def scalping_transfer(req: ScalpingTransferRequest) -> dict[str, Any]:
             detail=f"Fondi insufficienti nel portafoglio principale (disponibili: {round(main_cash, 2)})",
         )
 
-    pcfg = await get_paper_config()
-    pcfg.initial_capital -= amount
-    await save_paper_config(pcfg)
+    await set_paper_cash(main_cash - amount)
 
     wallet = await get_scalping_wallet()
     wallet["cash"] = wallet.get("cash", 0.0) + amount
