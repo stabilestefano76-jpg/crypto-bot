@@ -2214,6 +2214,7 @@ async def scheduler_loop() -> None:
         try:
             await expire_stale_signals()
             await run_scan()
+            await run_scalping_scan()
         except Exception as e:  # noqa: BLE001
             logger.exception("Scan loop error: %s", e)
         await asyncio.sleep(max(60, cfg.scan_interval_minutes * 60))
@@ -2890,4 +2891,119 @@ def analyze_scalping(highs, lows, closes, volumes, rsis, cfg) -> dict:
         "bb_upper": round(upper_bb, 6),
         "ema_fast": round(ema_fast[-1], 6),
         "ema_slow": round(ema_slow[-1], 6),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Scalping Bot: independent scan loop + API endpoints
+# ---------------------------------------------------------------------------
+async def run_scalping_scan() -> dict[str, Any]:
+    cfg = await get_config()
+    if not cfg.scalping_enabled:
+        return {"skipped": True, "reason": "scalping disabled"}
+
+    tickers = await exchange.get_tickers()
+    vol_map: dict[str, float] = {}
+    for t in tickers:
+        try:
+            vol_map[t["symbol"]] = float(t.get("volValue") or 0)
+        except (TypeError, ValueError):
+            continue
+
+    symbols = await exchange.get_symbols()
+    quotes = {q.strip() for q in (cfg.quote_filter or "").split(",") if q.strip()}
+    pairs: list[str] = []
+    for s in symbols:
+        if not s.get("enableTrading"):
+            continue
+        sym = s.get("symbol")
+        if not sym:
+            continue
+        if quotes and s.get("quoteCurrency") not in quotes:
+            continue
+        if cfg.excluded_pairs and sym in cfg.excluded_pairs:
+            continue
+        if cfg.enabled_pairs and sym not in cfg.enabled_pairs:
+            continue
+        if vol_map.get(sym, 0) < cfg.min_24h_volume_usdt:
+            continue
+        pairs.append(sym)
+    pairs.sort(key=lambda s: vol_map.get(s, 0), reverse=True)
+    pairs = pairs[:20]
+
+    tf = cfg.scalping_timeframe
+    signals_found: list[dict[str, Any]] = []
+    for symbol in pairs:
+        try:
+            candles = await exchange.get_klines(symbol, tf)
+        except Exception:  # noqa: BLE001
+            continue
+        min_len = max(cfg.scalping_bb_period, cfg.scalping_ema_slow) + 5
+        if len(candles) < min_len:
+            continue
+        highs = [c[3] for c in candles]
+        lows = [c[4] for c in candles]
+        closes = [c[2] for c in candles]
+        volumes = [c[5] for c in candles]
+        rsis = rsi_wilder(closes, cfg.scalping_rsi_period)
+        result = analyze_scalping(highs, lows, closes, volumes, rsis, cfg)
+        if not result.get("confirmed"):
+            continue
+        doc = {
+            "id": str(uuid.uuid4()),
+            "symbol": symbol,
+            "timeframe": tf,
+            "side": result["side"],
+            "reasons": result["reasons"],
+            "vwap": result["vwap"],
+            "rsi": result["rsi"],
+            "bb_lower": result["bb_lower"],
+            "bb_upper": result["bb_upper"],
+            "ema_fast": result["ema_fast"],
+            "ema_slow": result["ema_slow"],
+            "price": closes[-1],
+            "status": "active",
+            "created_at": datetime.now(timezone.utc).isoformat(),
+        }
+        signals_found.append(doc)
+
+    if signals_found:
+        for doc in signals_found:
+            await db.scalping_signals.update_many(
+                {
+                    "symbol": doc["symbol"],
+                    "timeframe": doc["timeframe"],
+                    "status": "active",
+                },
+                {"$set": {"status": "expired"}},
+            )
+        await db.scalping_signals.insert_many(signals_found)
+
+    return {"scanned_pairs": len(pairs), "signals_found": len(signals_found)}
+
+
+@api.get("/scalping/signals")
+async def scalping_signals(limit: int = 50) -> dict[str, Any]:
+    cursor = (
+        db.scalping_signals.find({}, {"_id": 0})
+        .sort("created_at", -1)
+        .limit(limit)
+    )
+    logs = await cursor.to_list(length=limit)
+    active = sum(1 for s in logs if s.get("status") == "active")
+    return {"signals": logs, "count": len(logs), "active": active}
+
+
+@api.get("/scalping/config")
+async def scalping_config_get() -> dict[str, Any]:
+    cfg = await get_config()
+    return {
+        "scalping_enabled": cfg.scalping_enabled,
+        "scalping_timeframe": cfg.scalping_timeframe,
+        "scalping_rsi_period": cfg.scalping_rsi_period,
+        "scalping_bb_period": cfg.scalping_bb_period,
+        "scalping_bb_std": cfg.scalping_bb_std,
+        "scalping_ema_fast": cfg.scalping_ema_fast,
+        "scalping_ema_slow": cfg.scalping_ema_slow,
+        "scalping_volume_multiplier": cfg.scalping_volume_multiplier,
     }
