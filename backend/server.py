@@ -3013,3 +3013,118 @@ async def scalping_config_get() -> dict[str, Any]:
     }
 
 app.include_router(api)
+
+
+# ---------------------------------------------------------------------------
+# Scalping Bot: separate paper wallet + fund transfer
+# ---------------------------------------------------------------------------
+SCALPING_WALLET_ID = "scalping_wallet_singleton"
+
+
+async def get_scalping_wallet() -> dict[str, Any]:
+    doc = await db.scalping_wallet.find_one({"_id": SCALPING_WALLET_ID}, {"_id": 0})
+    if not doc:
+        doc = {"cash": 0.0, "total_transferred_in": 0.0}
+        await db.scalping_wallet.update_one(
+            {"_id": SCALPING_WALLET_ID}, {"$set": doc}, upsert=True
+        )
+    return doc
+
+
+async def save_scalping_wallet(doc: dict[str, Any]) -> None:
+    await db.scalping_wallet.update_one(
+        {"_id": SCALPING_WALLET_ID}, {"$set": doc}, upsert=True
+    )
+
+
+class ScalpingTransferRequest(BaseModel):
+    amount: float
+
+
+@api.post("/scalping/transfer")
+async def scalping_transfer(req: ScalpingTransferRequest) -> dict[str, Any]:
+    amount = req.amount
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="L'importo deve essere positivo")
+
+    main_cash = await get_paper_cash()
+    if amount > main_cash:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Fondi insufficienti nel portafoglio principale (disponibili: {round(main_cash, 2)})",
+        )
+
+    pcfg = await get_paper_config()
+    pcfg.initial_capital -= amount
+    await save_paper_config(pcfg)
+
+    wallet = await get_scalping_wallet()
+    wallet["cash"] = wallet.get("cash", 0.0) + amount
+    wallet["total_transferred_in"] = wallet.get("total_transferred_in", 0.0) + amount
+    await save_scalping_wallet(wallet)
+
+    return {"ok": True, "scalping_cash": wallet["cash"], "main_cash": main_cash - amount}
+
+
+@api.get("/scalping/portfolio")
+async def scalping_portfolio() -> dict[str, Any]:
+    wallet = await get_scalping_wallet()
+    cash = wallet.get("cash", 0.0)
+
+    positions = await db.scalping_positions.find(
+        {"status": "open"}, {"_id": 0}
+    ).to_list(1000)
+
+    tickers = await exchange.get_tickers()
+    price_map: dict[str, float] = {}
+    for t in tickers:
+        try:
+            price_map[t["symbol"]] = float(t.get("last") or 0)
+        except (TypeError, ValueError):
+            continue
+
+    unrealized = 0.0
+    allocated = 0.0
+    enriched: list[dict[str, Any]] = []
+    for p in positions:
+        cur = price_map.get(p["symbol"], p["entry"])
+        if p["side"] == "long":
+            pnl = (cur - p["entry"]) * p["quantity"]
+        else:
+            pnl = (p["entry"] - cur) * p["quantity"]
+        notional = p["entry"] * p["quantity"]
+        pnl_pct = (pnl / notional) * 100 if notional > 0 else 0.0
+        unrealized += pnl
+        allocated += notional
+        enriched.append(
+            {
+                **p,
+                "current_price": round(cur, 8),
+                "unrealized_pnl": round(pnl, 4),
+                "unrealized_pnl_pct": round(pnl_pct, 2),
+            }
+        )
+
+    closed = await db.scalping_positions.find(
+        {"status": "closed"}, {"_id": 0}
+    ).sort("closed_at", -1).to_list(200)
+    realized = sum(c.get("pnl_usdt", 0.0) for c in closed)
+    wins = sum(1 for c in closed if c.get("pnl_usdt", 0.0) > 0)
+    losses = sum(1 for c in closed if c.get("pnl_usdt", 0.0) <= 0)
+    settled = wins + losses
+    win_rate = round((wins / settled) * 100, 1) if settled else 0.0
+
+    equity = cash + allocated + unrealized
+
+    return {
+        "cash": round(cash, 4),
+        "allocated": round(allocated, 4),
+        "unrealized_pnl": round(unrealized, 4),
+        "realized_pnl": round(realized, 4),
+        "equity": round(equity, 4),
+        "open_positions": enriched,
+        "closed_positions": closed,
+        "open_count": len(enriched),
+        "closed_count": len(closed),
+        "win_rate": win_rate,
+    }
