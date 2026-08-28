@@ -15,7 +15,6 @@ import { useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import {
-  scalpingApi,
   scalpingWalletApi,
   ScalpingPortfolio,
   ScalpingPosition,
@@ -138,7 +137,7 @@ export default function ScalpingScreen() {
     <View style={[styles.root, { paddingTop: insets.top }]}>
       <View style={styles.header}>
         <Pressable onPress={() => router.back()} hitSlop={12}>
-          <Ionicons name="chevron-back" size={26} color={colors.text} />
+          <Ionicons name="chevron-back" size={26} color={colors.onSurface} />
         </Pressable>
         <Text style={styles.title}>Scalping Bot</Text>
         <View style={{ width: 26 }} />
@@ -151,7 +150,7 @@ export default function ScalpingScreen() {
         <Text style={styles.errorText}>{error}</Text>
       ) : (
         <ScrollView
-          contentContainerStyle={{ padding: spacing.md, paddingBottom: 60 }}
+          contentContainerStyle={{ padding: spacing.lg, paddingBottom: 60 }}
           refreshControl={
             <RefreshControl refreshing={refreshing} onRefresh={onRefresh} tintColor={colors.brand} />
           }
@@ -196,7 +195,7 @@ export default function ScalpingScreen() {
               ]}
               onPress={() => setModalVisible(true)}
             >
-              <Ionicons name="swap-horizontal" size={16} color="#fff" />
+              <Ionicons name="swap-horizontal" size={16} color={colors.onBrand} />
               <Text style={styles.transferBtnText}>Trasferisci fondi</Text>
             </Pressable>
           </View>
@@ -232,7 +231,7 @@ export default function ScalpingScreen() {
             <TextInput
               style={styles.modalInput}
               placeholder="Importo in USDT"
-              placeholderTextColor={colors.textSecondary}
+              placeholderTextColor={colors.onSurfaceSecondary}
               keyboardType="decimal-pad"
               value={amountText}
               onChangeText={setAmountText}
@@ -253,9 +252,9 @@ export default function ScalpingScreen() {
                 disabled={transferring}
               >
                 {transferring ? (
-                  <ActivityIndicator color="#fff" size="small" />
+                  <ActivityIndicator color={colors.onBrand} size="small" />
                 ) : (
-                  <Text style={[styles.modalBtnText, { color: "#fff" }]}>Conferma</Text>
+                  <Text style={[styles.modalBtnText, { color: colors.onBrand }]}>Conferma</Text>
                 )}
               </Pressable>
             </View>
@@ -267,18 +266,18 @@ export default function ScalpingScreen() {
 }
 
 const styles = StyleSheet.create({
-  root: { flex: 1, backgroundColor: colors.background },
+  root: { flex: 1, backgroundColor: colors.surface },
   header: {
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "space-between",
-    paddingHorizontal: spacing.md,
+    paddingHorizontal: spacing.lg,
     paddingTop: spacing.sm,
   },
-  title: { color: colors.text, fontSize: font.lg, fontWeight: "700" },
+  title: { color: colors.onSurface, fontSize: font.xl, fontWeight: "700" },
   subtitle: {
-    color: colors.textSecondary,
-    fontSize: font.xs,
+    color: colors.onSurfaceSecondary,
+    fontSize: font.sm,
     textAlign: "center",
     marginTop: 4,
     marginBottom: spacing.sm,
@@ -287,18 +286,18 @@ const styles = StyleSheet.create({
     color: colors.error,
     textAlign: "center",
     marginTop: 40,
-    paddingHorizontal: spacing.md,
+    paddingHorizontal: spacing.lg,
   },
   emptyText: {
-    color: colors.textSecondary,
+    color: colors.onSurfaceSecondary,
     textAlign: "center",
     marginVertical: spacing.sm,
   },
   walletCard: {
     backgroundColor: colors.surfaceSecondary,
     borderRadius: radius.lg,
-    padding: spacing.md,
-    marginBottom: spacing.md,
+    padding: spacing.lg,
+    marginBottom: spacing.lg,
   },
   walletRow: {
     flexDirection: "row",
@@ -306,9 +305,9 @@ const styles = StyleSheet.create({
     marginBottom: spacing.sm,
   },
   walletStat: { flex: 1 },
-  walletLabel: { color: colors.textSecondary, fontSize: font.xs, marginBottom: 2 },
-  walletValue: { color: colors.text, fontSize: font.md, fontWeight: "700" },
-  walletValueBig: { color: colors.text, fontSize: font.lg, fontWeight: "800" },
+  walletLabel: { color: colors.onSurfaceSecondary, fontSize: font.sm, marginBottom: 2 },
+  walletValue: { color: colors.onSurface, fontSize: font.lg, fontWeight: "700" },
+  walletValueBig: { color: colors.onSurface, fontSize: font.xl, fontWeight: "800" },
   transferBtn: {
     flexDirection: "row",
     alignItems: "center",
@@ -319,18 +318,18 @@ const styles = StyleSheet.create({
     paddingVertical: spacing.sm,
     marginTop: spacing.xs,
   },
-  transferBtnText: { color: "#fff", fontWeight: "700", fontSize: font.sm },
+  transferBtnText: { color: colors.onBrand, fontWeight: "700", fontSize: font.base },
   sectionTitle: {
-    color: colors.text,
-    fontSize: font.sm,
+    color: colors.onSurface,
+    fontSize: font.base,
     fontWeight: "700",
-    marginTop: spacing.md,
+    marginTop: spacing.lg,
     marginBottom: spacing.sm,
   },
   posCard: {
     backgroundColor: colors.surfaceSecondary,
     borderRadius: radius.lg,
-    padding: spacing.md,
+    padding: spacing.lg,
     marginBottom: spacing.sm,
   },
   posTop: {
@@ -339,43 +338,43 @@ const styles = StyleSheet.create({
     alignItems: "center",
     marginBottom: spacing.xs,
   },
-  posSymbol: { color: colors.text, fontSize: font.md, fontWeight: "700" },
+  posSymbol: { color: colors.onSurface, fontSize: font.lg, fontWeight: "700" },
   sideBadge: {
     borderRadius: radius.pill,
     paddingHorizontal: spacing.sm,
     paddingVertical: 2,
   },
-  sideBadgeText: { color: "#fff", fontSize: font.xs, fontWeight: "700" },
-  posMeta: { color: colors.textSecondary, fontSize: font.xs, marginBottom: 2 },
+  sideBadgeText: { color: colors.onSurface, fontSize: font.sm, fontWeight: "700" },
+  posMeta: { color: colors.onSurfaceSecondary, fontSize: font.sm, marginBottom: 2 },
   posFooter: {
     flexDirection: "row",
     justifyContent: "space-between",
     marginTop: spacing.xs,
   },
-  posPnl: { fontSize: font.sm, fontWeight: "700" },
-  posTime: { color: colors.textSecondary, fontSize: font.xs },
+  posPnl: { fontSize: font.base, fontWeight: "700" },
+  posTime: { color: colors.onSurfaceSecondary, fontSize: font.sm },
   modalOverlay: {
     flex: 1,
     backgroundColor: "rgba(0,0,0,0.6)",
     justifyContent: "center",
     alignItems: "center",
-    padding: spacing.lg,
+    padding: spacing.xl,
   },
   modalBox: {
     backgroundColor: colors.surfaceSecondary,
     borderRadius: radius.lg,
-    padding: spacing.lg,
+    padding: spacing.xl,
     width: "100%",
   },
-  modalTitle: { color: colors.text, fontSize: font.md, fontWeight: "700", marginBottom: 4 },
-  modalSubtitle: { color: colors.textSecondary, fontSize: font.xs, marginBottom: spacing.md },
+  modalTitle: { color: colors.onSurface, fontSize: font.lg, fontWeight: "700", marginBottom: 4 },
+  modalSubtitle: { color: colors.onSurfaceSecondary, fontSize: font.sm, marginBottom: spacing.lg },
   modalInput: {
     backgroundColor: colors.surfaceTertiary,
     borderRadius: radius.md,
     padding: spacing.sm,
-    color: colors.text,
-    fontSize: font.md,
-    marginBottom: spacing.md,
+    color: colors.onSurface,
+    fontSize: font.lg,
+    marginBottom: spacing.lg,
   },
   modalButtons: { flexDirection: "row", gap: spacing.sm },
   modalBtn: {
@@ -384,5 +383,5 @@ const styles = StyleSheet.create({
     paddingVertical: spacing.sm,
     alignItems: "center",
   },
-  modalBtnText: { color: colors.text, fontWeight: "700" },
+  modalBtnText: { color: colors.onSurface, fontWeight: "700" },
 });
