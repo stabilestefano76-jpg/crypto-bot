@@ -2879,7 +2879,12 @@ def analyze_scalping(highs, lows, closes, volumes, rsis, cfg) -> dict:
     if vol_ok and side:
         reasons.append("Volume Spike")
 
-    confirmed = side is not None and vol_ok
+    # Discard flat / dead markets: Bollinger Bands almost touching means
+    # the price hasn't really moved, so signals are not reliable.
+    bb_width_pct = (upper_bb - lower_bb) / mid_bb * 100 if mid_bb else 0.0
+    is_flat = bb_width_pct < 0.05
+
+    confirmed = side is not None and vol_ok and not is_flat
     return {
         "confirmed": confirmed,
         "side": side,
