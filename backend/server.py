@@ -48,12 +48,13 @@ logger = logging.getLogger("kusignal")
 BYBIT_BASE = "https://api.bybit.eu"
 BYBIT_WS_PUBLIC = "wss://stream.bybit.eu/v5/public"
 TF_MAP = {
+ "5m": "5",
     "15m": "15",
     "1h": "60",
     "4h": "240",
     "1d": "D",
 }
-TF_SECONDS = {"15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
+TF_SECONDS = {"5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
 DEFAULT_TIMEFRAMES = ["1h", "4h"]
 CANDLE_LIMIT = 200  # candles fetched per pair/tf
 
@@ -88,6 +89,16 @@ class Config(BaseModel):
     score_ma_cross: float = 1.0
     score_fvg_reversal: float = 2.0  # NEW: confirmed reversal inside FVG zone
     min_score_threshold: float = 4.0
+
+    # --- Scalping Bot (independent strategy) ---
+    scalping_enabled: bool = True
+    scalping_timeframe: str = "5m"
+    scalping_rsi_period: int = 9
+    scalping_bb_period: int = 20
+    scalping_bb_std: float = 2.0
+    scalping_ema_fast: int = 9
+    scalping_ema_slow: int = 21
+    scalping_volume_multiplier: float = 1.5
     signal_validity_candles: int = 5  # a condition counts if it happened within N bars
     fvg_lookback: int = 40  # how far back to look for an open FVG
     # --- FVG reversal / fill entry extension ---
@@ -2812,3 +2823,71 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+
+# ---------------------------------------------------------------------------
+# Scalping Bot (independent strategy): VWAP + RSI(9) + Bollinger Bands + EMA9/21
+# ---------------------------------------------------------------------------
+def _ema(values: list[float], period: int) -> list[float]:
+    if not values:
+        return []
+    k = 2 / (period + 1)
+    out = [values[0]]
+    for v in values[1:]:
+        out.append(v * k + out[-1] * (1 - k))
+    return out
+
+
+def _vwap(highs, lows, closes, volumes) -> float:
+    num = 0.0
+    den = 0.0
+    for h, l, c, v in zip(highs, lows, closes, volumes):
+        tp = (h + l + c) / 3
+        num += tp * v
+        den += v
+    return num / den if den else closes[-1]
+
+
+def _bollinger(closes: list[float], period: int, std_mult: float):
+    window = closes[-period:]
+    mean = sum(window) / len(window)
+    variance = sum((x - mean) ** 2 for x in window) / len(window)
+    std = variance ** 0.5
+    return mean - std_mult * std, mean, mean + std_mult * std
+
+
+def analyze_scalping(highs, lows, closes, volumes, rsis, cfg) -> dict:
+    """Scalping setup: EMA9/21 trend + VWAP reclaim/loss + Bollinger touch + volume."""
+    ema_fast = _ema(closes, cfg.scalping_ema_fast)
+    ema_slow = _ema(closes, cfg.scalping_ema_slow)
+    vwap = _vwap(highs, lows, closes, volumes)
+    lower_bb, mid_bb, upper_bb = _bollinger(closes, cfg.scalping_bb_period, cfg.scalping_bb_std)
+    last_close = closes[-1]
+    last_rsi = rsis[-1] if rsis else 50.0
+    avg_vol = sum(volumes[-20:]) / max(1, len(volumes[-20:]))
+    vol_ok = volumes[-1] >= avg_vol * cfg.scalping_volume_multiplier
+
+    side = None
+    reasons = []
+    if ema_fast[-1] > ema_slow[-1] and last_close > vwap and last_close <= lower_bb * 1.01:
+        side = "long"
+        reasons = ["EMA9>EMA21", "Above VWAP", "Near lower BB"]
+    elif ema_fast[-1] < ema_slow[-1] and last_close < vwap and last_close >= upper_bb * 0.99:
+        side = "short"
+        reasons = ["EMA9<EMA21", "Below VWAP", "Near upper BB"]
+
+    if vol_ok and side:
+        reasons.append("Volume Spike")
+
+    confirmed = side is not None and vol_ok
+    return {
+        "confirmed": confirmed,
+        "side": side,
+        "reasons": reasons,
+        "vwap": round(vwap, 6),
+        "rsi": round(last_rsi, 2),
+        "bb_lower": round(lower_bb, 6),
+        "bb_upper": round(upper_bb, 6),
+        "ema_fast": round(ema_fast[-1], 6),
+        "ema_slow": round(ema_slow[-1], 6),
+    }
