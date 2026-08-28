@@ -2215,6 +2215,7 @@ async def scheduler_loop() -> None:
             await expire_stale_signals()
             await run_scan()
             await run_scalping_scan()
+            await close_scalping_positions()
         except Exception as e:  # noqa: BLE001
             logger.exception("Scan loop error: %s", e)
         await asyncio.sleep(max(60, cfg.scan_interval_minutes * 60))
@@ -2970,6 +2971,7 @@ async def run_scalping_scan() -> dict[str, Any]:
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         signals_found.append(doc)
+        await open_scalping_position(doc)
 
     if signals_found:
         for doc in signals_found:
@@ -3128,3 +3130,123 @@ async def scalping_portfolio() -> dict[str, Any]:
         "closed_count": len(closed),
         "win_rate": win_rate,
     }
+
+
+# ---------------------------------------------------------------------------
+# Scalping Bot: auto-execution of real (paper) positions
+# ---------------------------------------------------------------------------
+SCALPING_SL_PCT = 0.004   # 0.4% stop loss
+SCALPING_TP_PCT = 0.008   # 0.8% take profit (2:1 reward/risk)
+SCALPING_WALLET_RISK_PCT = 0.20  # % of scalping cash used per trade
+
+
+async def open_scalping_position(doc: dict[str, Any]) -> None:
+    wallet = await get_scalping_wallet()
+    cash = wallet.get("cash", 0.0)
+    if cash <= 1.0:
+        return  # not enough funds transferred to the scalping wallet
+
+    existing = await db.scalping_positions.find_one(
+        {"symbol": doc["symbol"], "status": "open"}, {"_id": 0}
+    )
+    if existing:
+        return  # already have an open position on this pair
+
+    notional = cash * SCALPING_WALLET_RISK_PCT
+    if notional < 1.0:
+        notional = min(cash, 1.0)
+
+    fill_price = doc["price"]
+    if fill_price <= 0:
+        return
+    quantity = notional / fill_price
+
+    side = doc["side"]
+    if side == "long":
+        stop_loss = fill_price * (1 - SCALPING_SL_PCT)
+        take_profit = fill_price * (1 + SCALPING_TP_PCT)
+    else:
+        stop_loss = fill_price * (1 + SCALPING_SL_PCT)
+        take_profit = fill_price * (1 - SCALPING_TP_PCT)
+
+    position = {
+        "id": str(uuid.uuid4()),
+        "signal_id": doc["id"],
+        "symbol": doc["symbol"],
+        "timeframe": doc["timeframe"],
+        "side": side,
+        "entry": fill_price,
+        "fill_price": fill_price,
+        "stop_loss": stop_loss,
+        "take_profit": take_profit,
+        "quantity": quantity,
+        "notional": notional,
+        "opened_at": datetime.now(timezone.utc).isoformat(),
+        "status": "open",
+    }
+    await db.scalping_positions.insert_one(position)
+
+    wallet["cash"] = cash - notional
+    await save_scalping_wallet(wallet)
+
+
+async def close_scalping_positions() -> None:
+    open_positions = await db.scalping_positions.find(
+        {"status": "open"}, {"_id": 0}
+    ).to_list(1000)
+    if not open_positions:
+        return
+
+    tickers = await exchange.get_tickers()
+    price_map: dict[str, float] = {}
+    for t in tickers:
+        try:
+            price_map[t["symbol"]] = float(t.get("last") or 0)
+        except (TypeError, ValueError):
+            continue
+
+    wallet = await get_scalping_wallet()
+    cash = wallet.get("cash", 0.0)
+
+    for p in open_positions:
+        cur = price_map.get(p["symbol"])
+        if not cur:
+            continue
+
+        hit = None
+        if p["side"] == "long":
+            if cur <= p["stop_loss"]:
+                hit = "stop_loss"
+            elif cur >= p["take_profit"]:
+                hit = "take_profit"
+        else:
+            if cur >= p["stop_loss"]:
+                hit = "stop_loss"
+            elif cur <= p["take_profit"]:
+                hit = "take_profit"
+
+        if not hit:
+            continue
+
+        if p["side"] == "long":
+            pnl = (cur - p["entry"]) * p["quantity"]
+        else:
+            pnl = (p["entry"] - cur) * p["quantity"]
+
+        cash += p["notional"] + pnl
+
+        await db.scalping_positions.update_one(
+            {"id": p["id"]},
+            {
+                "$set": {
+                    "status": "closed",
+                    "close_price": cur,
+                    "close_reason": hit,
+                    "pnl_usdt": round(pnl, 4),
+                    "closed_at": datetime.now(timezone.utc).isoformat(),
+                }
+            },
+        )
+
+    wallet["cash"] = cash
+    await save_scalping_wallet(wallet)
