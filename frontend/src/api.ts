@@ -303,3 +303,81 @@ export const api = {
       bottleneck: string | null;
     }>("/setup-debug/log"),
 };
+
+
+export type ScalpingSignal = {
+  id: string;
+  symbol: string;
+  timeframe: string;
+  side: "long" | "short";
+  reasons: string[];
+  vwap: number;
+  rsi: number;
+  bb_lower: number;
+  bb_upper: number;
+  ema_fast: number;
+  ema_slow: number;
+  price: number;
+  status: string;
+  created_at: string;
+};
+
+export const scalpingApi = {
+  signals: () =>
+    req<{ signals: ScalpingSignal[]; count: number; active: number }>(
+      "/scalping/signals"
+    ),
+  config: () =>
+    req<{
+      scalping_enabled: boolean;
+      scalping_timeframe: string;
+      scalping_rsi_period: number;
+      scalping_bb_period: number;
+      scalping_bb_std: number;
+      scalping_ema_fast: number;
+      scalping_ema_slow: number;
+      scalping_volume_multiplier: number;
+    }>("/scalping/config"),
+};
+
+export type ScalpingPosition = {
+  id: string;
+  symbol: string;
+  side: "long" | "short";
+  entry: number;
+  stop_loss: number;
+  take_profit: number;
+  quantity: number;
+  notional: number;
+  status: string;
+  opened_at: string;
+  current_price?: number;
+  unrealized_pnl?: number;
+  unrealized_pnl_pct?: number;
+  close_price?: number;
+  close_reason?: string;
+  pnl_usdt?: number;
+  closed_at?: string;
+};
+
+export type ScalpingPortfolio = {
+  cash: number;
+  allocated: number;
+  unrealized_pnl: number;
+  realized_pnl: number;
+  equity: number;
+  open_positions: ScalpingPosition[];
+  closed_positions: ScalpingPosition[];
+  open_count: number;
+  closed_count: number;
+  win_rate: number;
+};
+
+export const scalpingWalletApi = {
+  portfolio: () => req<ScalpingPortfolio>("/scalping/portfolio"),
+  transfer: (amount: number) =>
+    req<{ ok: boolean; scalping_cash: number; main_cash: number }>(
+      "/scalping/transfer",
+      { method: "POST", body: JSON.stringify({ amount }) }
+    ),
+};
