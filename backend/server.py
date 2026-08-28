@@ -2816,7 +2816,6 @@ async def exchange_disconnect() -> dict[str, Any]:
     return {"ok": True}
 
 
-app.include_router(api)
 app.add_middleware(
     CORSMiddleware,
     allow_credentials=True,
@@ -3007,3 +3006,5 @@ async def scalping_config_get() -> dict[str, Any]:
         "scalping_ema_slow": cfg.scalping_ema_slow,
         "scalping_volume_multiplier": cfg.scalping_volume_multiplier,
     }
+
+app.include_router(api)
