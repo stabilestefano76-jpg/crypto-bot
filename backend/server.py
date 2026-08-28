@@ -3255,4 +3255,29 @@ async def close_scalping_positions() -> None:
     wallet["cash"] = cash
     await save_scalping_wallet(wallet)
 
+
+
+@api.post("/scalping/withdraw")
+async def scalping_withdraw(req: ScalpingTransferRequest) -> dict[str, Any]:
+    amount = req.amount
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="L'importo deve essere positivo")
+
+    wallet = await get_scalping_wallet()
+    scalping_cash = wallet.get("cash", 0.0)
+    if amount > scalping_cash:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Fondi insufficienti nel portafoglio scalping (disponibili: {round(scalping_cash, 2)})",
+        )
+
+    wallet["cash"] = scalping_cash - amount
+    wallet["total_transferred_in"] = wallet.get("total_transferred_in", 0.0) - amount
+    await save_scalping_wallet(wallet)
+
+    main_cash = await get_paper_cash()
+    await set_paper_cash(main_cash + amount)
+
+    return {"ok": True, "scalping_cash": wallet["cash"], "main_cash": main_cash + amount}
+
 app.include_router(api)
