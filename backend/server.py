@@ -145,6 +145,11 @@ class Config(BaseModel):
     fvgr_trailing_pct: float = 1.0  # trailing distance % (from best price), when in profit
     fvgr_atr_sl_multiplier: float = 1.5
     fvgr_min_rr_ratio: float = 1.5
+    # --- Trend Exhaustion Score (additive, COUNTER-TREND strategies only:
+    # "counter_trend" / Rev Pre-FVG and "fvg_reversal" / FVG Reversal). Not
+    # used by "scoring" or "impulse_fvg". ---
+    exhaustion_lookback: int = 10
+    exhaustion_min_score: float = 2.0
 
 
 class Signal(BaseModel):
@@ -497,6 +502,99 @@ def detect_fvg_reversal(
 
     confirmed = len(signals) >= cfg.reversal_min_signals
     return {"confirmed": confirmed, "signals": signals}
+
+
+def detect_trend_exhaustion(
+    opens: list[float],
+    highs: list[float],
+    lows: list[float],
+    closes: list[float],
+    volumes: list[float],
+    rsis: list[Optional[float]],
+    trend: str,  # "up" or "down"
+    cfg: Config,
+) -> dict[str, Any]:
+    """Trend Exhaustion Score (additive check, COUNTER-TREND strategies only:
+    "counter_trend" / Rev Pre-FVG and "fvg_reversal" / FVG Reversal). Measures
+    whether the trend is genuinely running out of steam, BEFORE the reversal
+    candle pattern is searched. Does not touch "scoring" or "impulse_fvg".
+
+    Checks 4 independent conditions over the last `cfg.exhaustion_lookback`
+    candles (1 point each), speculare for "up" (looking for bearish exhaustion)
+    and "down" (looking for bullish exhaustion):
+      1) Candles shrinking (avg body last 3 < avg body of the 3 before that).
+      2) Volume fading while price still advances in the trend direction.
+      3) RSI swings losing strength (lower highs on "up", higher lows on "down").
+      4) A long rejection wick against the trend on one of the last 2 candles.
+
+    Returns {"confirmed": bool, "score": float, "signals": [str]}.
+    """
+    signals: list[str] = []
+    n = len(closes)
+    lb = max(6, cfg.exhaustion_lookback)
+    if n < lb + 2:
+        return {"confirmed": False, "score": 0.0, "signals": signals}
+
+    w_opens = opens[-lb:]
+    w_highs = highs[-lb:]
+    w_lows = lows[-lb:]
+    w_closes = closes[-lb:]
+    w_vols = volumes[-lb:]
+    w_rsis = rsis[-lb:]
+
+    # 1) Candles shrinking: avg body of the last 3 vs the 3 candles before that.
+    bodies = [abs(w_closes[i] - w_opens[i]) for i in range(len(w_opens))]
+    if len(bodies) >= 6:
+        recent_avg = sum(bodies[-3:]) / 3
+        prior_avg = sum(bodies[-6:-3]) / 3
+        if prior_avg > 0 and recent_avg < prior_avg * 0.7:
+            signals.append("Candele in Contrazione")
+
+    # 2) Volume fading while price still advances in the trend direction.
+    if len(w_vols) >= 6 and len(w_closes) >= 4:
+        recent_vol_avg = sum(w_vols[-3:]) / 3
+        prior_vol_avg = sum(w_vols[-6:-3]) / 3
+        price_advancing = (
+            w_closes[-1] > w_closes[-4] if trend == "up" else w_closes[-1] < w_closes[-4]
+        )
+        if price_advancing and prior_vol_avg > 0 and recent_vol_avg < prior_vol_avg:
+            signals.append("Volume in Calo")
+
+    # 3) RSI swings losing strength: lower highs (up) / higher lows (down),
+    # reusing detect_pivots on the closes within this same window.
+    sub_window = max(2, min(cfg.pivot_window, lb // 2 - 1))
+    if sub_window >= 2 and len(w_closes) >= (2 * sub_window + 1):
+        lows_idx, highs_idx = detect_pivots(w_closes, sub_window)
+        if trend == "up" and len(highs_idx) >= 2:
+            i1, i2 = highs_idx[-2], highs_idx[-1]
+            r1, r2 = w_rsis[i1], w_rsis[i2]
+            if r1 is not None and r2 is not None and w_closes[i2] >= w_closes[i1] and r2 < r1:
+                signals.append("RSI Picchi Decrescenti")
+        elif trend == "down" and len(lows_idx) >= 2:
+            i1, i2 = lows_idx[-2], lows_idx[-1]
+            r1, r2 = w_rsis[i1], w_rsis[i2]
+            if r1 is not None and r2 is not None and w_closes[i2] <= w_closes[i1] and r2 > r1:
+                signals.append("RSI Minimi Crescenti")
+
+    # 4) Long rejection wick against the trend, on one of the last 2 candles.
+    ratio = cfg.reversal_rejection_wick_ratio
+    for i in range(max(0, len(w_opens) - 2), len(w_opens)):
+        o, h, l, c = w_opens[i], w_highs[i], w_lows[i], w_closes[i]
+        body = abs(c - o)
+        if body <= 0:
+            body = (h - l) * 0.25 or 1e-9
+        upper_wick = h - max(o, c)
+        lower_wick = min(o, c) - l
+        if trend == "up" and upper_wick >= ratio * body and upper_wick > lower_wick:
+            signals.append("Candela di Rifiuto")
+            break
+        if trend == "down" and lower_wick >= ratio * body and lower_wick > upper_wick:
+            signals.append("Candela di Rifiuto")
+            break
+
+    score = float(len(signals))
+    confirmed = score >= cfg.exhaustion_min_score
+    return {"confirmed": confirmed, "score": score, "signals": signals}
 
 
 
@@ -1863,6 +1961,17 @@ async def analyze_pair_counter(symbol: str, tf: str, cfg: Config) -> Optional[Si
     else:
         return None
 
+    # --- Trend Exhaustion Score (additive, before the reversal-pattern search) ---
+    # The trade direction is the breakout direction (`side`); the trend this
+    # strategy trades AGAINST is therefore the opposite direction.
+    rsis = rsi_wilder(closes, cfg.rsi_period)
+    exhaustion_trend = "down" if side == "long" else "up"
+    exhaustion = detect_trend_exhaustion(
+        opens, highs, lows, closes, vols, rsis, exhaustion_trend, cfg
+    )
+    if not exhaustion["confirmed"]:
+        return None
+
     # Step 3: reversal pattern INSIDE the consolidation (before the breakout).
     #   long  -> bullish reversal (bullish engulfing / morning star)
     #   short -> bearish reversal (bearish engulfing / evening star)
@@ -1919,7 +2028,6 @@ async def analyze_pair_counter(symbol: str, tf: str, cfg: Config) -> Optional[Si
     vol_ratio = volume_spike_ratio(vols, cfg.volume_ma_period)
     if vol_ratio < cfg.volume_spike_multiplier:
         return None
-    rsis = rsi_wilder(closes, cfg.rsi_period)
     # (a) higher-TF extreme (oversold for long / overbought for short)
     htf = _higher_tf(tf)
     hcandles = await exchange.get_klines(symbol, htf)
@@ -1944,7 +2052,8 @@ async def analyze_pair_counter(symbol: str, tf: str, cfg: Config) -> Optional[Si
         entry=round(entry, 8), stop_loss=round(stop_loss, 8),
         take_profit=round(tp1, 8), rr_ratio=cfg.rr_ratio,
         confirmations=["Consolidation Breakout", pattern, "Volume Spike",
-                       "RSI HTF Extreme", "RSI Momentum Turn", "RSI Divergence"],
+                       "RSI HTF Extreme", "RSI Momentum Turn", "RSI Divergence"]
+                       + exhaustion["signals"],
         strength=6, score=0.0, max_score=0.0,
         strategy="counter_trend",
         tp1=round(tp1, 8), tp2=round(tp2, 8),
@@ -1992,6 +2101,14 @@ async def analyze_pair_fvg_reversal(symbol: str, tf: str, cfg: Config) -> Option
         return None
     origin = max(impulse_fvgs, key=lambda f: f["gap"])
 
+    # --- Trend Exhaustion Score (additive, before the reversal-pattern search) ---
+    rsis = rsi_wilder(closes, cfg.rsi_period)
+    exhaustion = detect_trend_exhaustion(
+        opens, highs, lows, closes, [c[5] for c in candles], rsis, trend, cfg
+    )
+    if not exhaustion["confirmed"]:
+        return None
+
     # Reversal pattern AGAINST the trend during the retracement.
     against = "bearish" if trend == "up" else "bullish"
     pattern = detect_reversal_pattern(opens, highs, lows, closes, against)
@@ -1999,7 +2116,6 @@ async def analyze_pair_fvg_reversal(symbol: str, tf: str, cfg: Config) -> Option
         return None
 
     # RSI filters (independent thresholds).
-    rsis = rsi_wilder(closes, cfg.rsi_period)
     htf = _higher_tf(tf)
     hcandles = await exchange.get_klines(symbol, htf)
     hrsis = rsi_wilder([c[2] for c in hcandles], cfg.rsi_period) if len(hcandles) > cfg.rsi_period else []
@@ -2046,7 +2162,7 @@ async def analyze_pair_fvg_reversal(symbol: str, tf: str, cfg: Config) -> Option
         entry=round(entry, 8), stop_loss=round(stop_loss, 8),
         take_profit=round(tp1, 8), rr_ratio=cfg.rr_ratio,
         confirmations=["FVG Reversal", pattern, "RSI HTF Extreme",
-                       "RSI Momentum Turn", "RSI Divergence"],
+                       "RSI Momentum Turn", "RSI Divergence"] + exhaustion["signals"],
         strength=5, score=0.0, max_score=0.0,
         strategy="fvg_reversal",
         tp1=round(tp1, 8), tp2=round(tp2, 8),
