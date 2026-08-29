@@ -99,6 +99,8 @@ class Config(BaseModel):
     scalping_ema_fast: int = 9
     scalping_ema_slow: int = 21
     scalping_volume_multiplier: float = 1.5
+    scalping_min_hold_seconds: int = 60  # min time before the invalidation check can close early
+    scalping_cooldown_minutes: int = 10  # pause on a symbol after a losing scalping trade
     signal_validity_candles: int = 5  # a condition counts if it happened within N bars
     fvg_lookback: int = 40  # how far back to look for an open FVG
     # --- FVG reversal / fill entry extension ---
@@ -735,7 +737,10 @@ class PriceFeed:
 
     async def desired_symbols(self) -> list[str]:
         docs = await db.paper_positions.find({}, {"symbol": 1, "_id": 0}).to_list(1000)
-        return sorted({d["symbol"] for d in docs})
+        scalp_docs = await db.scalping_positions.find(
+            {"status": "open"}, {"symbol": 1, "_id": 0}
+        ).to_list(1000)
+        return sorted({d["symbol"] for d in docs} | {d["symbol"] for d in scalp_docs})
 
     def _ws_url(self) -> str:
         return f"{BYBIT_WS_PUBLIC}/{exchange.category}"
@@ -2331,7 +2336,6 @@ async def scheduler_loop() -> None:
             await expire_stale_signals()
             await run_scan()
             await run_scalping_scan()
-            await close_scalping_positions()
         except Exception as e:  # noqa: BLE001
             logger.exception("Scan loop error: %s", e)
         await asyncio.sleep(max(60, cfg.scan_interval_minutes * 60))
@@ -2345,6 +2349,19 @@ async def paper_monitor_loop() -> None:
             await monitor_paper_positions()
         except Exception as e:  # noqa: BLE001
             logger.exception("Paper monitor error: %s", e)
+        await asyncio.sleep(3)
+
+
+async def scalping_monitor_loop() -> None:
+    """Check Scalping Bot SL/TP/invalidation every 3s using the real-time WS
+    price cache — decoupled from the (much slower) scan cycle so stop losses
+    trigger close to the intended level instead of drifting on fast moves."""
+    await asyncio.sleep(8)
+    while True:
+        try:
+            await close_scalping_positions()
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Scalping monitor error: %s", e)
         await asyncio.sleep(3)
 
 
@@ -2418,11 +2435,13 @@ async def lifespan(_app: FastAPI):
     await get_paper_config()  # sync exchange.category from trading_mode
     scan_task = asyncio.create_task(scheduler_loop())
     monitor_task = asyncio.create_task(paper_monitor_loop())
+    scalping_monitor_task = asyncio.create_task(scalping_monitor_loop())
     ws_task = asyncio.create_task(price_feed.run())
     premature_task = asyncio.create_task(premature_stop_loop())
     yield
     scan_task.cancel()
     monitor_task.cancel()
+    scalping_monitor_task.cancel()
     ws_task.cancel()
     premature_task.cancel()
     await exchange.close()
@@ -3087,7 +3106,7 @@ async def run_scalping_scan() -> dict[str, Any]:
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
         signals_found.append(doc)
-        await open_scalping_position(doc)
+        await open_scalping_position(doc, cfg)
 
     if signals_found:
         for doc in signals_found:
@@ -3257,7 +3276,52 @@ SCALPING_WALLET_RISK_PCT = 0.20  # % of scalping cash used per trade
 SCALPING_FEE_PCT = 0.001  # 0.10% Bybit spot fee per side (open + close = 0.20% round trip)
 
 
-async def open_scalping_position(doc: dict[str, Any]) -> None:
+async def check_scalping_invalidation(pos: dict[str, Any], cfg: Config) -> bool:
+    """Invalidation check (additive, Scalping Bot only): closes a trade EARLY,
+    before SL/TP, if the reasons that generated the signal no longer hold —
+    i.e. the trade is now going against us. Does not replace SL/TP; it only
+    adds an earlier exit when the setup is invalidated.
+
+    A long is invalidated if price closes back below VWAP OR EMA9 crosses
+    below EMA21 (trend flip). A short is invalidated speculare (above VWAP /
+    EMA9 crosses above EMA21). Only checked after `scalping_min_hold_seconds`
+    have elapsed since the position was opened, to avoid closing on noise.
+    """
+    try:
+        opened = datetime.fromisoformat(pos["opened_at"]).timestamp()
+    except (ValueError, TypeError):
+        return False
+    if (time.time() - opened) < cfg.scalping_min_hold_seconds:
+        return False
+
+    candles = await exchange.get_klines(pos["symbol"], cfg.scalping_timeframe)
+    min_len = max(cfg.scalping_bb_period, cfg.scalping_ema_slow) + 5
+    if len(candles) < min_len:
+        return False
+
+    highs = [c[3] for c in candles]
+    lows = [c[4] for c in candles]
+    closes = [c[2] for c in candles]
+    volumes = [c[5] for c in candles]
+    ema_fast = _ema(closes, cfg.scalping_ema_fast)
+    ema_slow = _ema(closes, cfg.scalping_ema_slow)
+    vwap = _vwap(highs, lows, closes, volumes)
+    last_close = closes[-1]
+
+    if pos["side"] == "long":
+        return last_close < vwap or ema_fast[-1] < ema_slow[-1]
+    return last_close > vwap or ema_fast[-1] > ema_slow[-1]
+
+
+# Per-symbol cooldown after a losing scalping trade (additive, in-memory).
+_scalping_cooldown: dict[str, float] = {}
+
+
+async def open_scalping_position(doc: dict[str, Any], cfg: Config) -> None:
+    # Cooldown: skip re-opening on this symbol shortly after a losing close.
+    last_loss = _scalping_cooldown.get(doc["symbol"])
+    if last_loss and (time.time() - last_loss) < cfg.scalping_cooldown_minutes * 60:
+        return
     wallet = await get_scalping_wallet()
     cash = wallet.get("cash", 0.0)
     if cash <= 1.0:
@@ -3314,19 +3378,24 @@ async def close_scalping_positions() -> None:
     if not open_positions:
         return
 
-    tickers = await exchange.get_tickers()
+    # Prefer real-time WS prices (same cache used by the main paper monitor);
+    # fall back to a single REST call only for symbols with no fresh WS price.
     price_map: dict[str, float] = {}
-    for t in tickers:
-        try:
-            price_map[t["symbol"]] = float(t.get("last") or 0)
-        except (TypeError, ValueError):
-            continue
+    need_rest = any(price_feed.get(p["symbol"]) is None for p in open_positions)
+    if need_rest:
+        tickers = await exchange.get_tickers()
+        for t in tickers:
+            try:
+                price_map[t["symbol"]] = float(t.get("last") or 0)
+            except (TypeError, ValueError):
+                continue
 
     wallet = await get_scalping_wallet()
     cash = wallet.get("cash", 0.0)
+    cfg = await get_config()
 
     for p in open_positions:
-        cur = price_map.get(p["symbol"])
+        cur = price_feed.get(p["symbol"]) or price_map.get(p["symbol"])
         if not cur:
             continue
 
@@ -3342,6 +3411,11 @@ async def close_scalping_positions() -> None:
             elif cur <= p["take_profit"]:
                 hit = "take_profit"
 
+        # Additive check: close EARLY if the setup that justified the trade
+        # is no longer valid (trade going against us), before SL/TP is hit.
+        if not hit and await check_scalping_invalidation(p, cfg):
+            hit = "invalidation"
+
         if not hit:
             continue
 
@@ -3354,6 +3428,10 @@ async def close_scalping_positions() -> None:
         pnl = gross_pnl - fees
 
         cash += p["notional"] + pnl
+
+        # Cooldown: pause re-opening on this symbol after a losing close.
+        if pnl < 0:
+            _scalping_cooldown[p["symbol"]] = time.time()
 
         await db.scalping_positions.update_one(
             {"id": p["id"]},
@@ -3395,5 +3473,19 @@ async def scalping_withdraw(req: ScalpingTransferRequest) -> dict[str, Any]:
     await set_paper_cash(main_cash + amount)
 
     return {"ok": True, "scalping_cash": wallet["cash"], "main_cash": main_cash + amount}
+
+
+@api.post("/scalping/reset")
+async def scalping_reset() -> dict[str, Any]:
+    """Reset dello Scalping Bot: chiude tutte le posizioni aperte, cancella lo
+    storico segnali/posizioni chiuse e azzera il portafoglio scalping (cash e
+    totale trasferito). NON tocca il portafoglio principale: i fondi già
+    trasferiti nello scalping vengono azzerati qui; per riaverli sul
+    portafoglio principale, trasferirli PRIMA di fare il reset."""
+    await db.scalping_positions.delete_many({})
+    await db.scalping_signals.delete_many({})
+    wallet = {"cash": 0.0, "total_transferred_in": 0.0}
+    await save_scalping_wallet(wallet)
+    return {"ok": True, "cash": 0.0}
 
 app.include_router(api)
