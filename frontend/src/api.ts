@@ -380,6 +380,7 @@ export const scalpingWalletApi = {
       "/scalping/transfer",
       { method: "POST", body: JSON.stringify({ amount }) }
     ),
+  reset: () => req<{ ok: boolean; cash: number }>("/scalping/reset", { method: "POST" }),
 };
 
 export const scalpingWithdraw = (amount: number) =>

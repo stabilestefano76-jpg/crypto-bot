@@ -49,6 +49,7 @@ export default function ScalpingScreen() {
   const [amountText, setAmountText] = useState("");
   const [transferring, setTransferring] = useState(false);
   const [transferMode, setTransferMode] = useState<"deposit" | "withdraw">("deposit");
+  const [resetting, setResetting] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -95,6 +96,31 @@ export default function ScalpingScreen() {
     } finally {
       setTransferring(false);
     }
+  };
+
+  const onReset = () => {
+    Alert.alert(
+      "Reset Scalping Bot",
+      "Verranno chiuse tutte le posizioni aperte, cancellato lo storico e azzerato il portafoglio scalping (il saldo attuale andrà perso). Il portafoglio principale non viene toccato. Continuare?",
+      [
+        { text: "Annulla", style: "cancel" },
+        {
+          text: "Reset",
+          style: "destructive",
+          onPress: async () => {
+            setResetting(true);
+            try {
+              await scalpingWalletApi.reset();
+              await load();
+            } catch (e: any) {
+              Alert.alert("Reset fallito", e?.message || "Errore sconosciuto");
+            } finally {
+              setResetting(false);
+            }
+          },
+        },
+      ]
+    );
   };
 
   const renderPosition = (p: ScalpingPosition, closed: boolean) => {
@@ -146,7 +172,13 @@ export default function ScalpingScreen() {
           <Ionicons name="chevron-back" size={26} color={colors.onSurface} />
         </Pressable>
         <Text style={styles.title}>Scalping Bot</Text>
-        <View style={{ width: 26 }} />
+        <Pressable onPress={onReset} hitSlop={12} disabled={resetting}>
+          {resetting ? (
+            <ActivityIndicator size="small" color={colors.error} />
+          ) : (
+            <Ionicons name="refresh-circle-outline" size={24} color={colors.error} />
+          )}
+        </Pressable>
       </View>
       <Text style={styles.subtitle}>VWAP + RSI(9) + Bollinger + EMA9/21 · 5m</Text>
 
@@ -224,6 +256,17 @@ export default function ScalpingScreen() {
                 <Text style={styles.withdrawBtnText}>Preleva</Text>
               </Pressable>
             </View>
+            <Pressable
+              style={({ pressed }) => [
+                styles.resetBtn,
+                pressed && { opacity: 0.7 },
+              ]}
+              onPress={onReset}
+              disabled={resetting}
+            >
+              <Ionicons name="trash-outline" size={16} color={colors.error} />
+              <Text style={styles.resetBtnText}>Reset Scalping Bot</Text>
+            </Pressable>
           </View>
 
           <Text style={styles.sectionTitle}>
@@ -359,6 +402,18 @@ const styles = StyleSheet.create({
     paddingVertical: spacing.sm,
   },
   withdrawBtnText: { color: colors.onSurface, fontWeight: "700", fontSize: font.base },
+  resetBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    borderWidth: 1,
+    borderColor: colors.error,
+    borderRadius: radius.pill,
+    paddingVertical: spacing.sm,
+    marginTop: spacing.sm,
+  },
+  resetBtnText: { color: colors.error, fontWeight: "700", fontSize: font.base },
   sectionTitle: {
     color: colors.onSurface,
     fontSize: font.base,
