@@ -286,6 +286,18 @@ export default function SignalsScreen() {
   );
 }
 
+const STRATEGY_LABELS: Record<string, string> = {
+  counter_trend: "Rev Pre-FVG",
+  fvg_reversal: "FVG Reversal",
+  rsi_reversion: "RSI Reversion",
+};
+
+const STRATEGY_COLORS: Record<string, string> = {
+  counter_trend: "#3B82F6",
+  fvg_reversal: "#A855F7",
+  rsi_reversion: "#F59E0B",
+};
+
 function SignalCard({
   signal,
   onPress,
@@ -307,6 +319,8 @@ function SignalCard({
     setTimeout(() => setMsg(null), 3000);
     setExecuting(false);
   };
+  const stratLabel = signal.strategy ? STRATEGY_LABELS[signal.strategy] : undefined;
+  const stratColor = signal.strategy ? STRATEGY_COLORS[signal.strategy] : colors.brand;
   return (
     <Pressable
       onPress={onPress}
@@ -319,6 +333,13 @@ function SignalCard({
           <View style={styles.tfTag}>
             <Text style={styles.tfTagText}>{signal.timeframe}</Text>
           </View>
+          {stratLabel && (
+            <View style={[styles.stratTag, { borderColor: stratColor }]}>
+              <Text style={[styles.stratTagText, { color: stratColor }]}>
+                {stratLabel}
+              </Text>
+            </View>
+          )}
         </View>
         <View
           style={[
@@ -533,6 +554,14 @@ const styles = StyleSheet.create({
     backgroundColor: colors.surfaceTertiary,
   },
   tfTagText: { color: colors.onSurfaceSecondary, fontSize: 11, fontWeight: "600" },
+  stratTag: {
+    paddingHorizontal: 6,
+    paddingVertical: 2,
+    borderRadius: radius.sm,
+    borderWidth: 1,
+    backgroundColor: "transparent",
+  },
+  stratTagText: { fontSize: 10, fontWeight: "700" },
   sideBadge: {
     flexDirection: "row",
     alignItems: "center",
