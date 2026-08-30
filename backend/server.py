@@ -153,6 +153,20 @@ class Config(BaseModel):
     # used by "scoring" or "impulse_fvg". ---
     exhaustion_lookback: int = 10
     exhaustion_min_score: float = 2.0
+    # --- Grid Bot (independent strategy: range/laterale trading) ---
+    grid_enabled: bool = True
+    grid_timeframe: str = "1h"  # timeframe used for range detection, ATR and spacing
+    grid_bb_period: int = 20
+    grid_bb_std: float = 2.0
+    grid_max_bb_width_pct: float = 3.0  # market considered "laterale" if BB width <= this % of price
+    grid_ema_fast: int = 9
+    grid_ema_slow: int = 21
+    grid_max_ema_gap_pct: float = 0.5  # EMA fast/slow must be within this % of each other (flat trend)
+    grid_atr_period: int = 14
+    grid_num_levels: int = 4  # wide/sparse grid: few levels below the center price
+    grid_atr_spacing_mult: float = 1.8  # distance between grid levels = this * ATR
+    grid_range_break_atr_mult: float = 3.0  # emergency stop: price this many ATR below the lowest level
+    grid_max_pairs: int = 4  # max symbols with an active grid at once
 
 
 class Signal(BaseModel):
@@ -741,7 +755,14 @@ class PriceFeed:
         scalp_docs = await db.scalping_positions.find(
             {"status": "open"}, {"symbol": 1, "_id": 0}
         ).to_list(1000)
-        return sorted({d["symbol"] for d in docs} | {d["symbol"] for d in scalp_docs})
+        grid_docs = await db.grid_instances.find(
+            {"status": "active"}, {"symbol": 1, "_id": 0}
+        ).to_list(1000)
+        return sorted(
+            {d["symbol"] for d in docs}
+            | {d["symbol"] for d in scalp_docs}
+            | {d["symbol"] for d in grid_docs}
+        )
 
     def _ws_url(self) -> str:
         return f"{BYBIT_WS_PUBLIC}/{exchange.category}"
@@ -2358,6 +2379,7 @@ async def scheduler_loop() -> None:
             await expire_stale_signals(cfg)
             await run_scan()
             await run_scalping_scan()
+            await run_grid_scan()
         except Exception as e:  # noqa: BLE001
             logger.exception("Scan loop error: %s", e)
         await asyncio.sleep(max(60, cfg.scan_interval_minutes * 60))
@@ -2519,6 +2541,7 @@ async def lifespan(_app: FastAPI):
     scan_task = asyncio.create_task(scheduler_loop())
     monitor_task = asyncio.create_task(paper_monitor_loop())
     scalping_monitor_task = asyncio.create_task(scalping_monitor_loop())
+    grid_monitor_task = asyncio.create_task(grid_monitor_loop())
     ws_task = asyncio.create_task(price_feed.run())
     premature_task = asyncio.create_task(premature_stop_loop())
     entry_timing_task = asyncio.create_task(entry_timing_loop())
@@ -2526,6 +2549,7 @@ async def lifespan(_app: FastAPI):
     scan_task.cancel()
     monitor_task.cancel()
     scalping_monitor_task.cancel()
+    grid_monitor_task.cancel()
     ws_task.cancel()
     premature_task.cancel()
     entry_timing_task.cancel()
@@ -3612,5 +3636,405 @@ async def scalping_reset() -> dict[str, Any]:
     wallet = {"cash": 0.0, "total_transferred_in": 0.0}
     await save_scalping_wallet(wallet)
     return {"ok": True, "cash": 0.0}
+
+
+# ---------------------------------------------------------------------------
+# Grid Bot (independent strategy): range/laterale trading with ATR-spaced,
+# wide/sparse grid levels. Long-only spot-style cells: buy at the lower edge
+# of a cell, sell at its upper edge, then re-arm the cell so it can buy again
+# on the next dip — this is what produces the repeated small profits typical
+# of grid trading, but ONLY while the market stays range-bound.
+# ---------------------------------------------------------------------------
+GRID_WALLET_ID = "grid_wallet_singleton"
+GRID_FEE_PCT = 0.001  # 0.10% Bybit spot fee per side
+
+
+async def get_grid_wallet() -> dict[str, Any]:
+    doc = await db.grid_wallet.find_one({"_id": GRID_WALLET_ID}, {"_id": 0})
+    if not doc:
+        doc = {"cash": 0.0, "total_transferred_in": 0.0}
+        await db.grid_wallet.update_one(
+            {"_id": GRID_WALLET_ID}, {"$set": doc}, upsert=True
+        )
+    return doc
+
+
+async def save_grid_wallet(doc: dict[str, Any]) -> None:
+    await db.grid_wallet.update_one(
+        {"_id": GRID_WALLET_ID}, {"$set": doc}, upsert=True
+    )
+
+
+def analyze_grid_eligibility(closes: list[float], cfg: Config) -> dict[str, Any]:
+    """A market is 'laterale' (range-bound, safe for a grid) when both the
+    Bollinger Bands are tight AND the fast/slow EMAs are close together (no
+    clear trend direction). Reuses the same building blocks as the other
+    strategies (_ema, _bollinger)."""
+    ema_f = _ema(closes, cfg.grid_ema_fast)
+    ema_s = _ema(closes, cfg.grid_ema_slow)
+    lower, mid, upper = _bollinger(closes, cfg.grid_bb_period, cfg.grid_bb_std)
+    last = closes[-1]
+    ema_gap_pct = abs(ema_f[-1] - ema_s[-1]) / last * 100 if last else 0.0
+    bb_width_pct = (upper - lower) / mid * 100 if mid else 0.0
+    ranging = (
+        bb_width_pct <= cfg.grid_max_bb_width_pct
+        and ema_gap_pct <= cfg.grid_max_ema_gap_pct
+    )
+    return {
+        "ranging": ranging,
+        "bb_width_pct": round(bb_width_pct, 3),
+        "ema_gap_pct": round(ema_gap_pct, 3),
+    }
+
+
+async def create_grid_instance(symbol: str, cfg: Config) -> Optional[dict[str, Any]]:
+    """Build a new grid for `symbol`: wide/sparse ATR-spaced cells below the
+    current price. Only created when the market is currently 'laterale'."""
+    candles = await exchange.get_klines(symbol, cfg.grid_timeframe)
+    if len(candles) < 60:
+        return None
+    closes = [c[2] for c in candles]
+    highs = [c[3] for c in candles]
+    lows = [c[4] for c in candles]
+
+    elig = analyze_grid_eligibility(closes, cfg)
+    if not elig["ranging"]:
+        return None
+
+    atr = atr_wilder(highs, lows, closes, cfg.grid_atr_period)
+    if not atr or atr <= 0:
+        return None
+
+    center = closes[-1]
+    spacing = atr * cfg.grid_atr_spacing_mult
+    cells: list[dict[str, Any]] = []
+    for i in range(1, cfg.grid_num_levels + 1):
+        cells.append({
+            "index": i,
+            "buy_price": round(center - i * spacing, 8),
+            "sell_price": round(center - (i - 1) * spacing, 8),
+            "status": "armed",  # armed | holding
+        })
+
+    wallet = await get_grid_wallet()
+    notional_per_cell = (wallet.get("cash", 0.0) / max(1, cfg.grid_max_pairs)) / cfg.grid_num_levels
+
+    doc = {
+        "id": str(uuid.uuid4()),
+        "symbol": symbol,
+        "timeframe": cfg.grid_timeframe,
+        "center_price": round(center, 8),
+        "spacing": round(spacing, 8),
+        "atr": round(atr, 8),
+        "cells": cells,
+        "notional_per_cell": round(notional_per_cell, 4),
+        "status": "active",  # active | stopped
+        "stopped_reason": None,
+        "created_at": datetime.now(timezone.utc).isoformat(),
+        "bb_width_pct": elig["bb_width_pct"],
+        "ema_gap_pct": elig["ema_gap_pct"],
+    }
+    await db.grid_instances.insert_one(doc)
+    return doc
+
+
+async def run_grid_scan() -> dict[str, Any]:
+    """Pick eligible (ranging, high-volume) pairs without an active grid yet,
+    and create grids for them up to `grid_max_pairs` concurrent symbols."""
+    cfg = await get_config()
+    if not cfg.grid_enabled:
+        return {"skipped": True, "reason": "grid disabled"}
+    wallet = await get_grid_wallet()
+    if wallet.get("cash", 0.0) <= 1.0:
+        return {"skipped": True, "reason": "no funds in grid wallet"}
+
+    active_instances = await db.grid_instances.find(
+        {"status": "active"}, {"_id": 0, "symbol": 1}
+    ).to_list(100)
+    active_symbols = {g["symbol"] for g in active_instances}
+    slots = cfg.grid_max_pairs - len(active_instances)
+    if slots <= 0:
+        return {"scanned": 0, "created": 0}
+
+    tickers = await exchange.get_tickers()
+    vol_map: dict[str, float] = {}
+    for t in tickers:
+        try:
+            vol_map[t["symbol"]] = float(t.get("volValue") or 0)
+        except (TypeError, ValueError):
+            continue
+
+    symbols_info = await exchange.get_symbols()
+    quotes = {q.strip() for q in (cfg.quote_filter or "").split(",") if q.strip()}
+    candidates: list[str] = []
+    for s in symbols_info:
+        if not s.get("enableTrading"):
+            continue
+        sym = s.get("symbol")
+        if not sym or sym in active_symbols:
+            continue
+        if quotes and s.get("quoteCurrency") not in quotes:
+            continue
+        if cfg.excluded_pairs and sym in cfg.excluded_pairs:
+            continue
+        if cfg.enabled_pairs and sym not in cfg.enabled_pairs:
+            continue
+        if vol_map.get(sym, 0) < cfg.min_24h_volume_usdt:
+            continue
+        candidates.append(sym)
+    candidates.sort(key=lambda s: vol_map.get(s, 0), reverse=True)
+    candidates = candidates[:30]  # cap scan for performance
+
+    created = 0
+    for sym in candidates:
+        if slots <= 0:
+            break
+        grid = await create_grid_instance(sym, cfg)
+        if grid:
+            created += 1
+            slots -= 1
+    return {"scanned": len(candidates), "created": created}
+
+
+async def monitor_grid_instances() -> None:
+    """Check every active grid's cells against the current price: fill armed
+    cells that got dipped into, close holding cells that reached their sell
+    target (re-arming them), and emergency-stop a grid if price breaks well
+    below its lowest cell (the real risk of a long-only range grid)."""
+    instances = await db.grid_instances.find({"status": "active"}, {"_id": 0}).to_list(100)
+    if not instances:
+        return
+    cfg = await get_config()
+    wallet = await get_grid_wallet()
+    cash = wallet.get("cash", 0.0)
+
+    need_rest = any(price_feed.get(g["symbol"]) is None for g in instances)
+    rest_map: dict[str, float] = {}
+    if need_rest:
+        tickers = await exchange.get_tickers()
+        for t in tickers:
+            try:
+                rest_map[t["symbol"]] = float(t.get("last") or 0)
+            except (TypeError, ValueError):
+                continue
+
+    for grid in instances:
+        cur = price_feed.get(grid["symbol"]) or rest_map.get(grid["symbol"])
+        if not cur:
+            continue
+        cells = grid["cells"]
+
+        # Emergency stop: price fell well below the lowest grid cell — this
+        # means the market broke out of the range into a real downtrend.
+        lowest_buy = min(c["buy_price"] for c in cells)
+        if cur < lowest_buy - cfg.grid_range_break_atr_mult * grid["atr"]:
+            holding = await db.grid_positions.find(
+                {"grid_id": grid["id"], "status": "open"}, {"_id": 0}
+            ).to_list(100)
+            for pos in holding:
+                exit_notional = cur * pos["quantity"]
+                fees = (pos["notional"] + exit_notional) * GRID_FEE_PCT
+                pnl = (cur - pos["entry"]) * pos["quantity"] - fees
+                cash += pos["notional"] + pnl
+                await db.grid_positions.update_one(
+                    {"id": pos["id"]},
+                    {"$set": {
+                        "status": "closed", "close_price": cur,
+                        "close_reason": "emergency_stop", "pnl_usdt": round(pnl, 4),
+                        "closed_at": datetime.now(timezone.utc).isoformat(),
+                    }},
+                )
+            await db.grid_instances.update_one(
+                {"id": grid["id"]},
+                {"$set": {"status": "stopped", "stopped_reason": "range_break"}},
+            )
+            continue
+
+        changed = False
+        for cell in cells:
+            if cell["status"] == "armed" and cur <= cell["buy_price"]:
+                notional = grid["notional_per_cell"]
+                if notional < 1.0 or notional > cash:
+                    continue
+                qty = notional / cur
+                await db.grid_positions.insert_one({
+                    "id": str(uuid.uuid4()),
+                    "grid_id": grid["id"],
+                    "symbol": grid["symbol"],
+                    "cell_index": cell["index"],
+                    "entry": cur,
+                    "target": cell["sell_price"],
+                    "quantity": qty,
+                    "notional": notional,
+                    "opened_at": datetime.now(timezone.utc).isoformat(),
+                    "status": "open",
+                })
+                cash -= notional
+                cell["status"] = "holding"
+                changed = True
+            elif cell["status"] == "holding" and cur >= cell["sell_price"]:
+                pos = await db.grid_positions.find_one(
+                    {"grid_id": grid["id"], "cell_index": cell["index"], "status": "open"},
+                    {"_id": 0},
+                )
+                if pos:
+                    exit_notional = cur * pos["quantity"]
+                    fees = (pos["notional"] + exit_notional) * GRID_FEE_PCT
+                    pnl = (cur - pos["entry"]) * pos["quantity"] - fees
+                    cash += pos["notional"] + pnl
+                    await db.grid_positions.update_one(
+                        {"id": pos["id"]},
+                        {"$set": {
+                            "status": "closed", "close_price": cur,
+                            "close_reason": "target", "pnl_usdt": round(pnl, 4),
+                            "closed_at": datetime.now(timezone.utc).isoformat(),
+                        }},
+                    )
+                cell["status"] = "armed"
+                changed = True
+
+        if changed:
+            await db.grid_instances.update_one(
+                {"id": grid["id"]}, {"$set": {"cells": cells}}
+            )
+
+    await save_grid_wallet({**wallet, "cash": cash})
+
+
+async def grid_monitor_loop() -> None:
+    """Check grid fills/closes every 3s using the real-time WS price cache —
+    same reasoning as the scalping monitor: infrequent checks let price slip
+    past a level before the bot notices."""
+    await asyncio.sleep(8)
+    while True:
+        try:
+            await monitor_grid_instances()
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Grid monitor error: %s", e)
+        await asyncio.sleep(3)
+
+
+class GridTransferRequest(BaseModel):
+    amount: float
+
+
+@api.post("/grid/transfer")
+async def grid_transfer(req: GridTransferRequest) -> dict[str, Any]:
+    amount = req.amount
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="L'importo deve essere positivo")
+    main_cash = await get_paper_cash()
+    if amount > main_cash:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Fondi insufficienti nel portafoglio principale (disponibili: {round(main_cash, 2)})",
+        )
+    await set_paper_cash(main_cash - amount)
+    wallet = await get_grid_wallet()
+    wallet["cash"] = wallet.get("cash", 0.0) + amount
+    wallet["total_transferred_in"] = wallet.get("total_transferred_in", 0.0) + amount
+    await save_grid_wallet(wallet)
+    return {"ok": True, "grid_cash": wallet["cash"], "main_cash": main_cash - amount}
+
+
+@api.post("/grid/withdraw")
+async def grid_withdraw(req: GridTransferRequest) -> dict[str, Any]:
+    amount = req.amount
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="L'importo deve essere positivo")
+    wallet = await get_grid_wallet()
+    grid_cash = wallet.get("cash", 0.0)
+    if amount > grid_cash:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Fondi insufficienti nel portafoglio griglia (disponibili: {round(grid_cash, 2)})",
+        )
+    wallet["cash"] = grid_cash - amount
+    wallet["total_transferred_in"] = wallet.get("total_transferred_in", 0.0) - amount
+    await save_grid_wallet(wallet)
+    main_cash = await get_paper_cash()
+    await set_paper_cash(main_cash + amount)
+    return {"ok": True, "grid_cash": wallet["cash"], "main_cash": main_cash + amount}
+
+
+@api.post("/grid/reset")
+async def grid_reset() -> dict[str, Any]:
+    """Reset del Grid Bot: cancella tutte le griglie attive/fermate, le
+    posizioni aperte/chiuse e azzera il portafoglio griglia. NON tocca il
+    portafoglio principale."""
+    await db.grid_positions.delete_many({})
+    await db.grid_instances.delete_many({})
+    await save_grid_wallet({"cash": 0.0, "total_transferred_in": 0.0})
+    return {"ok": True, "cash": 0.0}
+
+
+@api.get("/grid/portfolio")
+async def grid_portfolio() -> dict[str, Any]:
+    wallet = await get_grid_wallet()
+    cash = wallet.get("cash", 0.0)
+    open_positions = await db.grid_positions.find({"status": "open"}, {"_id": 0}).to_list(1000)
+    tickers = await exchange.get_tickers()
+    price_map: dict[str, float] = {}
+    for t in tickers:
+        try:
+            price_map[t["symbol"]] = float(t.get("last") or 0)
+        except (TypeError, ValueError):
+            continue
+    unrealized = 0.0
+    allocated = 0.0
+    enriched: list[dict[str, Any]] = []
+    for p in open_positions:
+        cur = price_map.get(p["symbol"], p["entry"])
+        gross_pnl = (cur - p["entry"]) * p["quantity"]
+        notional = p["entry"] * p["quantity"]
+        exit_notional = cur * p["quantity"]
+        est_fees = (notional + exit_notional) * GRID_FEE_PCT
+        pnl = gross_pnl - est_fees
+        pnl_pct = (pnl / notional) * 100 if notional > 0 else 0.0
+        unrealized += pnl
+        allocated += notional
+        enriched.append({
+            **p, "current_price": round(cur, 8),
+            "unrealized_pnl": round(pnl, 4), "unrealized_pnl_pct": round(pnl_pct, 2),
+        })
+    closed = await db.grid_positions.find(
+        {"status": "closed"}, {"_id": 0}
+    ).sort("closed_at", -1).to_list(200)
+    realized = sum(c.get("pnl_usdt", 0.0) for c in closed)
+    wins = sum(1 for c in closed if c.get("pnl_usdt", 0.0) > 0)
+    losses = sum(1 for c in closed if c.get("pnl_usdt", 0.0) <= 0)
+    settled = wins + losses
+    win_rate = round((wins / settled) * 100, 1) if settled else 0.0
+    equity = cash + allocated + unrealized
+    return {
+        "cash": round(cash, 4),
+        "allocated": round(allocated, 4),
+        "unrealized_pnl": round(unrealized, 4),
+        "realized_pnl": round(realized, 4),
+        "equity": round(equity, 4),
+        "open_positions": enriched,
+        "closed_positions": closed,
+        "open_count": len(enriched),
+        "closed_count": len(closed),
+        "win_rate": win_rate,
+    }
+
+
+@api.get("/grid/instances")
+async def grid_instances_list() -> dict[str, Any]:
+    """Active/stopped grids with their cell levels and current price — this
+    is what the frontend chart uses to draw the grid lines over the price."""
+    instances = await db.grid_instances.find({}, {"_id": 0}).sort("created_at", -1).to_list(50)
+    tickers = await exchange.get_tickers()
+    price_map: dict[str, float] = {}
+    for t in tickers:
+        try:
+            price_map[t["symbol"]] = float(t.get("last") or 0)
+        except (TypeError, ValueError):
+            continue
+    for g in instances:
+        g["current_price"] = price_map.get(g["symbol"])
+    return {"instances": instances, "count": len(instances)}
+
 
 app.include_router(api)
