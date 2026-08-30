@@ -55,35 +55,20 @@ export type Config = {
   rsi_overbought: number;
   rsi_oversold: number;
   pivot_window: number;
-  ema_fast: number;
-  ema_slow: number;
   volume_ma_period: number;
   volume_spike_multiplier: number;
-  require_volume_confirmation: boolean;
-  require_ma_alignment: boolean;
   rr_ratio: number;
   sl_padding_pct: number;
   atr_period: number;
   atr_sl_multiplier: number;
   min_rr_ratio: number;
   premature_lookahead: number;
-  score_fvg: number;
-  score_rsi_divergence: number;
-  score_volume: number;
-  score_ma_cross: number;
-  score_fvg_reversal: number;
-  min_score_threshold: number;
   signal_validity_candles: number;
   fvg_lookback: number;
-  reversal_min_signals: number;
   reversal_rejection_wick_ratio: number;
-  fvg_fill_mode: string;
-  strategy_mode: string;
-  impulse_atr_mult: number;
   consolidation_min_candles: number;
   consolidation_max_atr: number;
   tp1_pct: number;
-  tp2_pct: number;
   post_tp1_advance_pct: number;
   enabled_strategies?: string[];
   fvgr_tp1_pct: number;
@@ -136,6 +121,9 @@ export type PaperPosition = {
   trailing_active?: boolean;
   partial_closed?: boolean;
   current_stop?: number;
+  strategy?: string;
+  tp1?: number;
+  tp2?: number;
 };
 
 export type PaperTrade = {
@@ -151,6 +139,7 @@ export type PaperTrade = {
   outcome: "win" | "loss";
   opened_at: string;
   closed_at: string;
+  strategy?: string;
 };
 
 export type Portfolio = {
@@ -219,11 +208,6 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ trading_mode }),
     }),
-  setStrategyMode: (strategy_mode: "scoring" | "impulse_fvg" | "both") =>
-    req<{ ok: boolean; strategy_mode: string }>("/strategy-mode", {
-      method: "POST",
-      body: JSON.stringify({ strategy_mode }),
-    }),
   exchangeStatus: () =>
     req<{
       connected: boolean;
@@ -284,24 +268,6 @@ export const api = {
       premature_rate: number;
       avg_stop_distance_atr: number;
     }>("/stop-debug/log"),
-  setupDebugLog: () =>
-    req<{
-      logs: {
-        id: string;
-        symbol: string;
-        side: string;
-        score: number;
-        max_score: number;
-        threshold: number;
-        passed: string[];
-        failed: string[];
-        at: string;
-      }[];
-      count: number;
-      fail_counts: Record<string, number>;
-      pass_counts: Record<string, number>;
-      bottleneck: string | null;
-    }>("/setup-debug/log"),
 };
 
 
@@ -467,4 +433,56 @@ export const gridWithdraw = (amount: number) =>
 
 export const gridApi = {
   instances: () => req<{ instances: GridInstance[]; count: number }>("/grid/instances"),
+};
+
+// ---------------------------------------------------------------------------
+// Per-strategy fund allocation ("cross"/shared by default, isolated on
+// request) for the three traditional strategies: counter_trend, fvg_reversal,
+// rsi_reversion.
+// ---------------------------------------------------------------------------
+export type StrategyName = "counter_trend" | "fvg_reversal" | "rsi_reversion";
+
+export type StrategyWalletInfo = {
+  strategy: StrategyName;
+  allocated: boolean;
+  cash: number | null;
+  open_positions: number;
+};
+
+export type StrategyWalletsStatus = {
+  shared_cash: number;
+  strategies: StrategyWalletInfo[];
+};
+
+export type StrategyPortfolio = {
+  strategy: StrategyName;
+  wallet_type: "isolated" | "shared";
+  cash: number;
+  equity: number;
+  unrealized_pnl: number;
+  realized_pnl: number;
+  open_positions: PaperPosition[];
+  closed_trades: PaperTrade[];
+  open_count: number;
+  closed_count: number;
+  win_rate: number;
+};
+
+export const strategyWalletApi = {
+  status: () => req<StrategyWalletsStatus>("/strategy-wallets"),
+  allocate: (strategy: StrategyName, amount: number) =>
+    req<{ ok: boolean; strategy: string; cash: number; main_cash: number }>(
+      `/strategy-wallets/${strategy}/allocate`,
+      { method: "POST", body: JSON.stringify({ amount }) }
+    ),
+  deallocate: (strategy: StrategyName) =>
+    req<{ ok: boolean; strategy: string; main_cash: number }>(
+      `/strategy-wallets/${strategy}/deallocate`,
+      { method: "POST" }
+    ),
+};
+
+export const strategyApi = {
+  portfolio: (strategy: StrategyName) =>
+    req<StrategyPortfolio>(`/strategy/${strategy}/portfolio`),
 };
