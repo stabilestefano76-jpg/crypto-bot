@@ -14,7 +14,7 @@ import os
 import time
 import uuid
 from contextlib import asynccontextmanager
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -1547,8 +1547,10 @@ async def analyze_pair_counter(symbol: str, tf: str, cfg: Config) -> Optional[Si
     direction as the breakout. Confirmations: volume spike on the breakout + the
     RSI filters (HTF extreme, momentum turn, divergence coherent with entry).
     """
+    STRAT = "counter_trend"
     candles = await exchange.get_klines(symbol, tf)
     if len(candles) < 60:
+        await log_reject(symbol, tf, STRAT, "dati insufficienti")
         return None
     opens = [c[1] for c in candles]
     closes = [c[2] for c in candles]
@@ -1558,16 +1560,19 @@ async def analyze_pair_counter(symbol: str, tf: str, cfg: Config) -> Optional[Si
 
     atr = atr_wilder(highs, lows, closes, cfg.atr_period)
     if not atr or atr <= 0:
+        await log_reject(symbol, tf, STRAT, "ATR non calcolabile")
         return None
 
     # Step 1: consolidation box = the K candles BEFORE the last (breakout) candle.
     k = cfg.consolidation_min_candles
     if len(candles) < k + 2:
+        await log_reject(symbol, tf, STRAT, "dati insufficienti")
         return None
     box = candles[-(k + 1):-1]
     box_high = max(c[3] for c in box)
     box_low = min(c[4] for c in box)
     if (box_high - box_low) > cfg.consolidation_max_atr * atr:
+        await log_reject(symbol, tf, STRAT, "consolidamento troppo ampio")
         return None
 
     # Step 2: breakout direction from the last CLOSED candle (close-confirmed).
@@ -1577,6 +1582,7 @@ async def analyze_pair_counter(symbol: str, tf: str, cfg: Config) -> Optional[Si
     elif bo_close < box_low:
         side = "short"
     else:
+        await log_reject(symbol, tf, STRAT, "nessun breakout confermato")
         return None
 
     # --- Trend Exhaustion Score (additive, before the reversal-pattern search) ---
@@ -1588,6 +1594,7 @@ async def analyze_pair_counter(symbol: str, tf: str, cfg: Config) -> Optional[Si
         opens, highs, lows, closes, vols, rsis, exhaustion_trend, cfg
     )
     if not exhaustion["confirmed"]:
+        await log_reject(symbol, tf, STRAT, "esaurimento trend non confermato")
         return None
 
     # Step 3: reversal pattern INSIDE the consolidation (before the breakout).
@@ -1599,6 +1606,7 @@ async def analyze_pair_counter(symbol: str, tf: str, cfg: Config) -> Optional[Si
         [c[4] for c in box], [c[2] for c in box], against,
     )
     if pattern is None:
+        await log_reject(symbol, tf, STRAT, "pattern di inversione non trovato")
         return None
 
     # Step 4: the impulse FVG the reversal contradicts, in the breakout direction.
@@ -1613,6 +1621,7 @@ async def analyze_pair_counter(symbol: str, tf: str, cfg: Config) -> Optional[Si
         targets = [f for f in fvgs if f["kind"] == "bullish" and f["bottom"] < entry]
         targets.sort(key=lambda f: -f["bottom"])
     if not targets:
+        await log_reject(symbol, tf, STRAT, "nessuna FVG target trovata")
         return None
     target_fvg = targets[0]
     far_edge = target_fvg["top"] if side == "long" else target_fvg["bottom"]
@@ -1625,11 +1634,13 @@ async def analyze_pair_counter(symbol: str, tf: str, cfg: Config) -> Optional[Si
         if tp1 <= entry:
             tp1 = entry + (tp2 - entry) * 0.5
         if tp2 <= entry:
+            await log_reject(symbol, tf, STRAT, "target non valido")
             return None
     else:
         if tp1 >= entry:
             tp1 = entry - (entry - tp2) * 0.5
         if tp2 >= entry:
+            await log_reject(symbol, tf, STRAT, "target non valido")
             return None
 
     # Step 5: stop beyond the consolidation box (ATR/structure buffer).
@@ -1637,14 +1648,17 @@ async def analyze_pair_counter(symbol: str, tf: str, cfg: Config) -> Optional[Si
     stop_loss = (box_low - sl_buffer) if side == "long" else (box_high + sl_buffer)
     risk = abs(entry - stop_loss)
     if risk <= 0:
+        await log_reject(symbol, tf, STRAT, "rischio non valido")
         return None
     est_rr = abs(tp2 - entry) / risk
     if est_rr < cfg.min_rr_ratio:
+        await log_reject(symbol, tf, STRAT, "R:R insufficiente")
         return None
 
     # Step 6: confirmations — volume spike on breakout + RSI filters.
     vol_ratio = volume_spike_ratio(vols, cfg.volume_ma_period)
     if vol_ratio < cfg.volume_spike_multiplier:
+        await log_reject(symbol, tf, STRAT, "volume insufficiente sul breakout")
         return None
     # (a) higher-TF extreme (oversold for long / overbought for short)
     htf = _higher_tf(tf)
@@ -1652,17 +1666,22 @@ async def analyze_pair_counter(symbol: str, tf: str, cfg: Config) -> Optional[Si
     hrsis = rsi_wilder([c[2] for c in hcandles], cfg.rsi_period) if len(hcandles) > cfg.rsi_period else []
     hval = next((r for r in reversed(hrsis) if r is not None), None)
     if hval is None:
+        await log_reject(symbol, tf, STRAT, "RSI timeframe alto non disponibile")
         return None
     if side == "long" and hval > cfg.rsi_high_tf_os:
+        await log_reject(symbol, tf, STRAT, "RSI timeframe alto non in ipervenduto")
         return None
     if side == "short" and hval < cfg.rsi_high_tf_ob:
+        await log_reject(symbol, tf, STRAT, "RSI timeframe alto non in ipercomprato")
         return None
     # (b) momentum turn on the trade timeframe
     if not _rsi_momentum_turn(rsis, side, cfg.rsi_overbought, cfg.rsi_oversold):
+        await log_reject(symbol, tf, STRAT, "RSI non in inversione di momentum")
         return None
     # (c) divergence coherent with the trade direction
     div = detect_rsi_divergence(closes, rsis, cfg.pivot_window)
     if (side == "long" and div != "bullish") or (side == "short" and div != "bearish"):
+        await log_reject(symbol, tf, STRAT, "divergenza RSI non coerente")
         return None
 
     return Signal(
@@ -1685,6 +1704,23 @@ async def analyze_pair_counter(symbol: str, tf: str, cfg: Config) -> Optional[Si
     )
 
 
+async def log_reject(symbol: str, tf: str, strategy: str, reason: str) -> None:
+    """Records why a candidate setup was discarded, WITHOUT waiting for it —
+    fire-and-forget so it never slows down the scan. Used to find the real
+    bottleneck across the three strategies instead of guessing at thresholds."""
+    try:
+        await db.strategy_debug_log.insert_one({
+            "id": str(uuid.uuid4()),
+            "symbol": symbol,
+            "timeframe": tf,
+            "strategy": strategy,
+            "reason": reason,
+            "at": datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception:  # noqa: BLE001
+        pass
+
+
 scan_state = ScanState()
 
 
@@ -1693,8 +1729,10 @@ async def analyze_pair_fvg_reversal(symbol: str, tf: str, cfg: Config) -> Option
     strong impulse; the bot trades AGAINST the trend on the retracement back
     toward that FVG. Entry = a reversal candle pattern during the retracement;
     target = inside the trend FVG. Uses its own `fvgr_*` parameters."""
+    STRAT = "fvg_reversal"
     candles = await exchange.get_klines(symbol, tf)
     if len(candles) < 60:
+        await log_reject(symbol, tf, STRAT, "dati insufficienti")
         return None
     opens = [c[1] for c in candles]
     closes = [c[2] for c in candles]
@@ -1703,12 +1741,14 @@ async def analyze_pair_fvg_reversal(symbol: str, tf: str, cfg: Config) -> Option
 
     structure = detect_market_structure(candles, cfg.pivot_window)
     if structure == "range":
+        await log_reject(symbol, tf, STRAT, "trend non definito (mercato laterale)")
         return None
     trend = structure  # 'up' or 'down'
     entry_side = "short" if trend == "up" else "long"  # AGAINST the trend
 
     atr = atr_wilder(highs, lows, closes, cfg.atr_period)
     if not atr or atr <= 0:
+        await log_reject(symbol, tf, STRAT, "ATR non calcolabile")
         return None
 
     # Impulse FVG in the TREND direction (most significant = largest gap).
@@ -1716,6 +1756,7 @@ async def analyze_pair_fvg_reversal(symbol: str, tf: str, cfg: Config) -> Option
     trend_kind = "bullish" if trend == "up" else "bearish"
     impulse_fvgs = [f for f in fvgs if f["kind"] == trend_kind]
     if not impulse_fvgs:
+        await log_reject(symbol, tf, STRAT, "nessuna FVG di impulso trovata")
         return None
     origin = max(impulse_fvgs, key=lambda f: f["gap"])
 
@@ -1725,12 +1766,14 @@ async def analyze_pair_fvg_reversal(symbol: str, tf: str, cfg: Config) -> Option
         opens, highs, lows, closes, [c[5] for c in candles], rsis, trend, cfg
     )
     if not exhaustion["confirmed"]:
+        await log_reject(symbol, tf, STRAT, "esaurimento trend non confermato")
         return None
 
     # Reversal pattern AGAINST the trend during the retracement.
     against = "bearish" if trend == "up" else "bullish"
     pattern = detect_reversal_pattern(opens, highs, lows, closes, against)
     if pattern is None:
+        await log_reject(symbol, tf, STRAT, "pattern di inversione non trovato")
         return None
 
     # RSI filters (independent thresholds).
@@ -1739,15 +1782,20 @@ async def analyze_pair_fvg_reversal(symbol: str, tf: str, cfg: Config) -> Option
     hrsis = rsi_wilder([c[2] for c in hcandles], cfg.rsi_period) if len(hcandles) > cfg.rsi_period else []
     hval = next((r for r in reversed(hrsis) if r is not None), None)
     if hval is None:
+        await log_reject(symbol, tf, STRAT, "RSI timeframe alto non disponibile")
         return None
     if entry_side == "long" and hval > cfg.fvgr_rsi_high_tf_os:
+        await log_reject(symbol, tf, STRAT, "RSI timeframe alto non in ipervenduto")
         return None
     if entry_side == "short" and hval < cfg.fvgr_rsi_high_tf_ob:
+        await log_reject(symbol, tf, STRAT, "RSI timeframe alto non in ipercomprato")
         return None
     if not _rsi_momentum_turn(rsis, entry_side, cfg.rsi_overbought, cfg.rsi_oversold):
+        await log_reject(symbol, tf, STRAT, "RSI non in inversione di momentum")
         return None
     div = detect_rsi_divergence(closes, rsis, cfg.pivot_window)
     if (entry_side == "long" and div != "bullish") or (entry_side == "short" and div != "bearish"):
+        await log_reject(symbol, tf, STRAT, "divergenza RSI non coerente")
         return None
 
     entry = closes[-1]
@@ -1767,11 +1815,14 @@ async def analyze_pair_fvg_reversal(symbol: str, tf: str, cfg: Config) -> Option
         tp2 = mid
     risk = abs(entry - stop_loss)
     if risk <= 0:
+        await log_reject(symbol, tf, STRAT, "rischio non valido")
         return None
     if (entry_side == "long" and tp1 <= entry) or (entry_side == "short" and tp1 >= entry):
+        await log_reject(symbol, tf, STRAT, "target non valido")
         return None
     est_rr = abs(tp1 - entry) / risk
     if est_rr < cfg.fvgr_min_rr_ratio:
+        await log_reject(symbol, tf, STRAT, "R:R insufficiente")
         return None
 
     vol_ratio = volume_spike_ratio([c[5] for c in candles], cfg.volume_ma_period)
@@ -1807,8 +1858,10 @@ async def analyze_pair_rsi_reversion(symbol: str, tf: str, cfg: Config) -> Optio
     overbought/oversold in spot eventually rebalances — the catastrophic
     stop exists only to cap the rare case where it doesn't (e.g. a
     structural breakdown, not just ordinary volatility)."""
+    STRAT = "rsi_reversion"
     candles = await exchange.get_klines(symbol, tf)
     if len(candles) < 60:
+        await log_reject(symbol, tf, STRAT, "dati insufficienti")
         return None
     closes = [c[2] for c in candles]
     highs = [c[3] for c in candles]
@@ -1816,6 +1869,7 @@ async def analyze_pair_rsi_reversion(symbol: str, tf: str, cfg: Config) -> Optio
 
     rsis = rsi_wilder(closes, cfg.rsi_period)
     if rsis[-1] is None:
+        await log_reject(symbol, tf, STRAT, "RSI non calcolabile")
         return None
 
     ob = cfg.rsi_rev_overbought
@@ -1844,18 +1898,22 @@ async def analyze_pair_rsi_reversion(symbol: str, tf: str, cfg: Config) -> Optio
     elif rsis[-1] > os_ and consecutive_extreme_before_last(os_, above=False) >= min_extreme:
         side = "long"
     if side is None:
+        await log_reject(symbol, tf, STRAT, "nessun rientro da zona estrema")
         return None
 
     # Filter 2: genuine RSI/price divergence, not just a brief dip back inside
     # the bands (reuses the same detector as the other strategies).
     divergence = detect_rsi_divergence(closes, rsis, cfg.pivot_window)
     if side == "short" and divergence != "bearish":
+        await log_reject(symbol, tf, STRAT, "divergenza RSI non coerente")
         return None
     if side == "long" and divergence != "bullish":
+        await log_reject(symbol, tf, STRAT, "divergenza RSI non coerente")
         return None
 
     atr = atr_wilder(highs, lows, closes, cfg.atr_period)
     if not atr or atr <= 0:
+        await log_reject(symbol, tf, STRAT, "ATR non calcolabile")
         return None
 
     entry = closes[-1]
@@ -1864,11 +1922,13 @@ async def analyze_pair_rsi_reversion(symbol: str, tf: str, cfg: Config) -> Optio
 
     if side == "short":
         if sma >= entry:
+            await log_reject(symbol, tf, STRAT, "nessun margine di rientro (prezzo già sulla media)")
             return None  # price already at/below its average, no reversion left to capture
         take_profit = sma
         stop_loss = entry + catastrophic_buffer
     else:
         if sma <= entry:
+            await log_reject(symbol, tf, STRAT, "nessun margine di rientro (prezzo già sulla media)")
             return None
         take_profit = sma
         stop_loss = entry - catastrophic_buffer
@@ -1876,6 +1936,7 @@ async def analyze_pair_rsi_reversion(symbol: str, tf: str, cfg: Config) -> Optio
     risk = abs(entry - stop_loss)
     reward = abs(take_profit - entry)
     if risk <= 0 or reward <= 0:
+        await log_reject(symbol, tf, STRAT, "target/stop non validi")
         return None
 
     vol_ratio = volume_spike_ratio([c[5] for c in candles], cfg.volume_ma_period)
@@ -2545,6 +2606,38 @@ async def entry_timing_log(limit: int = 300) -> dict[str, Any]:
         "pending": pending,
         "reach_rate": reach_rate,
         "avg_candles_to_entry_by_timeframe": avg_candles_by_tf,
+    }
+
+
+@api.get("/strategy-debug/log")
+async def strategy_debug_log(limit: int = 1000, minutes: int = 180) -> dict[str, Any]:
+    """Bottleneck analysis for the 3 traditional strategies: which specific
+    check rejects the most candidates, broken down per strategy. Looks at
+    the last `minutes` of scans (default 3h) so it reflects current market
+    conditions rather than the whole history."""
+    since = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
+    cursor = db.strategy_debug_log.find(
+        {"at": {"$gte": since}}, {"_id": 0}
+    ).sort("at", -1).limit(limit)
+    logs = await cursor.to_list(length=limit)
+
+    by_strategy: dict[str, dict[str, int]] = {}
+    for l in logs:
+        strat = l.get("strategy", "unknown")
+        reason = l.get("reason", "unknown")
+        by_strategy.setdefault(strat, {})
+        by_strategy[strat][reason] = by_strategy[strat].get(reason, 0) + 1
+
+    bottleneck_by_strategy = {
+        strat: max(reasons, key=reasons.get) if reasons else None
+        for strat, reasons in by_strategy.items()
+    }
+
+    return {
+        "window_minutes": minutes,
+        "count": len(logs),
+        "reason_counts_by_strategy": by_strategy,
+        "bottleneck_by_strategy": bottleneck_by_strategy,
     }
 
 
