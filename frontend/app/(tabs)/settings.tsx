@@ -531,20 +531,30 @@ function NumRow({
 }) {
   const [txt, setTxt] = useState(String(value));
   useEffect(() => setTxt(String(value)), [value]);
+  const commit = (raw: string) => {
+    const n = Number(raw);
+    if (!Number.isFinite(n)) return;
+    onChange(step && step < 1 ? Math.round(n * 100) / 100 : n);
+  };
   return (
     <View style={styles.formRow}>
       <Text style={styles.formLabel}>{label}</Text>
       <TextInput
         style={styles.input}
         value={txt}
-        onChangeText={setTxt}
+        onChangeText={(t) => {
+          setTxt(t);
+          // Commit on every valid keystroke (not just on blur/end-editing):
+          // onEndEditing/onBlur don't fire reliably on every platform (e.g.
+          // web), which could leave a typed value un-saved even though it
+          // looks confirmed on screen.
+          commit(t);
+        }}
         onEndEditing={() => {
           const n = Number(txt);
           if (!Number.isFinite(n)) {
             setTxt(String(value));
-            return;
           }
-          onChange(step && step < 1 ? Math.round(n * 100) / 100 : n);
         }}
         keyboardType="decimal-pad"
         testID={testID}
