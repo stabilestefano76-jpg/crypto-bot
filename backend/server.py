@@ -70,25 +70,14 @@ class Config(BaseModel):
     rsi_overbought: float = 70.0
     rsi_oversold: float = 30.0
     pivot_window: int = 5
-    ema_fast: int = 20
-    ema_slow: int = 50
     volume_ma_period: int = 20
     volume_spike_multiplier: float = 1.5
-    require_volume_confirmation: bool = False
-    require_ma_alignment: bool = False
     rr_ratio: float = 2.0
     sl_padding_pct: float = 0.3  # min % buffer beyond FVG edge (fallback)
     atr_period: int = 14
     atr_sl_multiplier: float = 1.5  # SL buffer = max(atr_mult*ATR, sl_padding_pct)
     min_rr_ratio: float = 1.5  # reject setups below this estimated R:R
     premature_lookahead: int = 20  # candles to check if target would've been hit
-    # --- Scoring system (replaces rigid AND logic) ---
-    score_fvg: float = 2.0
-    score_rsi_divergence: float = 2.0
-    score_volume: float = 1.0
-    score_ma_cross: float = 1.0
-    score_fvg_reversal: float = 2.0  # NEW: confirmed reversal inside FVG zone
-    min_score_threshold: float = 4.0
 
     # --- Scalping Bot (independent strategy) ---
     scalping_enabled: bool = True
@@ -104,10 +93,7 @@ class Config(BaseModel):
     scalping_invalidation_buffer_pct: float = 0.15  # min % beyond VWAP required, on top of the EMA cross, to count as invalidated
     signal_validity_candles: int = 5  # a condition counts if it happened within N bars
     fvg_lookback: int = 40  # how far back to look for an open FVG
-    # --- FVG reversal / fill entry extension ---
-    reversal_min_signals: int = 2  # min reversal sub-signals to confirm
     reversal_rejection_wick_ratio: float = 1.5  # wick/body ratio for rejection candle
-    fvg_fill_mode: str = "opposite_edge"  # "opposite_edge" or "midpoint" (50% CE)
     max_pairs_per_scan: int = 200  # cap for MVP performance
     enabled_pairs: list[str] = Field(default_factory=list)  # empty = all matching filter
     excluded_pairs: list[str] = Field(default_factory=list)
@@ -125,20 +111,17 @@ class Config(BaseModel):
     partial_close_r: float = 1.0
     partial_close_pct: float = 35.0  # % of position closed at partial_close_r
     liq_min_distance_pct: float = 25.0  # leverage: min distance from liquidation (%)
-    # --- Impulse-FVG + Consolidation strategy (additive, selectable) ---
-    strategy_mode: str = "scoring"  # "scoring" | "impulse_fvg" | "counter_trend" | "both"
-    impulse_atr_mult: float = 1.5  # impulse candle range >= this * ATR
+    # --- Consolidation-breakout params (shared by counter_trend) ---
     consolidation_min_candles: int = 3
     consolidation_max_atr: float = 1.5  # channel width <= this * ATR
     tp1_pct: float = 65.0  # % closed at TP1
-    tp2_pct: float = 35.0  # % remainder to TP2 / trailing
     # --- Counter-trend strategy RSI filters ---
     rsi_high_tf_ob: float = 80.0  # higher-TF overbought (short)
     rsi_high_tf_os: float = 20.0  # higher-TF oversold (long)
     trailing_pct_from_entry: float = 1.0  # counter-trend trailing distance %
     post_tp1_advance_pct: float = 0.5  # % beyond TP1 before moving SL to TP1 (net fees)
     # --- Parallel strategy selection ---
-    enabled_strategies: list[str] = Field(default_factory=list)  # empty = derive from strategy_mode
+    enabled_strategies: list[str] = Field(default_factory=list)  # empty = ["counter_trend", "fvg_reversal"]
     # --- FVG Reversal strategy (independent params, contro-trend on retracement) ---
     fvgr_rsi_high_tf_ob: float = 80.0
     fvgr_rsi_high_tf_os: float = 20.0
@@ -183,7 +166,7 @@ class Signal(BaseModel):
     score: float = 0.0  # weighted confluence score
     max_score: float = 0.0  # max achievable score with active weights
     reversal_signals: list[str] = Field(default_factory=list)  # FVG reversal contributors
-    strategy: str = "scoring"  # "scoring" | "impulse_fvg"
+    strategy: str = "counter_trend"  # "counter_trend" | "fvg_reversal"
     tp1: float = 0.0
     tp2: float = 0.0
     consolidation_high: float = 0.0
@@ -243,7 +226,7 @@ class PaperPosition(BaseModel):
     partial_closed: bool = False
     last_trail_candle_t: float = 0.0  # last candle time used to recompute trailing
     liquidation_price: float = 0.0  # leverage only (0 = unknown/spot)
-    strategy: str = "scoring"
+    strategy: str = "counter_trend"
     tp1: float = 0.0
     tp2: float = 0.0
 
@@ -329,19 +312,6 @@ def rsi_wilder(closes: list[float], period: int = 14) -> list[Optional[float]]:
     return rsis
 
 
-def ema(values: list[float], period: int) -> list[Optional[float]]:
-    if len(values) < period:
-        return [None] * len(values)
-    k = 2.0 / (period + 1)
-    out: list[Optional[float]] = [None] * (period - 1)
-    seed = sum(values[:period]) / period
-    out.append(seed)
-    prev = seed
-    for v in values[period:]:
-        prev = v * k + prev * (1 - k)
-        out.append(prev)
-    return out
-
 
 def detect_pivots(series: list[float], window: int = 5) -> tuple[list[int], list[int]]:
     """Return (lows, highs) indices where index is a local pivot."""
@@ -381,48 +351,6 @@ def detect_rsi_divergence(
     return None
 
 
-def detect_fvg(
-    highs: list[float], lows: list[float], lookback: int = 40
-) -> Optional[dict[str, Any]]:
-    """Return the most recent still-open FVG in the last `lookback` bars.
-
-    Bullish FVG: high of candle[i-2] < low of candle[i]. Gap zone = [high[i-2], low[i]].
-    Bearish FVG: low of candle[i-2] > high of candle[i]. Gap zone = [high[i], low[i-2]].
-    A zone is still open if price hasn't fully traversed it after formation.
-    """
-    n = len(highs)
-    start = max(2, n - lookback)
-    open_fvgs: list[dict[str, Any]] = []
-    for i in range(start, n):
-        # Bullish
-        if highs[i - 2] < lows[i]:
-            top, bottom = lows[i], highs[i - 2]
-            filled = False
-            for j in range(i + 1, n):
-                if lows[j] <= bottom:
-                    filled = True
-                    break
-            if not filled:
-                open_fvgs.append(
-                    {"kind": "bullish", "top": top, "bottom": bottom, "index": i}
-                )
-        # Bearish
-        if lows[i - 2] > highs[i]:
-            top, bottom = lows[i - 2], highs[i]
-            filled = False
-            for j in range(i + 1, n):
-                if highs[j] >= top:
-                    filled = True
-                    break
-            if not filled:
-                open_fvgs.append(
-                    {"kind": "bearish", "top": top, "bottom": bottom, "index": i}
-                )
-    if not open_fvgs:
-        return None
-    return open_fvgs[-1]
-
-
 def volume_spike_ratio(volumes: list[float], period: int = 20) -> float:
     if len(volumes) < period + 1:
         return 1.0
@@ -453,72 +381,6 @@ def atr_wilder(
     for tr in trs[period:]:
         atr = (atr * (period - 1) + tr) / period
     return atr
-
-
-def detect_fvg_reversal(
-    opens: list[float],
-    highs: list[float],
-    lows: list[float],
-    closes: list[float],
-    volumes: list[float],
-    rsis: list[Optional[float]],
-    fvg: dict[str, Any],
-    side: str,
-    cfg: Config,
-) -> dict[str, Any]:
-    """Detect a confirmed reversal INSIDE the FVG zone (price rejecting the
-    zone edge to go fill it), reusing existing RSI-divergence logic.
-
-    Returns {"confirmed": bool, "signals": [names]}.
-    'side' == 'long' means a bullish FVG acting as support (expected bounce up);
-    'short' means a bearish FVG acting as resistance (expected drop down).
-    """
-    signals: list[str] = []
-    n = len(closes)
-    if n < 8:
-        return {"confirmed": False, "signals": signals}
-
-    o, h, l, c = opens[-1], highs[-1], lows[-1], closes[-1]
-    body = abs(c - o)
-    if body <= 0:
-        body = (h - l) * 0.25 or 1e-9
-    upper_wick = h - max(o, c)
-    lower_wick = min(o, c) - l
-    ratio = cfg.reversal_rejection_wick_ratio
-
-    # 1) Rejection candle: long wick in the fill direction.
-    if side == "long":
-        if lower_wick >= ratio * body and lower_wick > upper_wick:
-            signals.append("Rejection Candle")
-    else:
-        if upper_wick >= ratio * body and upper_wick > lower_wick:
-            signals.append("Rejection Candle")
-
-    # 2) Volume spike on the rejection candle.
-    if volume_spike_ratio(volumes, cfg.volume_ma_period) >= cfg.volume_spike_multiplier:
-        signals.append("Reversal Volume")
-
-    # 3) Change of character: break of the local mini swing on the last bars.
-    window = max(3, cfg.pivot_window)
-    prior = slice(-(window + 1), -1)
-    if side == "long":
-        local_high = max(highs[prior]) if highs[prior] else h
-        if c > local_high:
-            signals.append("Change of Character")
-    else:
-        local_low = min(lows[prior]) if lows[prior] else l
-        if c < local_low:
-            signals.append("Change of Character")
-
-    # 4) RSI divergence in the FVG direction (reuse existing detector).
-    divergence = detect_rsi_divergence(closes, rsis, cfg.pivot_window)
-    if (divergence == "bullish" and side == "long") or (
-        divergence == "bearish" and side == "short"
-    ):
-        signals.append("RSI Divergence (FVG)")
-
-    confirmed = len(signals) >= cfg.reversal_min_signals
-    return {"confirmed": confirmed, "signals": signals}
 
 
 def detect_trend_exhaustion(
@@ -1008,7 +870,7 @@ async def open_paper_position(signal: dict[str, Any]) -> Optional[PaperPosition]
         opened_at=datetime.now(timezone.utc).isoformat(),
         current_stop=round(signal["stop_loss"], 8),
         initial_risk=round(abs(fill_price - signal["stop_loss"]), 8),
-        strategy=signal.get("strategy", "scoring"),
+        strategy=signal.get("strategy", "counter_trend"),
         tp1=float(signal.get("tp1", 0.0)),
         tp2=float(signal.get("tp2", 0.0)),
     )
@@ -1333,47 +1195,6 @@ async def _last_closed_close(symbol: str, tf: str) -> Optional[float]:
     return candles[-2][2]
 
 
-async def manage_impulse_position(pos: dict[str, Any], price: float, cfg: Config) -> dict[str, Any]:
-    """Impulse strategy execution: TP1 (close tp1_pct on candle-close beyond TP1,
-    then move remainder to breakeven), TP2 for the rest, trailing fallback if
-    no TP2. Uses close-confirmation (not wick)."""
-    tf = pos.get("timeframe", "1h")
-    tp1 = float(pos.get("tp1") or 0)
-    tp2 = float(pos.get("tp2") or 0)
-    long = pos["side"] == "long"
-    last_close = await _last_closed_close(pos["symbol"], tf)
-    if last_close is None:
-        return pos
-
-    if not pos.get("partial_closed"):
-        hit_tp1 = last_close >= tp1 if long else last_close <= tp1
-        if tp1 > 0 and hit_tp1:
-            remain = await _close_fraction(pos, tp1, cfg.tp1_pct / 100, "tp1")
-            pcfg = await get_paper_config()
-            be = await compute_breakeven(pos, cfg, pcfg.trading_mode)
-            await db.paper_positions.update_one(
-                {"id": pos["id"]},
-                {"$set": {"current_stop": round(be, 8), "breakeven_active": True,
-                          "quantity": round(remain, 8)}},
-            )
-            pos = {**pos, "current_stop": be, "breakeven_active": True,
-                   "partial_closed": True, "quantity": remain}
-        return pos
-
-    # After TP1: manage the remainder
-    if tp2 > 0:
-        hit_tp2 = last_close >= tp2 if long else last_close <= tp2
-        if hit_tp2:
-            await close_paper_position(pos, tp2, "win")
-            return {**pos, "quantity": 0}
-    else:
-        trail = await apply_trailing_manager(pos, price, cfg)
-        if trail is not None:
-            await db.paper_positions.update_one(
-                {"id": pos["id"]}, {"$set": {"current_stop": round(trail, 8), "trailing_active": True}}
-            )
-            pos = {**pos, "current_stop": trail, "trailing_active": True}
-    return pos
 
 
 
@@ -1487,9 +1308,6 @@ async def manage_open_position(pos: dict[str, Any], price: float, cfg: Config) -
     """Run the 3 additive managers + partial close. Returns the possibly-updated
     position dict (with fresh current_stop)."""
     updates: dict[str, Any] = {}
-    # Impulse strategy has its own TP1/TP2 execution path.
-    if pos.get("strategy") == "impulse_fvg":
-        return await manage_impulse_position(pos, price, cfg)
     # Pre-FVG reversal strategy has its own TP1/TP2 + post-TP1 stop path.
     if pos.get("strategy") == "counter_trend":
         return await manage_counter_position(pos, price, cfg)
@@ -1548,7 +1366,7 @@ async def monitor_paper_positions() -> None:
         # For impulse strategy the primary fixed target is TP2 (if any); the base
         # take_profit equals TP1 which the manager already handles on candle close.
         tp_check = pos["take_profit"]
-        if pos.get("strategy") in ("impulse_fvg", "counter_trend", "fvg_reversal"):
+        if pos.get("strategy") in ("counter_trend", "fvg_reversal"):
             # Fixed TP2 close only AFTER TP1 partial is taken; before that the
             # manager handles TP1 on candle close. If no TP2, rely on trailing.
             if pos.get("partial_closed") and float(pos.get("tp2") or 0) > 0:
@@ -1565,206 +1383,6 @@ async def monitor_paper_positions() -> None:
                 await close_paper_position(pos, active_stop, "loss")
             elif tp_check and price <= tp_check:
                 await close_paper_position(pos, tp_check, "win")
-
-
-# ---------------------------------------------------------------------------
-# Signal generation
-# ---------------------------------------------------------------------------
-async def analyze_pair(symbol: str, tf: str, cfg: Config) -> Optional[Signal]:
-    candles = await exchange.get_klines(symbol, tf)
-    if len(candles) < 60:
-        return None
-
-    closes = [c[2] for c in candles]
-    highs = [c[3] for c in candles]
-    lows = [c[4] for c in candles]
-    vols = [c[5] for c in candles]
-    opens = [c[1] for c in candles]
-
-    rsis = rsi_wilder(closes, cfg.rsi_period)
-
-    # An FVG is required for the trade STRUCTURE (entry/SL levels). It does not
-    # need to form on the current candle: detect_fvg looks back over fvg_lookback
-    # bars and only returns zones that are still open (unmitigated).
-    fvg = detect_fvg(highs, lows, lookback=cfg.fvg_lookback)
-    if fvg is None:
-        return None
-
-    side = "long" if fvg["kind"] == "bullish" else "short"
-    price = closes[-1]
-
-    # ATR on the entry timeframe — basis for a volatility-aware stop.
-    atr = atr_wilder(highs, lows, closes, cfg.atr_period)
-    if atr is None or atr <= 0:
-        return None
-
-    # SL buffer = max(atr_multiplier * ATR, sl_padding_pct % of price).
-    atr_buffer = cfg.atr_sl_multiplier * atr
-    pct_buffer = price * (cfg.sl_padding_pct / 100)
-    sl_buffer = max(atr_buffer, pct_buffer)
-
-    if side == "long":
-        entry = fvg["top"]
-        if price < fvg["bottom"] or price > entry * 1.05:
-            return None
-        stop_loss = fvg["bottom"] - sl_buffer
-        risk = entry - stop_loss
-        if risk <= 0:
-            return None
-        take_profit = entry + risk * cfg.rr_ratio
-    else:
-        entry = fvg["bottom"]
-        if price > fvg["top"] or price < entry * 0.95:
-            return None
-        stop_loss = fvg["top"] + sl_buffer
-        risk = stop_loss - entry
-        if risk <= 0:
-            return None
-        take_profit = entry - risk * cfg.rr_ratio
-
-    # Minimum estimated R:R gate — independent of the confluence score.
-    reward = abs(take_profit - entry)
-    est_rr = reward / risk if risk > 0 else 0
-    if est_rr < cfg.min_rr_ratio:
-        return None
-
-    # ---------------- SCORING SYSTEM (replaces rigid AND) ----------------
-    # Each satisfied condition adds its configurable weight. A trade opens only
-    # if the total reaches min_score_threshold — no longer requiring ALL filters.
-    score = 0.0
-    passed: list[str] = []
-    failed: list[str] = []
-    breakdown: dict[str, dict[str, Any]] = {}
-
-    def add(name: str, ok: bool, weight: float) -> None:
-        nonlocal score
-        breakdown[name] = {"passed": ok, "weight": weight}
-        if ok:
-            score += weight
-            passed.append(name)
-        else:
-            failed.append(name)
-
-    # FVG valid & unmitigated (aligned with side by construction)
-    add("FVG Zone", True, cfg.score_fvg)
-
-    # RSI divergence confirmed in the FVG direction, within the validity window
-    divergence = detect_rsi_divergence(closes, rsis, cfg.pivot_window)
-    div_ok = (divergence == "bullish" and side == "long") or (
-        divergence == "bearish" and side == "short"
-    )
-    add("RSI Divergence", div_ok, cfg.score_rsi_divergence)
-
-    # Volume above its moving average
-    vol_ratio = volume_spike_ratio(vols, cfg.volume_ma_period)
-    add("Volume Spike", vol_ratio >= cfg.volume_spike_multiplier, cfg.score_volume)
-
-    # EMA cross aligned with trade direction
-    ema_f = ema(closes, cfg.ema_fast)
-    ema_s = ema(closes, cfg.ema_slow)
-    ma_ok = False
-    if ema_f[-1] is not None and ema_s[-1] is not None:
-        ma_ok = (side == "long" and ema_f[-1] > ema_s[-1]) or (
-            side == "short" and ema_f[-1] < ema_s[-1]
-        )
-    add("EMA Trend", ma_ok, cfg.score_ma_cross)
-
-    # NEW scored condition: confirmed reversal INSIDE the FVG zone. Reuses the
-    # existing RSI-divergence detector; contributes into THIS same score.
-    reversal = detect_fvg_reversal(
-        opens, highs, lows, closes, vols, rsis, fvg, side, cfg
-    )
-    add("FVG Reversal", reversal["confirmed"], cfg.score_fvg_reversal)
-
-    max_score = (
-        cfg.score_fvg
-        + cfg.score_rsi_divergence
-        + cfg.score_volume
-        + cfg.score_ma_cross
-        + cfg.score_fvg_reversal
-    )
-
-    if score < cfg.min_score_threshold:
-        # DEBUG: record the discarded setup so the user can see which filter is
-        # the real bottleneck blocking trades.
-        try:
-            await db.setup_debug_log.insert_one({
-                "id": str(uuid.uuid4()),
-                "symbol": symbol,
-                "timeframe": tf,
-                "side": side,
-                "score": round(score, 2),
-                "max_score": round(max_score, 2),
-                "threshold": cfg.min_score_threshold,
-                "passed": passed,
-                "failed": failed,
-                "breakdown": breakdown,
-                "reversal_signals": reversal["signals"],
-                "at": datetime.now(timezone.utc).isoformat(),
-            })
-        except Exception:  # noqa: BLE001
-            pass
-        return None
-
-    # ---- FVG-fill target override (only when reversal is an ACTIVE condition) ----
-    # The ATR/structural stop is left UNCHANGED. Only entry/target adapt to the
-    # reversal-to-fill scenario, then R:R is re-validated with the same stop.
-    reversal_signals: list[str] = reversal["signals"] if reversal["confirmed"] else []
-    if reversal["confirmed"]:
-        span = fvg["top"] - fvg["bottom"]
-        midpoint = fvg["bottom"] + span * 0.5
-        if side == "long":
-            fill_target = fvg["top"] if cfg.fvg_fill_mode == "opposite_edge" else midpoint
-            # Invalidation: price swept the FVG on the opposite side of the fill.
-            if closes[-1] < fvg["bottom"]:
-                return None
-            # Target already reached or too close → discard.
-            if price >= fill_target:
-                return None
-            entry = price  # enter at the rejection close, inside the zone
-            stop_loss = fvg["bottom"] - sl_buffer  # UNCHANGED ATR/structural stop
-            risk = entry - stop_loss
-            take_profit = fill_target
-        else:
-            fill_target = fvg["bottom"] if cfg.fvg_fill_mode == "opposite_edge" else midpoint
-            if closes[-1] > fvg["top"]:
-                return None
-            if price <= fill_target:
-                return None
-            entry = price
-            stop_loss = fvg["top"] + sl_buffer  # UNCHANGED ATR/structural stop
-            risk = stop_loss - entry
-            take_profit = fill_target
-
-        if risk <= 0:
-            return None
-        reward = abs(take_profit - entry)
-        est_rr = reward / risk if risk > 0 else 0
-        # Re-apply the SAME configured minimum R:R gate.
-        if est_rr < cfg.min_rr_ratio:
-            return None
-
-    return Signal(
-        symbol=symbol,
-        timeframe=tf,
-        side=side,
-        entry=round(entry, 8),
-        stop_loss=round(stop_loss, 8),
-        take_profit=round(take_profit, 8),
-        rr_ratio=cfg.rr_ratio,
-        confirmations=passed,
-        strength=len(passed),
-        score=round(score, 2),
-        max_score=round(max_score, 2),
-        reversal_signals=reversal_signals,
-        rsi_value=round(rsis[-1] or 0, 2),
-        volume_ratio=round(vol_ratio, 2),
-        created_at=datetime.now(timezone.utc).isoformat(),
-        fvg_top=round(fvg["top"], 8),
-        fvg_bottom=round(fvg["bottom"], 8),
-        atr=round(atr, 8),
-        atr_multiplier=cfg.atr_sl_multiplier,
-    )
 
 
 # ===========================================================================
@@ -1810,94 +1428,6 @@ def detect_all_fvgs(highs: list[float], lows: list[float], lookback: int) -> lis
     return out
 
 
-def find_consolidation(candles: list[list[float]], cfg: Config, side: str, atr: float
-                       ) -> Optional[dict[str, float]]:
-    """Rectangle from the K candles BEFORE the last (breakout) candle, tight
-    within consolidation_max_atr*ATR. Confirms a CLOSE breakout in trade side."""
-    k = cfg.consolidation_min_candles
-    if len(candles) < k + 2:
-        return None
-    prior = candles[-(k + 1):-1]  # exclude the breakout candle (last)
-    rect_high = max(c[3] for c in prior)
-    rect_low = min(c[4] for c in prior)
-    if (rect_high - rect_low) > cfg.consolidation_max_atr * atr:
-        return None
-    bo_close = candles[-1][2]
-    if side == "long" and bo_close > rect_high:
-        return {"high": rect_high, "low": rect_low}
-    if side == "short" and bo_close < rect_low:
-        return {"high": rect_high, "low": rect_low}
-    return None
-
-
-async def analyze_pair_impulse(symbol: str, tf: str, cfg: Config) -> Optional[Signal]:
-    """Impulse-FVG strategy: trend -> origin impulse FVG (TP2) -> consolidation
-    breakout (entry) -> SL under/over the box -> TP1 nearest FVG, TP2 origin FVG."""
-    candles = await exchange.get_klines(symbol, tf)
-    if len(candles) < 60:
-        return None
-    highs = [c[3] for c in candles]
-    lows = [c[4] for c in candles]
-    closes = [c[2] for c in candles]
-
-    structure = detect_market_structure(candles, cfg.pivot_window)
-    if structure == "range":
-        return None
-    side = "long" if structure == "up" else "short"
-
-    atr = atr_wilder(highs, lows, closes, cfg.atr_period)
-    if not atr or atr <= 0:
-        return None
-
-    # Consolidation breakout in the trend direction (entry trigger).
-    rect = find_consolidation(candles, cfg, side, atr)
-    if rect is None:
-        return None
-
-    entry = closes[-1]
-    sl_buffer = max(cfg.atr_sl_multiplier * atr, entry * (cfg.sl_padding_pct / 100))
-    if side == "long":
-        stop_loss = rect["low"] - sl_buffer
-    else:
-        stop_loss = rect["high"] + sl_buffer
-    risk = abs(entry - stop_loss)
-    if risk <= 0:
-        return None
-
-    # Unfilled FVGs in trade direction, positioned as targets beyond entry.
-    fvgs = detect_all_fvgs(highs, lows, cfg.fvg_lookback)
-    if side == "long":
-        targets = [f for f in fvgs if f["kind"] == "bullish" and f["bottom"] > entry]
-        targets.sort(key=lambda f: f["bottom"])  # nearest first
-        tp_edge = lambda f: f["bottom"]
-    else:
-        targets = [f for f in fvgs if f["kind"] == "bearish" and f["top"] < entry]
-        targets.sort(key=lambda f: -f["top"])  # nearest first
-        tp_edge = lambda f: f["top"]
-
-    if not targets:
-        return None  # need at least TP1
-    tp1 = tp_edge(targets[0])  # nearest unfilled FVG edge
-    # Origin/important FVG = the largest-gap unfilled FVG in trend direction.
-    origin = max(targets, key=lambda f: f["gap"])
-    tp2 = tp_edge(origin) if origin is not targets[0] else 0.0
-    take_profit = tp1  # primary target for charting/base flow
-
-    return Signal(
-        symbol=symbol, timeframe=tf, side=side,
-        entry=round(entry, 8), stop_loss=round(stop_loss, 8),
-        take_profit=round(take_profit, 8), rr_ratio=cfg.rr_ratio,
-        confirmations=["Market Structure", "Impulse FVG", "Consolidation Breakout"],
-        strength=3, score=0.0, max_score=0.0,
-        strategy="impulse_fvg",
-        tp1=round(tp1, 8), tp2=round(tp2, 8),
-        consolidation_high=round(rect["high"], 8),
-        consolidation_low=round(rect["low"], 8),
-        rsi_value=0.0, volume_ratio=0.0,
-        created_at=datetime.now(timezone.utc).isoformat(),
-        fvg_top=round(origin["top"], 8), fvg_bottom=round(origin["bottom"], 8),
-        atr=round(atr, 8), atr_multiplier=cfg.atr_sl_multiplier,
-    )
 
 
 
@@ -2203,13 +1733,12 @@ async def analyze_pair_fvg_reversal(symbol: str, tf: str, cfg: Config) -> Option
 
 
 def active_strategies(cfg: Config) -> set[str]:
-    """Set of strategies to run this scan. Parallel selection via
-    `enabled_strategies`; falls back to the legacy single `strategy_mode`."""
+    """Set of strategies to run this scan, via `enabled_strategies`. Empty
+    defaults to both counter-trend strategies ("counter_trend", "fvg_reversal")
+    — the "scoring" and "impulse_fvg" strategies were removed."""
     if cfg.enabled_strategies:
         return set(cfg.enabled_strategies)
-    if cfg.strategy_mode == "both":
-        return {"scoring", "impulse_fvg"}
-    return {cfg.strategy_mode}
+    return {"counter_trend", "fvg_reversal"}
 
 
 async def run_scan() -> dict[str, Any]:
@@ -2254,22 +1783,12 @@ async def run_scan() -> dict[str, Any]:
 
         logger.info("Scanning %d pairs across %s", len(pairs), cfg.timeframes)
         signals_found: list[Signal] = []
-        # Reset discarded-setup log so bottleneck analysis reflects this scan.
-        await db.setup_debug_log.delete_many({})
 
         active = active_strategies(cfg)
 
         async def process(sym: str) -> None:
             for tf in cfg.timeframes:
                 try:
-                    if "scoring" in active:
-                        sig = await analyze_pair(sym, tf, cfg)
-                        if sig:
-                            signals_found.append(sig)
-                    if "impulse_fvg" in active:
-                        sig2 = await analyze_pair_impulse(sym, tf, cfg)
-                        if sig2:
-                            signals_found.append(sig2)
                     if "counter_trend" in active:
                         sig3 = await analyze_pair_counter(sym, tf, cfg)
                         if sig3:
@@ -2856,40 +2375,6 @@ async def entry_timing_log(limit: int = 300) -> dict[str, Any]:
     }
 
 
-@api.get("/setup-debug/log")
-async def setup_debug_log(limit: int = 200) -> dict[str, Any]:
-    """Discarded setups (score below threshold) + bottleneck analysis:
-    which filter fails most often across rejected setups."""
-    cursor = db.setup_debug_log.find({}, {"_id": 0}).sort("at", -1).limit(limit)
-    logs = await cursor.to_list(length=limit)
-    fail_counts: dict[str, int] = {}
-    pass_counts: dict[str, int] = {}
-    for l in logs:
-        for f in l.get("failed", []):
-            fail_counts[f] = fail_counts.get(f, 0) + 1
-        for p in l.get("passed", []):
-            pass_counts[p] = pass_counts.get(p, 0) + 1
-    # The bottleneck = the filter that fails most among near-miss setups
-    bottleneck = max(fail_counts, key=fail_counts.get) if fail_counts else None
-    return {
-        "logs": logs,
-        "count": len(logs),
-        "fail_counts": fail_counts,
-        "pass_counts": pass_counts,
-        "bottleneck": bottleneck,
-    }
-
-
-@api.delete("/setup-debug/log")
-async def clear_setup_debug_log() -> dict[str, Any]:
-    await db.setup_debug_log.delete_many({})
-    return {"ok": True}
-
-
-
-
-
-
 @api.post("/paper/execute/{signal_id}")
 async def paper_execute(signal_id: str) -> dict[str, Any]:
     signal = await db.signals.find_one({"id": signal_id}, {"_id": 0})
@@ -2984,19 +2469,6 @@ async def paper_set_trading_mode(payload: dict[str, str]) -> dict[str, Any]:
     pcfg.trading_mode = mode
     await save_paper_config(pcfg)
     return {"ok": True, "trading_mode": mode}
-
-
-@api.post("/strategy-mode")
-async def set_strategy_mode(payload: dict[str, str]) -> dict[str, Any]:
-    """Select signal strategy: 'scoring', 'impulse_fvg' or 'both'."""
-    mode = payload.get("strategy_mode", "").lower()
-    if mode not in ("scoring", "impulse_fvg", "counter_trend", "both"):
-        raise HTTPException(status_code=400, detail="invalid strategy_mode")
-    cfg = await get_config()
-    cfg.strategy_mode = mode
-    await save_config(cfg)
-    return {"ok": True, "strategy_mode": mode}
-
 
 
 # ---------------------------------------------------------------------------
