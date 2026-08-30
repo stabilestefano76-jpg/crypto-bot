@@ -2278,6 +2278,25 @@ async def run_scan() -> dict[str, Any]:
                     {"$set": {"status": "expired"}},
                 )
             await db.signals.insert_many([s.model_dump() for s in signals_found])
+            # Instrumentation: track how many candles it actually takes for
+            # price to reach the entry zone after a signal fires, so the
+            # generation/expiration timing can later be calibrated on real
+            # data instead of a guessed number of candles.
+            await db.entry_timing_log.insert_many([
+                {
+                    "id": str(uuid.uuid4()),
+                    "signal_id": s.id,
+                    "symbol": s.symbol,
+                    "timeframe": s.timeframe,
+                    "side": s.side,
+                    "strategy": s.strategy,
+                    "entry": s.entry,
+                    "signal_created_at": s.created_at,
+                    "status": "pending",  # pending | reached | not_reached
+                    "candles_to_entry": None,
+                }
+                for s in signals_found
+            ])
 
             # Auto-execute paper trades if enabled
             pcfg = await get_paper_config()
@@ -2309,10 +2328,11 @@ async def run_scan() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Background scheduler
 # ---------------------------------------------------------------------------
-SIGNAL_MAX_AGE_HOURS = {"15m": 0.25, "1h": 1, "4h": 4}
-
-
-async def expire_stale_signals() -> None:
+async def expire_stale_signals(cfg: Config) -> None:
+    """Expire a signal after `signal_validity_candles` candles of its OWN
+    timeframe have elapsed (not a fixed hour count) — e.g. 5 candles on 1h
+    means 5 hours of validity, giving price real room to reach the entry
+    zone instead of expiring after essentially a single candle."""
     now = datetime.now(timezone.utc)
     cursor = db.signals.find({"status": "active"})
     async for sig in cursor:
@@ -2320,9 +2340,10 @@ async def expire_stale_signals() -> None:
             created = datetime.fromisoformat(sig["created_at"])
         except Exception:  # noqa: BLE001
             continue
-        max_hours = SIGNAL_MAX_AGE_HOURS.get(sig.get("timeframe"), 4)
-        age_hours = (now - created).total_seconds() / 3600
-        if age_hours > max_hours:
+        tf_sec = TF_SECONDS.get(sig.get("timeframe"), 3600)
+        max_age_sec = tf_sec * max(1, cfg.signal_validity_candles)
+        age_sec = (now - created).total_seconds()
+        if age_sec > max_age_sec:
             await db.signals.update_one(
                 {"_id": sig["_id"]}, {"$set": {"status": "expired"}}
             )
@@ -2334,7 +2355,7 @@ async def scheduler_loop() -> None:
     while True:
         cfg = await get_config()
         try:
-            await expire_stale_signals()
+            await expire_stale_signals(cfg)
             await run_scan()
             await run_scalping_scan()
         except Exception as e:  # noqa: BLE001
@@ -2428,6 +2449,67 @@ async def premature_stop_loop() -> None:
         await asyncio.sleep(120)
 
 
+ENTRY_TIMING_MAX_LOOKAHEAD = 50  # candles to check before giving up on "reached"
+
+
+async def resolve_entry_timing() -> None:
+    """For each pending entry-timing log, look at the candles that closed
+    AFTER the signal, and find how many candles it took for price to first
+    touch the entry level. Marks 'not_reached' once the lookahead window
+    elapses without a touch. This builds real data on how long price
+    typically takes to reach the entry zone, per symbol/timeframe/strategy —
+    used to calibrate signal generation/expiration timing later."""
+    pending = await db.entry_timing_log.find(
+        {"status": "pending"}, {"_id": 0}
+    ).to_list(1000)
+    for log in pending:
+        tf = log.get("timeframe", "1h")
+        tf_sec = TF_SECONDS.get(tf, 3600)
+        try:
+            created_epoch = datetime.fromisoformat(log["signal_created_at"]).timestamp()
+        except (ValueError, TypeError):
+            continue
+        candles = await exchange.get_klines(log["symbol"], tf)
+        # candles: [t, o, c, h, l, v] ascending, t in seconds
+        after = [c for c in candles if c[0] >= created_epoch]
+        if not after:
+            continue
+        window = after[:ENTRY_TIMING_MAX_LOOKAHEAD]
+        entry = log["entry"]
+        side = log["side"]
+        hit_idx = None
+        for i, c in enumerate(window):
+            high, low = c[3], c[4]
+            if side == "long" and low <= entry:
+                hit_idx = i + 1
+                break
+            if side == "short" and high >= entry:
+                hit_idx = i + 1
+                break
+        elapsed = time.time() - created_epoch
+        window_complete = elapsed >= ENTRY_TIMING_MAX_LOOKAHEAD * tf_sec
+        if hit_idx is not None:
+            await db.entry_timing_log.update_one(
+                {"id": log["id"]},
+                {"$set": {"status": "reached", "candles_to_entry": hit_idx}},
+            )
+        elif window_complete:
+            await db.entry_timing_log.update_one(
+                {"id": log["id"]},
+                {"$set": {"status": "not_reached", "candles_to_entry": None}},
+            )
+
+
+async def entry_timing_loop() -> None:
+    await asyncio.sleep(40)
+    while True:
+        try:
+            await resolve_entry_timing()
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Entry timing checker error: %s", e)
+        await asyncio.sleep(120)
+
+
 # ---------------------------------------------------------------------------
 # FastAPI app & routes
 # ---------------------------------------------------------------------------
@@ -2439,12 +2521,14 @@ async def lifespan(_app: FastAPI):
     scalping_monitor_task = asyncio.create_task(scalping_monitor_loop())
     ws_task = asyncio.create_task(price_feed.run())
     premature_task = asyncio.create_task(premature_stop_loop())
+    entry_timing_task = asyncio.create_task(entry_timing_loop())
     yield
     scan_task.cancel()
     monitor_task.cancel()
     scalping_monitor_task.cancel()
     ws_task.cancel()
     premature_task.cancel()
+    entry_timing_task.cancel()
     await exchange.close()
     client.close()
 
@@ -2714,6 +2798,37 @@ async def stop_debug_log(limit: int = 100) -> dict[str, Any]:
         "avg_stop_distance_atr": round(sum(avg_atr_dist) / len(avg_atr_dist), 3)
         if avg_atr_dist
         else 0.0,
+    }
+
+
+@api.get("/entry-timing/log")
+async def entry_timing_log(limit: int = 300) -> dict[str, Any]:
+    """Real data on how many candles it took price to reach the entry zone
+    after a signal fired — broken down by timeframe, to calibrate signal
+    generation/expiration timing instead of guessing."""
+    cursor = db.entry_timing_log.find({}, {"_id": 0}).sort("signal_created_at", -1).limit(limit)
+    logs = await cursor.to_list(length=limit)
+    total = len(logs)
+    reached = [l for l in logs if l.get("status") == "reached"]
+    not_reached = sum(1 for l in logs if l.get("status") == "not_reached")
+    pending = sum(1 for l in logs if l.get("status") == "pending")
+    reach_rate = round((len(reached) / (len(reached) + not_reached)) * 100, 1) if (reached or not_reached) else 0.0
+
+    by_timeframe: dict[str, list[int]] = {}
+    for l in reached:
+        by_timeframe.setdefault(l["timeframe"], []).append(l["candles_to_entry"])
+    avg_candles_by_tf = {
+        tf: round(sum(vals) / len(vals), 2) for tf, vals in by_timeframe.items()
+    }
+
+    return {
+        "logs": logs,
+        "count": total,
+        "reached": len(reached),
+        "not_reached": not_reached,
+        "pending": pending,
+        "reach_rate": reach_rate,
+        "avg_candles_to_entry_by_timeframe": avg_candles_by_tf,
     }
 
 
