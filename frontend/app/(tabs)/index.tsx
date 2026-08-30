@@ -128,6 +128,28 @@ export default function SignalsScreen() {
             <Ionicons name="school" size={16} color={colors.brand} />
           </Pressable>
           <Pressable
+            onPress={() => router.push("/scalping")}
+            style={({ pressed }) => [
+              styles.scanBtn,
+              { backgroundColor: colors.surfaceTertiary, marginRight: 8 },
+              pressed && { opacity: 0.6 },
+            ]}
+            testID="scalping-button"
+          >
+            <Ionicons name="flash" size={16} color={colors.brand} />
+          </Pressable>
+          <Pressable
+            onPress={() => router.push("/grid")}
+            style={({ pressed }) => [
+              styles.scanBtn,
+              { backgroundColor: colors.surfaceTertiary, marginRight: 8 },
+              pressed && { opacity: 0.6 },
+            ]}
+            testID="grid-button"
+          >
+            <Ionicons name="grid" size={16} color={colors.brand} />
+          </Pressable>
+          <Pressable
             onPress={onScan}
             disabled={scanning}
             style={({ pressed }) => [
