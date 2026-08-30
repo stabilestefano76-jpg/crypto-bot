@@ -3179,10 +3179,11 @@ SCALPING_WALLET_ID = "scalping_wallet_singleton"
 async def get_scalping_wallet() -> dict[str, Any]:
     doc = await db.scalping_wallet.find_one({"_id": SCALPING_WALLET_ID}, {"_id": 0})
     if not doc:
-        doc = {"cash": 0.0, "total_transferred_in": 0.0}
+        doc = {"cash": 0.0, "total_transferred_in": 0.0, "reset_seq": 0}
         await db.scalping_wallet.update_one(
             {"_id": SCALPING_WALLET_ID}, {"$set": doc}, upsert=True
         )
+    doc.setdefault("reset_seq", 0)
     return doc
 
 
@@ -3272,13 +3273,24 @@ async def scalping_portfolio() -> dict[str, Any]:
 
     equity = cash + allocated + unrealized
 
+    # Automatic reconciliation: cash + allocated (the original notional locked
+    # into open positions) must always equal exactly what was transferred in
+    # plus what's been realized so far — opening/closing a position only
+    # moves money between "cash" and "allocated", it never creates or
+    # destroys it. A non-zero discrepancy here means something (like a Reset
+    # racing with a position being opened) desynced the ledger.
+    total_in = wallet.get("total_transferred_in", 0.0)
+    expected_cash_plus_allocated = total_in + realized
+    discrepancy = round((cash + allocated) - expected_cash_plus_allocated, 4)
+
     return {
         "cash": round(cash, 4),
         "allocated": round(allocated, 4),
         "unrealized_pnl": round(unrealized, 4),
         "realized_pnl": round(realized, 4),
         "equity": round(equity, 4),
-        "total_transferred_in": round(wallet.get("total_transferred_in", 0.0), 4),
+        "total_transferred_in": round(total_in, 4),
+        "ledger_discrepancy_usdt": discrepancy,
         "open_positions": enriched,
         "closed_positions": closed,
         "open_count": len(enriched),
@@ -3353,6 +3365,7 @@ async def open_scalping_position(doc: dict[str, Any], cfg: Config) -> None:
         return
     wallet = await get_scalping_wallet()
     cash = wallet.get("cash", 0.0)
+    reset_seq = wallet.get("reset_seq", 0)
     if cash <= 1.0:
         return  # not enough funds transferred to the scalping wallet
 
@@ -3379,6 +3392,19 @@ async def open_scalping_position(doc: dict[str, Any], cfg: Config) -> None:
         stop_loss = fill_price * (1 + SCALPING_SL_PCT)
         take_profit = fill_price * (1 - SCALPING_TP_PCT)
 
+    # Debit the cash FIRST, guarded on the reset counter unchanged since we
+    # read it: if a Reset happened in between (reset_seq bumped), this update
+    # matches nothing and we abort WITHOUT opening the position — this is
+    # what prevents a stale pre-reset cash value from "reviving" funds that
+    # the reset had just zeroed out.
+    result = await db.scalping_wallet.update_one(
+        {"_id": SCALPING_WALLET_ID, "reset_seq": reset_seq},
+        {"$set": {"cash": cash - notional}},
+    )
+    if result.matched_count == 0:
+        logger.warning("Scalping open aborted: reset happened concurrently for %s", doc["symbol"])
+        return
+
     position = {
         "id": str(uuid.uuid4()),
         "signal_id": doc["id"],
@@ -3395,9 +3421,6 @@ async def open_scalping_position(doc: dict[str, Any], cfg: Config) -> None:
         "status": "open",
     }
     await db.scalping_positions.insert_one(position)
-
-    wallet["cash"] = cash - notional
-    await save_scalping_wallet(wallet)
 
 
 async def close_scalping_positions() -> None:
@@ -3511,9 +3534,11 @@ async def scalping_reset() -> dict[str, Any]:
     totale trasferito). NON tocca il portafoglio principale: i fondi già
     trasferiti nello scalping vengono azzerati qui; per riaverli sul
     portafoglio principale, trasferirli PRIMA di fare il reset."""
+    current = await get_scalping_wallet()
+    next_seq = current.get("reset_seq", 0) + 1
     await db.scalping_positions.delete_many({})
     await db.scalping_signals.delete_many({})
-    wallet = {"cash": 0.0, "total_transferred_in": 0.0}
+    wallet = {"cash": 0.0, "total_transferred_in": 0.0, "reset_seq": next_seq}
     await save_scalping_wallet(wallet)
     return {"ok": True, "cash": 0.0}
 
@@ -3532,10 +3557,11 @@ GRID_FEE_PCT = 0.001  # 0.10% Bybit spot fee per side
 async def get_grid_wallet() -> dict[str, Any]:
     doc = await db.grid_wallet.find_one({"_id": GRID_WALLET_ID}, {"_id": 0})
     if not doc:
-        doc = {"cash": 0.0, "total_transferred_in": 0.0}
+        doc = {"cash": 0.0, "total_transferred_in": 0.0, "reset_seq": 0}
         await db.grid_wallet.update_one(
             {"_id": GRID_WALLET_ID}, {"$set": doc}, upsert=True
         )
+    doc.setdefault("reset_seq", 0)
     return doc
 
 
@@ -3778,7 +3804,16 @@ async def monitor_grid_instances() -> None:
                 {"id": grid["id"]}, {"$set": {"cells": cells}}
             )
 
-    await save_grid_wallet({**wallet, "cash": cash})
+    # Guarded write: if a Reset happened while this cycle was running (the
+    # reset counter changed since we read the wallet), discard this cycle's
+    # cash changes instead of writing them on top of a just-reset wallet —
+    # same protection as the Scalping Bot, for the same reason.
+    result = await db.grid_wallet.update_one(
+        {"_id": GRID_WALLET_ID, "reset_seq": wallet.get("reset_seq", 0)},
+        {"$set": {"cash": cash}},
+    )
+    if result.matched_count == 0:
+        logger.warning("Grid wallet update aborted: reset happened concurrently")
 
 
 async def grid_monitor_loop() -> None:
@@ -3842,9 +3877,11 @@ async def grid_reset() -> dict[str, Any]:
     """Reset del Grid Bot: cancella tutte le griglie attive/fermate, le
     posizioni aperte/chiuse e azzera il portafoglio griglia. NON tocca il
     portafoglio principale."""
+    current = await get_grid_wallet()
+    next_seq = current.get("reset_seq", 0) + 1
     await db.grid_positions.delete_many({})
     await db.grid_instances.delete_many({})
-    await save_grid_wallet({"cash": 0.0, "total_transferred_in": 0.0})
+    await save_grid_wallet({"cash": 0.0, "total_transferred_in": 0.0, "reset_seq": next_seq})
     return {"ok": True, "cash": 0.0}
 
 
@@ -3886,13 +3923,16 @@ async def grid_portfolio() -> dict[str, Any]:
     settled = wins + losses
     win_rate = round((wins / settled) * 100, 1) if settled else 0.0
     equity = cash + allocated + unrealized
+    total_in = wallet.get("total_transferred_in", 0.0)
+    discrepancy = round((cash + allocated) - (total_in + realized), 4)
     return {
         "cash": round(cash, 4),
         "allocated": round(allocated, 4),
         "unrealized_pnl": round(unrealized, 4),
         "realized_pnl": round(realized, 4),
         "equity": round(equity, 4),
-        "total_transferred_in": round(wallet.get("total_transferred_in", 0.0), 4),
+        "total_transferred_in": round(total_in, 4),
+        "ledger_discrepancy_usdt": discrepancy,
         "open_positions": enriched,
         "closed_positions": closed,
         "open_count": len(enriched),
