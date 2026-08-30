@@ -136,6 +136,14 @@ class Config(BaseModel):
     # used by "scoring" or "impulse_fvg". ---
     exhaustion_lookback: int = 10
     exhaustion_min_score: float = 2.0
+    # --- RSI Reversion strategy (independent, simple): RSI extreme -> confirmed
+    # reentry -> target back near RSI-50 (proxied by price returning to its own
+    # N-period average). Deliberately no tight stop, only a wide catastrophic
+    # one, on the assumption overbought/oversold eventually rebalances. ---
+    rsi_rev_overbought: float = 80.0
+    rsi_rev_oversold: float = 20.0
+    rsi_rev_min_extreme_candles: int = 3  # min candles RSI must stay beyond 80/20 before reentry counts
+    rsi_rev_catastrophic_atr_mult: float = 6.0  # wide safety stop, only for extreme/structural cases
     # --- Grid Bot (independent strategy: range/laterale trading) ---
     grid_enabled: bool = True
     grid_timeframe: str = "1h"  # timeframe used for range detection, ATR and spacing
@@ -1314,6 +1322,12 @@ async def manage_open_position(pos: dict[str, Any], price: float, cfg: Config) -
     # FVG Reversal strategy: TP1/TP2 + post-TP1 stop + trailing.
     if pos.get("strategy") == "fvg_reversal":
         return await manage_fvg_reversal_position(pos, price, cfg)
+    # RSI Reversion: plain SL/TP only, on purpose — no partial close, no
+    # timeout-to-breakeven, no trailing. The strategy's whole premise is
+    # "wait for the rebalance"; the additive managers would fight that by
+    # cutting the trade early. Only the wide catastrophic stop protects it.
+    if pos.get("strategy") == "rsi_reversion":
+        return pos
     # Partial close first (does not affect stop)
     await maybe_partial_close(pos, price, cfg)
     # Timeout -> breakeven
@@ -1732,13 +1746,121 @@ async def analyze_pair_fvg_reversal(symbol: str, tf: str, cfg: Config) -> Option
     )
 
 
+# ===========================================================================
+# STRATEGY: RSI Reversion (independent, simple mean-reversion on RSI extremes)
+# ===========================================================================
+async def analyze_pair_rsi_reversion(symbol: str, tf: str, cfg: Config) -> Optional[Signal]:
+    """RSI Reversion: when RSI comes back from an extreme (>80 or <20) after
+    spending at least `rsi_rev_min_extreme_candles` candles there, AND the
+    reversal is backed by a genuine RSI/price divergence (not just noise),
+    enter counter-trend targeting the RSI-50 zone — proxied here by price
+    returning to its own N-period average, N = rsi_period, since a full RSI
+    inversion has no closed-form price target. Deliberately has NO tight
+    stop: only a wide ATR-based catastrophic stop, on the assumption that
+    overbought/oversold in spot eventually rebalances — the catastrophic
+    stop exists only to cap the rare case where it doesn't (e.g. a
+    structural breakdown, not just ordinary volatility)."""
+    candles = await exchange.get_klines(symbol, tf)
+    if len(candles) < 60:
+        return None
+    closes = [c[2] for c in candles]
+    highs = [c[3] for c in candles]
+    lows = [c[4] for c in candles]
+
+    rsis = rsi_wilder(closes, cfg.rsi_period)
+    if rsis[-1] is None:
+        return None
+
+    ob = cfg.rsi_rev_overbought
+    os_ = cfg.rsi_rev_oversold
+    min_extreme = cfg.rsi_rev_min_extreme_candles
+
+    def consecutive_extreme_before_last(threshold: float, above: bool) -> int:
+        """Count consecutive candles, going backwards from the one right
+        before the last, that stayed beyond `threshold`."""
+        count = 0
+        i = len(rsis) - 2
+        while i >= 0 and rsis[i] is not None:
+            beyond = (rsis[i] >= threshold) if above else (rsis[i] <= threshold)
+            if not beyond:
+                break
+            count += 1
+            i -= 1
+        return count
+
+    side: Optional[str] = None
+    # Filter 1 (candle-close confirmation) + Filter 3 (min time in extreme
+    # zone) are both checked here: the reentry must be on THIS closed candle,
+    # preceded by enough consecutive candles genuinely beyond the threshold.
+    if rsis[-1] < ob and consecutive_extreme_before_last(ob, above=True) >= min_extreme:
+        side = "short"
+    elif rsis[-1] > os_ and consecutive_extreme_before_last(os_, above=False) >= min_extreme:
+        side = "long"
+    if side is None:
+        return None
+
+    # Filter 2: genuine RSI/price divergence, not just a brief dip back inside
+    # the bands (reuses the same detector as the other strategies).
+    divergence = detect_rsi_divergence(closes, rsis, cfg.pivot_window)
+    if side == "short" and divergence != "bearish":
+        return None
+    if side == "long" and divergence != "bullish":
+        return None
+
+    atr = atr_wilder(highs, lows, closes, cfg.atr_period)
+    if not atr or atr <= 0:
+        return None
+
+    entry = closes[-1]
+    sma = sum(closes[-cfg.rsi_period:]) / cfg.rsi_period  # proxy for "RSI back to 50"
+    catastrophic_buffer = cfg.rsi_rev_catastrophic_atr_mult * atr
+
+    if side == "short":
+        if sma >= entry:
+            return None  # price already at/below its average, no reversion left to capture
+        take_profit = sma
+        stop_loss = entry + catastrophic_buffer
+    else:
+        if sma <= entry:
+            return None
+        take_profit = sma
+        stop_loss = entry - catastrophic_buffer
+
+    risk = abs(entry - stop_loss)
+    reward = abs(take_profit - entry)
+    if risk <= 0 or reward <= 0:
+        return None
+
+    vol_ratio = volume_spike_ratio([c[5] for c in candles], cfg.volume_ma_period)
+    return Signal(
+        symbol=symbol, timeframe=tf, side=side,
+        entry=round(entry, 8), stop_loss=round(stop_loss, 8),
+        take_profit=round(take_profit, 8), rr_ratio=round(reward / risk, 2),
+        confirmations=[
+            "RSI Ipercomprato" if side == "short" else "RSI Ipervenduto",
+            f"{min_extreme}+ candele in zona estrema",
+            "Rientro confermato su chiusura",
+            "Divergenza RSI/Prezzo",
+        ],
+        strength=4, score=0.0, max_score=0.0,
+        strategy="rsi_reversion",
+        tp1=0.0, tp2=0.0,
+        consolidation_high=0.0, consolidation_low=0.0,
+        rsi_value=round(rsis[-1], 2),
+        volume_ratio=round(vol_ratio, 2),
+        created_at=datetime.now(timezone.utc).isoformat(),
+        fvg_top=0.0, fvg_bottom=0.0,
+        atr=round(atr, 8), atr_multiplier=cfg.rsi_rev_catastrophic_atr_mult,
+    )
+
+
 def active_strategies(cfg: Config) -> set[str]:
     """Set of strategies to run this scan, via `enabled_strategies`. Empty
     defaults to both counter-trend strategies ("counter_trend", "fvg_reversal")
     — the "scoring" and "impulse_fvg" strategies were removed."""
     if cfg.enabled_strategies:
         return set(cfg.enabled_strategies)
-    return {"counter_trend", "fvg_reversal"}
+    return {"counter_trend", "fvg_reversal", "rsi_reversion"}
 
 
 async def run_scan() -> dict[str, Any]:
@@ -1797,6 +1919,10 @@ async def run_scan() -> dict[str, Any]:
                         sig4 = await analyze_pair_fvg_reversal(sym, tf, cfg)
                         if sig4:
                             signals_found.append(sig4)
+                    if "rsi_reversion" in active:
+                        sig5 = await analyze_pair_rsi_reversion(sym, tf, cfg)
+                        if sig5:
+                            signals_found.append(sig5)
                 except Exception as e:  # noqa: BLE001
                     logger.debug("analyze %s %s failed: %s", sym, tf, e)
 
