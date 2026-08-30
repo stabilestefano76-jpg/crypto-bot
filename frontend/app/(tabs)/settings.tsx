@@ -1,6 +1,7 @@
 import { useCallback, useEffect, useState } from "react";
 import {
   ActivityIndicator,
+  Alert,
   KeyboardAvoidingView,
   Platform,
   Pressable,
@@ -64,6 +65,11 @@ export default function SettingsScreen() {
       setPcfg(updatedP);
       setSaved(true);
       setTimeout(() => setSaved(false), 2500);
+    } catch (e: any) {
+      Alert.alert(
+        "Salvataggio non riuscito",
+        e?.message || "Errore sconosciuto durante il salvataggio."
+      );
     } finally {
       setSaving(false);
     }
