@@ -85,12 +85,11 @@ export default function SettingsScreen() {
     );
   }
 
-  const stratOn = (val: string): boolean =>
+  const enabledStrategies: string[] =
     cfg.enabled_strategies && cfg.enabled_strategies.length
-      ? cfg.enabled_strategies.includes(val)
-      : cfg.strategy_mode === "both"
-        ? val === "scoring" || val === "impulse_fvg"
-        : cfg.strategy_mode === val;
+      ? cfg.enabled_strategies
+      : ["counter_trend", "fvg_reversal", "rsi_reversion"];
+  const stratOn = (val: string): boolean => enabledStrategies.includes(val);
 
   return (
     <KeyboardAvoidingView
@@ -111,14 +110,8 @@ export default function SettingsScreen() {
         >
           <Section title="Strategie segnali (parallele)">
             {(() => {
-              const enabled: string[] =
-                cfg.enabled_strategies && cfg.enabled_strategies.length
-                  ? cfg.enabled_strategies
-                  : cfg.strategy_mode === "both"
-                    ? ["scoring", "impulse_fvg"]
-                    : [cfg.strategy_mode];
               const toggle = (val: string) => {
-                const set = new Set(enabled);
+                const set = new Set(enabledStrategies);
                 if (set.has(val)) set.delete(val);
                 else set.add(val);
                 update({ enabled_strategies: Array.from(set) });
@@ -126,12 +119,11 @@ export default function SettingsScreen() {
               return (
                 <View style={styles.stratRow}>
                   {([
-                    ["scoring", "Scoring"],
-                    ["impulse_fvg", "Impulse FVG"],
                     ["counter_trend", "Rev Pre-FVG"],
                     ["fvg_reversal", "FVG Reversal"],
+                    ["rsi_reversion", "RSI Reversion"],
                   ] as const).map(([val, label]) => {
-                    const active = enabled.includes(val);
+                    const active = stratOn(val);
                     return (
                       <Pressable
                         key={val}
@@ -151,11 +143,12 @@ export default function SettingsScreen() {
               );
             })()}
             <Text style={styles.scoreHintText}>
-              Selezione multipla: girano in parallelo a capitale condiviso.
-              Scoring = confluenza a punteggio. Impulse FVG = trend + impulso +
-              breakout con TP1/TP2. Rev Pre-FVG = breakout del consolidamento
-              verso il fill FVG. FVG Reversal = contro-trend sul ritracciamento
-              verso la FVG (parametri indipendenti).
+              Selezione multipla: girano in parallelo a capitale condiviso (a
+              meno di allocare fondi dedicati dalla schermata Strategie). Rev
+              Pre-FVG = breakout del consolidamento verso il fill FVG. FVG
+              Reversal = contro-trend sul ritracciamento verso la FVG
+              (parametri indipendenti). RSI Reversion = rientro da
+              ipercomprato/ipervenduto confermato da divergenza.
             </Text>
           </Section>
 
@@ -181,12 +174,6 @@ export default function SettingsScreen() {
                 testID="input-ct-tp1-pct"
               />
               <NumRow
-                label="Quota TP2 (%)"
-                value={cfg.tp2_pct}
-                onChange={(v) => update({ tp2_pct: v })}
-                testID="input-ct-tp2-pct"
-              />
-              <NumRow
                 label="Avanzamento post-TP1 (%)"
                 value={cfg.post_tp1_advance_pct}
                 onChange={(v) => update({ post_tp1_advance_pct: v })}
@@ -197,6 +184,7 @@ export default function SettingsScreen() {
                 Dopo TP1 chiude {cfg.tp1_pct}%; quando il prezzo avanza di{" "}
                 {cfg.post_tp1_advance_pct}% oltre TP1, lo stop del residuo si
                 sposta a TP1 (netto commissioni). Altrimenti resta lo stop ATR.
+                Il resto (TP2) chiude sul bordo opposto della FVG.
               </Text>
             </Section>
           )}
@@ -253,170 +241,43 @@ export default function SettingsScreen() {
             </Section>
           )}
 
-          {stratOn("impulse_fvg") && (
-            <Section title="Impulse FVG Strategy">
+          {stratOn("rsi_reversion") && (
+            <Section title="RSI Reversion Strategy">
               <NumRow
-                label="Soglia ATR candela impulso"
-                value={cfg.impulse_atr_mult}
-                onChange={(v) => update({ impulse_atr_mult: v })}
-                step={0.1}
-                testID="input-impulse-atr"
+                label="Soglia ipercomprato"
+                value={cfg.rsi_rev_overbought}
+                onChange={(v) => update({ rsi_rev_overbought: v })}
+                testID="input-rsirev-ob"
               />
               <NumRow
-                label="Min. candele consolidamento"
-                value={cfg.consolidation_min_candles}
-                onChange={(v) => update({ consolidation_min_candles: v })}
-                testID="input-consol-min"
+                label="Soglia ipervenduto"
+                value={cfg.rsi_rev_oversold}
+                onChange={(v) => update({ rsi_rev_oversold: v })}
+                testID="input-rsirev-os"
               />
               <NumRow
-                label="Max ampiezza box (×ATR)"
-                value={cfg.consolidation_max_atr}
-                onChange={(v) => update({ consolidation_max_atr: v })}
-                step={0.1}
-                testID="input-consol-atr"
+                label="Min. candele in zona estrema"
+                value={cfg.rsi_rev_min_extreme_candles}
+                onChange={(v) => update({ rsi_rev_min_extreme_candles: v })}
+                testID="input-rsirev-extreme"
               />
               <NumRow
-                label="Quota TP1 (%)"
-                value={cfg.tp1_pct}
-                onChange={(v) => update({ tp1_pct: v })}
-                testID="input-tp1-pct"
+                label="Stop catastrofico (×ATR)"
+                value={cfg.rsi_rev_catastrophic_atr_mult}
+                onChange={(v) => update({ rsi_rev_catastrophic_atr_mult: v })}
+                step={0.5}
+                testID="input-rsirev-atr"
               />
-              <NumRow
-                label="Quota TP2 (%)"
-                value={cfg.tp2_pct}
-                onChange={(v) => update({ tp2_pct: v })}
-                testID="input-tp2-pct"
-              />
+              <Text style={styles.scoreHintText}>
+                Entra quando l&apos;RSI rientra dalla zona estrema (dopo almeno{" "}
+                {cfg.rsi_rev_min_extreme_candles} candele oltre soglia) con
+                divergenza confermata. Target = prezzo torna sulla propria
+                media a {cfg.rsi_period} periodi (proxy di &quot;RSI torna a
+                50&quot;). Nessuno stop stretto: solo lo stop catastrofico a{" "}
+                {cfg.rsi_rev_catastrophic_atr_mult}×ATR, per i casi estremi.
+              </Text>
             </Section>
           )}
-
-          <Section title="Scoring System">
-            <View style={styles.scoreHint}>
-              <Ionicons name="information-circle" size={14} color={colors.brand} />
-              <Text style={styles.scoreHintText}>
-                Un trade si apre se la somma dei punti dei filtri soddisfatti
-                raggiunge la soglia minima. Non serve che tutti i filtri siano
-                veri insieme.
-              </Text>
-            </View>
-            <NumRow
-              label="Punti FVG valida"
-              value={cfg.score_fvg}
-              onChange={(v) => update({ score_fvg: v })}
-              step={0.5}
-              testID="input-score-fvg"
-            />
-            <NumRow
-              label="Punti divergenza RSI"
-              value={cfg.score_rsi_divergence}
-              onChange={(v) => update({ score_rsi_divergence: v })}
-              step={0.5}
-              testID="input-score-rsi"
-            />
-            <NumRow
-              label="Punti volume sopra media"
-              value={cfg.score_volume}
-              onChange={(v) => update({ score_volume: v })}
-              step={0.5}
-              testID="input-score-volume"
-            />
-            <NumRow
-              label="Punti incrocio medie"
-              value={cfg.score_ma_cross}
-              onChange={(v) => update({ score_ma_cross: v })}
-              step={0.5}
-              testID="input-score-ma"
-            />
-            <NumRow
-              label="Punti inversione FVG"
-              value={cfg.score_fvg_reversal}
-              onChange={(v) => update({ score_fvg_reversal: v })}
-              step={0.5}
-              testID="input-score-reversal"
-            />
-            <NumRow
-              label="Soglia minima apertura"
-              value={cfg.min_score_threshold}
-              onChange={(v) => update({ min_score_threshold: v })}
-              step={0.5}
-              testID="input-min-score"
-            />
-            <View style={styles.maxScoreRow}>
-              <Text style={styles.maxScoreText}>
-                Punteggio massimo raggiungibile:{" "}
-                <Text style={{ color: colors.brand, fontWeight: "800" }}>
-                  {(
-                    cfg.score_fvg +
-                    cfg.score_rsi_divergence +
-                    cfg.score_volume +
-                    cfg.score_ma_cross +
-                    cfg.score_fvg_reversal
-                  ).toFixed(1)}
-                </Text>
-              </Text>
-            </View>
-            <NumRow
-              label="Finestra validità (candele)"
-              value={cfg.signal_validity_candles}
-              onChange={(v) => update({ signal_validity_candles: v })}
-              testID="input-validity-window"
-            />
-            <NumRow
-              label="FVG lookback (candele)"
-              value={cfg.fvg_lookback}
-              onChange={(v) => update({ fvg_lookback: v })}
-              testID="input-fvg-lookback"
-            />
-          </Section>
-
-          <Section title="FVG Reversal Entry">
-            <View style={styles.scoreHint}>
-              <Ionicons name="git-compare" size={14} color={colors.brand} />
-              <Text style={styles.scoreHintText}>
-                Riconosce l&apos;inversione dentro la FVG (rejection candle, volume,
-                change of character, divergenza RSI). Se attiva, il target diventa
-                il fill della zona.
-              </Text>
-            </View>
-            <NumRow
-              label="Min. segnali inversione"
-              value={cfg.reversal_min_signals}
-              onChange={(v) => update({ reversal_min_signals: v })}
-              testID="input-reversal-min"
-            />
-            <NumRow
-              label="Rejection wick ratio"
-              value={cfg.reversal_rejection_wick_ratio}
-              onChange={(v) => update({ reversal_rejection_wick_ratio: v })}
-              step={0.1}
-              testID="input-reversal-wick"
-            />
-            <View style={styles.formRow}>
-              <Text style={styles.formLabel}>Target fill</Text>
-              <View style={{ flexDirection: "row", gap: 6 }}>
-                {(["opposite_edge", "midpoint"] as const).map((m) => {
-                  const active = cfg.fvg_fill_mode === m;
-                  return (
-                    <Pressable
-                      key={m}
-                      onPress={() => update({ fvg_fill_mode: m })}
-                      style={[styles.fillChip, active && styles.fillChipActive]}
-                      testID={`fill-mode-${m}`}
-                    >
-                      <Text
-                        style={[
-                          styles.fillChipText,
-                          active && { color: colors.brand },
-                        ]}
-                      >
-                        {m === "opposite_edge" ? "Bordo opp." : "50% (CE)"}
-                      </Text>
-                    </Pressable>
-                  );
-                })}
-              </View>
-            </View>
-          </Section>
 
           <Section title="Scan Engine">
             <NumRow
@@ -443,6 +304,18 @@ export default function SettingsScreen() {
               onChange={(v) => update({ min_24h_volume_usdt: v })}
               testID="input-min-volume"
             />
+            <NumRow
+              label="Finestra validità segnali (candele)"
+              value={cfg.signal_validity_candles}
+              onChange={(v) => update({ signal_validity_candles: v })}
+              testID="input-validity-window"
+            />
+            <NumRow
+              label="FVG lookback (candele)"
+              value={cfg.fvg_lookback}
+              onChange={(v) => update({ fvg_lookback: v })}
+              testID="input-fvg-lookback"
+            />
           </Section>
 
           <Section title="Timeframes">
@@ -467,7 +340,7 @@ export default function SettingsScreen() {
             </View>
           </Section>
 
-          <Section title="RSI">
+          <Section title="RSI (condiviso tra le strategie)">
             <NumRow
               label="Period"
               value={cfg.rsi_period}
@@ -481,37 +354,16 @@ export default function SettingsScreen() {
               testID="input-pivot-window"
             />
             <NumRow
-              label="Overbought"
+              label="Overbought (Rev Pre-FVG/FVG Reversal)"
               value={cfg.rsi_overbought}
               onChange={(v) => update({ rsi_overbought: v })}
               testID="input-rsi-ob"
             />
             <NumRow
-              label="Oversold"
+              label="Oversold (Rev Pre-FVG/FVG Reversal)"
               value={cfg.rsi_oversold}
               onChange={(v) => update({ rsi_oversold: v })}
               testID="input-rsi-os"
-            />
-          </Section>
-
-          <Section title="Moving Averages">
-            <NumRow
-              label="EMA fast"
-              value={cfg.ema_fast}
-              onChange={(v) => update({ ema_fast: v })}
-              testID="input-ema-fast"
-            />
-            <NumRow
-              label="EMA slow"
-              value={cfg.ema_slow}
-              onChange={(v) => update({ ema_slow: v })}
-              testID="input-ema-slow"
-            />
-            <ToggleRow
-              label="Require MA alignment"
-              value={cfg.require_ma_alignment}
-              onChange={(v) => update({ require_ma_alignment: v })}
-              testID="toggle-require-ma"
             />
           </Section>
 
@@ -529,12 +381,6 @@ export default function SettingsScreen() {
               step={0.1}
               testID="input-vol-mult"
             />
-            <ToggleRow
-              label="Require volume confirmation"
-              value={cfg.require_volume_confirmation}
-              onChange={(v) => update({ require_volume_confirmation: v })}
-              testID="toggle-require-vol"
-            />
           </Section>
 
           <Section title="Risk">
@@ -551,6 +397,26 @@ export default function SettingsScreen() {
               onChange={(v) => update({ sl_padding_pct: v })}
               step={0.05}
               testID="input-sl-padding"
+            />
+            <NumRow
+              label="ATR period"
+              value={cfg.atr_period}
+              onChange={(v) => update({ atr_period: v })}
+              testID="input-atr-period"
+            />
+            <NumRow
+              label="ATR SL multiplier"
+              value={cfg.atr_sl_multiplier}
+              onChange={(v) => update({ atr_sl_multiplier: v })}
+              step={0.1}
+              testID="input-atr-sl-mult"
+            />
+            <NumRow
+              label="Min R:R (Rev Pre-FVG)"
+              value={cfg.min_rr_ratio}
+              onChange={(v) => update({ min_rr_ratio: v })}
+              step={0.1}
+              testID="input-min-rr"
             />
           </Section>
 
@@ -836,7 +702,7 @@ const styles = StyleSheet.create({
   stratRow: { flexDirection: "row", flexWrap: "wrap", gap: spacing.sm, marginBottom: spacing.sm },
   stratChip: {
     flexGrow: 1,
-    flexBasis: "46%",
+    flexBasis: "30%",
     paddingVertical: 10,
     borderRadius: radius.md,
     backgroundColor: colors.surfaceTertiary,
