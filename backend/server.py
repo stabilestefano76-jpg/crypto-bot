@@ -101,6 +101,7 @@ class Config(BaseModel):
     scalping_volume_multiplier: float = 1.5
     scalping_min_hold_seconds: int = 60  # min time before the invalidation check can close early
     scalping_cooldown_minutes: int = 10  # pause on a symbol after a losing scalping trade
+    scalping_invalidation_buffer_pct: float = 0.15  # min % beyond VWAP required, on top of the EMA cross, to count as invalidated
     signal_validity_candles: int = 5  # a condition counts if it happened within N bars
     fvg_lookback: int = 40  # how far back to look for an open FVG
     # --- FVG reversal / fill entry extension ---
@@ -3282,10 +3283,14 @@ async def check_scalping_invalidation(pos: dict[str, Any], cfg: Config) -> bool:
     i.e. the trade is now going against us. Does not replace SL/TP; it only
     adds an earlier exit when the setup is invalidated.
 
-    A long is invalidated if price closes back below VWAP OR EMA9 crosses
-    below EMA21 (trend flip). A short is invalidated speculare (above VWAP /
-    EMA9 crosses above EMA21). Only checked after `scalping_min_hold_seconds`
-    have elapsed since the position was opened, to avoid closing on noise.
+    A long is invalidated only when BOTH conditions hold together: price
+    closes below VWAP by at least `scalping_invalidation_buffer_pct` AND
+    EMA9 is below EMA21 (trend flip). A short is invalidated speculare.
+    Requiring both conditions (not just one) plus a minimum buffer filters
+    out normal 5m noise around VWAP/EMA crosses, which otherwise triggers
+    this check on almost every trade before it has a chance to reach TP.
+    Only checked after `scalping_min_hold_seconds` have elapsed since the
+    position was opened.
     """
     try:
         opened = datetime.fromisoformat(pos["opened_at"]).timestamp()
@@ -3307,10 +3312,15 @@ async def check_scalping_invalidation(pos: dict[str, Any], cfg: Config) -> bool:
     ema_slow = _ema(closes, cfg.scalping_ema_slow)
     vwap = _vwap(highs, lows, closes, volumes)
     last_close = closes[-1]
+    buffer = cfg.scalping_invalidation_buffer_pct / 100
 
     if pos["side"] == "long":
-        return last_close < vwap or ema_fast[-1] < ema_slow[-1]
-    return last_close > vwap or ema_fast[-1] > ema_slow[-1]
+        lost_vwap = last_close < vwap * (1 - buffer)
+        trend_flipped = ema_fast[-1] < ema_slow[-1]
+        return lost_vwap and trend_flipped
+    lost_vwap = last_close > vwap * (1 + buffer)
+    trend_flipped = ema_fast[-1] > ema_slow[-1]
+    return lost_vwap and trend_flipped
 
 
 # Per-symbol cooldown after a losing scalping trade (additive, in-memory).
