@@ -388,3 +388,83 @@ export const scalpingWithdraw = (amount: number) =>
     "/scalping/withdraw",
     { method: "POST", body: JSON.stringify({ amount }) }
   );
+
+// ---------------------------------------------------------------------------
+// Grid Bot
+// ---------------------------------------------------------------------------
+export type GridPosition = {
+  id: string;
+  grid_id: string;
+  symbol: string;
+  cell_index: number;
+  entry: number;
+  target: number;
+  quantity: number;
+  notional: number;
+  status: string;
+  opened_at: string;
+  current_price?: number;
+  unrealized_pnl?: number;
+  unrealized_pnl_pct?: number;
+  close_price?: number;
+  close_reason?: string;
+  pnl_usdt?: number;
+  closed_at?: string;
+};
+
+export type GridPortfolio = {
+  cash: number;
+  allocated: number;
+  unrealized_pnl: number;
+  realized_pnl: number;
+  equity: number;
+  open_positions: GridPosition[];
+  closed_positions: GridPosition[];
+  open_count: number;
+  closed_count: number;
+  win_rate: number;
+};
+
+export type GridCellInfo = {
+  index: number;
+  buy_price: number;
+  sell_price: number;
+  status: "armed" | "holding";
+};
+
+export type GridInstance = {
+  id: string;
+  symbol: string;
+  timeframe: string;
+  center_price: number;
+  spacing: number;
+  atr: number;
+  cells: GridCellInfo[];
+  notional_per_cell: number;
+  status: "active" | "stopped";
+  stopped_reason?: string | null;
+  created_at: string;
+  bb_width_pct: number;
+  ema_gap_pct: number;
+  current_price?: number | null;
+};
+
+export const gridWalletApi = {
+  portfolio: () => req<GridPortfolio>("/grid/portfolio"),
+  transfer: (amount: number) =>
+    req<{ ok: boolean; grid_cash: number; main_cash: number }>(
+      "/grid/transfer",
+      { method: "POST", body: JSON.stringify({ amount }) }
+    ),
+  reset: () => req<{ ok: boolean; cash: number }>("/grid/reset", { method: "POST" }),
+};
+
+export const gridWithdraw = (amount: number) =>
+  req<{ ok: boolean; grid_cash: number; main_cash: number }>(
+    "/grid/withdraw",
+    { method: "POST", body: JSON.stringify({ amount }) }
+  );
+
+export const gridApi = {
+  instances: () => req<{ instances: GridInstance[]; count: number }>("/grid/instances"),
+};

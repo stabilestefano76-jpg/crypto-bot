@@ -169,3 +169,130 @@ ready();
 </body>
 </html>`;
 }
+
+// ---------------------------------------------------------------------------
+// Grid Bot chart: draws the grid's buy/sell cell levels over the live price,
+// instead of a single Entry/SL/TP/FVG setup. Cells still "armed" (waiting to
+// buy) are shown as dashed blue lines; cells currently "holding" (bought,
+// waiting to sell) are shown as solid green (buy price) + dashed teal (sell
+// target). A grey dotted line marks the grid's center price for reference.
+// ---------------------------------------------------------------------------
+export type GridCell = {
+  index: number;
+  buy_price: number;
+  sell_price: number;
+  status: "armed" | "holding";
+};
+
+export type GridChartLevels = {
+  cells: GridCell[];
+  centerPrice: number;
+};
+
+export function buildGridChartHtml(
+  candles: Candle[],
+  levels: GridChartLevels,
+  width: number,
+  height: number
+): string {
+  const data = JSON.stringify(toTvCandles(candles, CHART_BARS));
+  const lv = JSON.stringify(levels);
+  const W = Math.max(50, Math.round(width));
+  const H = Math.max(50, Math.round(height));
+  return `<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no"/>
+<style>
+  html,body{margin:0;padding:0;height:100%;width:100%;background:#0E1116;overflow:hidden;}
+  #wrap{position:relative;height:100%;width:100%;}
+  #c{position:absolute;top:0;left:0;right:0;bottom:0;}
+</style>
+<script src="https://unpkg.com/lightweight-charts@4.1.3/dist/lightweight-charts.standalone.production.js"></script>
+</head>
+<body>
+<div id="wrap"><div id="c"></div></div>
+<script>
+var DATA = ${data};
+var LV = ${lv};
+var W = ${W}, H = ${H};
+var chart, series, lines = [];
+
+function ready(){ if(!window.LightweightCharts){ return setTimeout(ready, 60); } init(); }
+
+function init(){
+  var el = document.getElementById('c');
+  chart = LightweightCharts.createChart(el, {
+    width: W, height: H,
+    layout: { background: { color: '#0E1116' }, textColor: '#8A93A2', fontSize: 10 },
+    grid: { vertLines: { color: '#161C24' }, horzLines: { color: '#161C24' } },
+    rightPriceScale: { borderColor: '#1C2530' },
+    timeScale: { borderColor: '#1C2530', timeVisible: true, secondsVisible: false },
+    crosshair: { mode: 0 },
+    handleScale: true, handleScroll: true
+  });
+  series = chart.addCandlestickSeries({
+    upColor: '#00C076', downColor: '#FF554A', borderVisible: false,
+    wickUpColor: '#00C076', wickDownColor: '#FF554A'
+  });
+  if (DATA && DATA.length) series.setData(DATA);
+  drawLevels();
+  function fit(){
+    try {
+      chart.resize(W - 1, H); chart.resize(W, H);
+      chart.timeScale().fitContent();
+    } catch(e){}
+  }
+  fit();
+  [60, 200, 500, 900, 1500].forEach(function(ms){ setTimeout(fit, ms); });
+}
+
+function clearLevels(){
+  lines.forEach(function(l){ try { series.removePriceLine(l); } catch(e){} });
+  lines = [];
+}
+
+function drawLevels(){
+  clearLevels();
+  if (!LV || !LV.cells) return;
+  function pl(price, color, title, style){
+    if (price == null || !isFinite(price)) return;
+    lines.push(series.createPriceLine({ price: price, color: color, lineWidth: 1,
+      lineStyle: style, axisLabelVisible: true, title: title }));
+  }
+  pl(LV.centerPrice, '#8A93A2', 'Centro', 3);
+  LV.cells.forEach(function(cell){
+    var holding = cell.status === 'holding';
+    pl(cell.buy_price, holding ? '#00C076' : '#3B82F6', 'B' + cell.index, holding ? 0 : 2);
+    if (holding) pl(cell.sell_price, '#12B886', 'T' + cell.index, 2);
+  });
+}
+
+function applyUpdate(d){
+  try {
+    if (d && d.candles && d.candles.length) series.setData(d.candles);
+    if (d && d.levels) { LV = d.levels; drawLevels(); }
+  } catch (e) {}
+}
+window.applyUpdate = applyUpdate;
+
+function onMsg(e){
+  try {
+    var d = typeof e.data === 'string' ? JSON.parse(e.data) : e.data;
+    if (!d) return;
+    if (d.type === 'update') applyUpdate(d);
+    else if (d.type === 'resize' && chart && d.width > 0 && d.height > 0) {
+      chart.resize(d.width, d.height);
+      chart.timeScale().fitContent();
+    }
+  } catch (err) {}
+}
+window.addEventListener('message', onMsg);
+document.addEventListener('message', onMsg);
+
+ready();
+</script>
+</body>
+</html>`;
+}
