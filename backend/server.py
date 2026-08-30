@@ -252,6 +252,7 @@ class PaperTrade(BaseModel):
     outcome: str  # win | loss
     opened_at: str
     closed_at: str
+    strategy: str = "counter_trend"
 
 
 class ExchangeConnectRequest(BaseModel):
@@ -812,6 +813,49 @@ async def set_paper_cash(cash: float) -> None:
     )
 
 
+# ---------------------------------------------------------------------------
+# Per-strategy fund isolation ("cross" by default, "isolated" on request) for
+# the three traditional (non-Scalping, non-Grid) strategies. By default a
+# strategy has no dedicated wallet and draws from/settles to the SHARED main
+# paper wallet (get_paper_cash/set_paper_cash above) exactly as before. If the
+# user allocates funds to a specific strategy, that strategy gets its own
+# isolated cash pool and stops touching the shared one, until deallocated.
+# ---------------------------------------------------------------------------
+STRATEGY_WALLET_NAMES = ("counter_trend", "fvg_reversal", "rsi_reversion")
+
+
+async def get_strategy_wallet(strategy: str) -> Optional[dict[str, Any]]:
+    """Returns None if this strategy has no dedicated wallet (i.e. it's on
+    the shared pool). Returns the wallet doc (with 'cash') if isolated."""
+    doc = await db.strategy_wallets.find_one({"_id": strategy}, {"_id": 0})
+    if not doc or not doc.get("allocated"):
+        return None
+    return doc
+
+
+async def get_effective_cash(strategy: Optional[str]) -> float:
+    if strategy in STRATEGY_WALLET_NAMES:
+        w = await get_strategy_wallet(strategy)
+        if w is not None:
+            return w.get("cash", 0.0)
+    return await get_paper_cash()
+
+
+async def adjust_effective_cash(strategy: Optional[str], delta: float) -> None:
+    """Credit/debit the right pool for this strategy: its isolated wallet if
+    it has one, otherwise the shared main paper wallet."""
+    if strategy in STRATEGY_WALLET_NAMES:
+        w = await get_strategy_wallet(strategy)
+        if w is not None:
+            new_cash = w.get("cash", 0.0) + delta
+            await db.strategy_wallets.update_one(
+                {"_id": strategy}, {"$set": {"cash": new_cash}}
+            )
+            return
+    cash = await get_paper_cash()
+    await set_paper_cash(cash + delta)
+
+
 async def open_paper_position(signal: dict[str, Any]) -> Optional[PaperPosition]:
     pcfg = await get_paper_config()
     open_count = await db.paper_positions.count_documents({})
@@ -828,7 +872,8 @@ async def open_paper_position(signal: dict[str, Any]) -> Optional[PaperPosition]
     # Spot mode restrictions: no shorts (spot cannot short natively)
     if pcfg.trading_mode == "spot" and signal["side"] == "short":
         return None
-    cash = await get_paper_cash()
+    strategy = signal.get("strategy")
+    cash = await get_effective_cash(strategy)
 
     # IMMEDIATE EXECUTION: fill at the current live market price (WS or REST),
     # not the planned signal price — this is what produces real slippage.
@@ -856,7 +901,7 @@ async def open_paper_position(signal: dict[str, Any]) -> Optional[PaperPosition]
             notional = qty * fill_price
         if qty <= 0 or notional < 1.0:
             return None
-        await set_paper_cash(cash - notional)  # lock cash on open
+        await adjust_effective_cash(strategy, -notional)  # lock cash on open
 
     # Slippage = actual fill vs planned signal entry
     slip_usdt = (fill_price - signal["entry"]) * qty
@@ -914,6 +959,7 @@ async def close_paper_position(pos: dict[str, Any], exit_price: float, outcome: 
     else:
         pnl = (entry - exit_price) * qty
     pnl_pct = (pnl / (entry * qty)) * 100 if entry > 0 and qty > 0 else 0.0
+    strategy = pos.get("strategy", "counter_trend")
     trade = PaperTrade(
         signal_id=pos["signal_id"],
         symbol=pos["symbol"],
@@ -926,15 +972,15 @@ async def close_paper_position(pos: dict[str, Any], exit_price: float, outcome: 
         outcome=outcome,
         opened_at=pos["opened_at"],
         closed_at=datetime.now(timezone.utc).isoformat(),
+        strategy=strategy,
     )
     await db.paper_trades.insert_one(trade.model_dump())
     await db.paper_positions.delete_one({"id": pos["id"]})
-    cash = await get_paper_cash()
     if pcfg.trading_mode == "spot" and pos["side"] == "long":
         # Unlock notional and add PnL: cash += exit * qty
-        await set_paper_cash(cash + exit_price * qty)
+        await adjust_effective_cash(strategy, exit_price * qty)
     else:
-        await set_paper_cash(cash + pnl)
+        await adjust_effective_cash(strategy, pnl)
     await db.signals.update_one(
         {"id": pos["signal_id"]},
         {"$set": {"outcome": outcome, "status": "closed"}},
@@ -1165,18 +1211,19 @@ async def _close_fraction(pos: dict[str, Any], price: float, frac: float,
     pnl = (price - entry) * close_qty if pos["side"] == "long" else (entry - price) * close_qty
     pnl_pct = (pnl / (entry * close_qty)) * 100 if entry > 0 else 0.0
     pcfg = await get_paper_config()
+    strategy = pos.get("strategy", "counter_trend")
     trade = PaperTrade(
         signal_id=pos["signal_id"], symbol=pos["symbol"], side=pos["side"],
         entry=entry, exit=round(price, 8), quantity=round(close_qty, 8),
         pnl_usdt=round(pnl, 2), pnl_pct=round(pnl_pct, 2), outcome=outcome,
         opened_at=pos["opened_at"], closed_at=datetime.now(timezone.utc).isoformat(),
+        strategy=strategy,
     )
     await db.paper_trades.insert_one(trade.model_dump())
-    cash = await get_paper_cash()
     if pcfg.trading_mode == "spot" and pos["side"] == "long":
-        await set_paper_cash(cash + price * close_qty)
+        await adjust_effective_cash(strategy, price * close_qty)
     else:
-        await set_paper_cash(cash + pnl)
+        await adjust_effective_cash(strategy, pnl)
     upd: dict[str, Any] = {"quantity": round(remain_qty, 8)}
     if set_partial:
         upd["partial_closed"] = True
@@ -2562,6 +2609,147 @@ async def paper_set_capital(payload: dict[str, float]) -> dict[str, Any]:
     await db.paper_trades.delete_many({})
     await set_paper_cash(amount)
     return {"ok": True, "initial_capital": amount, "cash": amount}
+
+
+class StrategyAllocateRequest(BaseModel):
+    amount: float
+
+
+@api.get("/strategy-wallets")
+async def strategy_wallets_status() -> dict[str, Any]:
+    """Allocation status of the three traditional strategies: whether each
+    has isolated funds or is still on the shared main pool."""
+    main_cash = await get_paper_cash()
+    out = []
+    for name in STRATEGY_WALLET_NAMES:
+        w = await get_strategy_wallet(name)
+        open_count = await db.paper_positions.count_documents({"strategy": name})
+        out.append({
+            "strategy": name,
+            "allocated": w is not None,
+            "cash": w.get("cash", 0.0) if w else None,
+            "open_positions": open_count,
+        })
+    return {"shared_cash": round(main_cash, 2), "strategies": out}
+
+
+@api.post("/strategy-wallets/{strategy}/allocate")
+async def strategy_wallet_allocate(strategy: str, req: StrategyAllocateRequest) -> dict[str, Any]:
+    """Move `amount` from the shared main wallet into a dedicated ('isolated')
+    wallet for this strategy. Refused while the strategy has open positions,
+    to avoid mixing up which pool they were opened against."""
+    if strategy not in STRATEGY_WALLET_NAMES:
+        raise HTTPException(status_code=400, detail="invalid strategy")
+    amount = req.amount
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="L'importo deve essere positivo")
+    open_count = await db.paper_positions.count_documents({"strategy": strategy})
+    if open_count > 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Chiudi prima le {open_count} posizioni aperte di questa strategia",
+        )
+    main_cash = await get_paper_cash()
+    if amount > main_cash:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Fondi insufficienti nel portafoglio principale (disponibili: {round(main_cash, 2)})",
+        )
+    await set_paper_cash(main_cash - amount)
+    existing = await get_strategy_wallet(strategy)
+    new_cash = (existing.get("cash", 0.0) if existing else 0.0) + amount
+    await db.strategy_wallets.update_one(
+        {"_id": strategy},
+        {"$set": {"cash": new_cash, "allocated": True}},
+        upsert=True,
+    )
+    return {"ok": True, "strategy": strategy, "cash": new_cash, "main_cash": main_cash - amount}
+
+
+@api.post("/strategy-wallets/{strategy}/deallocate")
+async def strategy_wallet_deallocate(strategy: str) -> dict[str, Any]:
+    """Move all of this strategy's isolated cash back to the shared main
+    wallet, and put the strategy back on the shared pool. Refused while the
+    strategy has open positions."""
+    if strategy not in STRATEGY_WALLET_NAMES:
+        raise HTTPException(status_code=400, detail="invalid strategy")
+    open_count = await db.paper_positions.count_documents({"strategy": strategy})
+    if open_count > 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Chiudi prima le {open_count} posizioni aperte di questa strategia",
+        )
+    w = await get_strategy_wallet(strategy)
+    amount = w.get("cash", 0.0) if w else 0.0
+    await db.strategy_wallets.update_one(
+        {"_id": strategy}, {"$set": {"cash": 0.0, "allocated": False}}, upsert=True
+    )
+    main_cash = await get_paper_cash()
+    await set_paper_cash(main_cash + amount)
+    return {"ok": True, "strategy": strategy, "main_cash": main_cash + amount}
+
+
+@api.get("/strategy/{strategy}/portfolio")
+async def strategy_portfolio(strategy: str) -> dict[str, Any]:
+    """Portfolio view scoped to a single strategy: its positions/trades, and
+    either its own isolated cash or the shared main cash (labeled as such)."""
+    if strategy not in STRATEGY_WALLET_NAMES:
+        raise HTTPException(status_code=400, detail="invalid strategy")
+    w = await get_strategy_wallet(strategy)
+    is_isolated = w is not None
+    cash = w.get("cash", 0.0) if w else await get_paper_cash()
+
+    open_positions = await db.paper_positions.find(
+        {"strategy": strategy}, {"_id": 0}
+    ).to_list(1000)
+    tickers = await exchange.get_tickers()
+    price_map: dict[str, float] = {}
+    for t in tickers:
+        try:
+            price_map[t["symbol"]] = float(t.get("last") or 0)
+        except (TypeError, ValueError):
+            continue
+    unrealized = 0.0
+    allocated = 0.0
+    enriched: list[dict[str, Any]] = []
+    for p in open_positions:
+        cur = price_map.get(p["symbol"], p["entry"])
+        if p["side"] == "long":
+            pnl = (cur - p["entry"]) * p["quantity"]
+        else:
+            pnl = (p["entry"] - cur) * p["quantity"]
+        notional = p["entry"] * p["quantity"]
+        pnl_pct = (pnl / notional) * 100 if notional > 0 else 0
+        unrealized += pnl
+        allocated += cur * p["quantity"]
+        enriched.append({
+            **p, "current_price": round(cur, 8),
+            "unrealized_pnl": round(pnl, 2), "unrealized_pnl_pct": round(pnl_pct, 2),
+        })
+
+    closed = await db.paper_trades.find(
+        {"strategy": strategy}, {"_id": 0}
+    ).sort("closed_at", -1).to_list(500)
+    realized = sum(t.get("pnl_usdt", 0.0) for t in closed)
+    wins = sum(1 for t in closed if t.get("outcome") == "win")
+    losses = sum(1 for t in closed if t.get("outcome") == "loss")
+    settled = wins + losses
+    win_rate = round((wins / settled) * 100, 1) if settled else 0.0
+    equity = cash + allocated if is_isolated else cash
+
+    return {
+        "strategy": strategy,
+        "wallet_type": "isolated" if is_isolated else "shared",
+        "cash": round(cash, 2),
+        "equity": round(equity, 2),
+        "unrealized_pnl": round(unrealized, 2),
+        "realized_pnl": round(realized, 2),
+        "open_positions": enriched,
+        "closed_trades": closed,
+        "open_count": len(enriched),
+        "closed_count": len(closed),
+        "win_rate": win_rate,
+    }
 
 
 @api.post("/paper/mode")
