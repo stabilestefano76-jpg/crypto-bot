@@ -1729,7 +1729,12 @@ async def analyze_pair_fvg_reversal(symbol: str, tf: str, cfg: Config) -> Option
     """FVG Reversal (independent strategy): the FVG forms WITH the trend from a
     strong impulse; the bot trades AGAINST the trend on the retracement back
     toward that FVG. Entry = a reversal candle pattern during the retracement;
-    target = inside the trend FVG. Uses its own `fvgr_*` parameters."""
+    target = inside the trend FVG. Uses its own `fvgr_*` parameters.
+
+    Trend context is read from the HIGHER timeframe (e.g. scanning on 1h ->
+    trend judged on 4h), not the scanning timeframe itself: on a short
+    timeframe the market reads as "range" far more often even when there is
+    a real trend one step up, which was starving this strategy of setups."""
     STRAT = "fvg_reversal"
     candles = await exchange.get_klines(symbol, tf)
     if len(candles) < 60:
@@ -1740,7 +1745,15 @@ async def analyze_pair_fvg_reversal(symbol: str, tf: str, cfg: Config) -> Option
     highs = [c[3] for c in candles]
     lows = [c[4] for c in candles]
 
-    structure = detect_market_structure(candles, cfg.pivot_window)
+    # Fetch the higher-timeframe candles once, upfront — used both for the
+    # trend read below AND the RSI HTF filters further down.
+    htf = _higher_tf(tf)
+    hcandles = await exchange.get_klines(symbol, htf)
+    if len(hcandles) < 20:
+        await log_reject(symbol, tf, STRAT, "dati insufficienti sul timeframe alto")
+        return None
+
+    structure = detect_market_structure(hcandles, cfg.pivot_window)
     if structure == "range":
         await log_reject(symbol, tf, STRAT, "trend non definito (mercato laterale)")
         return None
@@ -1777,9 +1790,7 @@ async def analyze_pair_fvg_reversal(symbol: str, tf: str, cfg: Config) -> Option
         await log_reject(symbol, tf, STRAT, "pattern di inversione non trovato")
         return None
 
-    # RSI filters (independent thresholds).
-    htf = _higher_tf(tf)
-    hcandles = await exchange.get_klines(symbol, htf)
+    # RSI filters (independent thresholds) — reuses the HTF candles fetched above.
     hrsis = rsi_wilder([c[2] for c in hcandles], cfg.rsi_period) if len(hcandles) > cfg.rsi_period else []
     hval = next((r for r in reversed(hrsis) if r is not None), None)
     if hval is None:
