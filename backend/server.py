@@ -24,6 +24,7 @@ from dotenv import load_dotenv
 from fastapi import APIRouter, FastAPI, HTTPException, Query
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field
+from pymongo import ReturnDocument
 from starlette.middleware.cors import CORSMiddleware
 
 ROOT_DIR = Path(__file__).parent
@@ -2704,6 +2705,41 @@ async def paper_set_capital(payload: dict[str, float]) -> dict[str, Any]:
     return {"ok": True, "initial_capital": amount, "cash": amount}
 
 
+class AddFundsRequest(BaseModel):
+    amount: float
+
+
+@api.post("/paper/add-funds")
+async def paper_add_funds(req: AddFundsRequest) -> dict[str, Any]:
+    """Ricarica il portafoglio principale SENZA azzerare posizioni o storico
+    (a differenza di /paper/set-capital, che resetta tutto). Aumenta anche il
+    capitale iniziale della stessa cifra, così il rendimento % percentuale
+    resta corretto (non scambia una ricarica per un guadagno). Incremento
+    atomico: mai a rischio di sovrascrivere un cambio di saldo concorrente
+    (es. un'operazione che si chiude proprio in quell'istante)."""
+    amount = req.amount
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="L'importo deve essere positivo")
+
+    updated_state = await db.paper_state.find_one_and_update(
+        {"_id": PAPER_STATE_ID},
+        {"$inc": {"cash": amount}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    updated_cfg = await db.paper_config.find_one_and_update(
+        {"_id": PAPER_CFG_ID},
+        {"$inc": {"initial_capital": amount}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return {
+        "ok": True,
+        "cash": updated_state.get("cash", amount),
+        "initial_capital": updated_cfg.get("initial_capital", amount),
+    }
+
+
 class StrategyAllocateRequest(BaseModel):
     amount: float
 
@@ -3212,12 +3248,18 @@ async def scalping_transfer(req: ScalpingTransferRequest) -> dict[str, Any]:
 
     await set_paper_cash(main_cash - amount)
 
-    wallet = await get_scalping_wallet()
-    wallet["cash"] = wallet.get("cash", 0.0) + amount
-    wallet["total_transferred_in"] = wallet.get("total_transferred_in", 0.0) + amount
-    await save_scalping_wallet(wallet)
+    # Atomic increment: adds `amount` to whatever is CURRENTLY in the DB,
+    # regardless of any concurrent write (a position opening/closing right
+    # now, etc.) — unlike read-then-overwrite-the-whole-doc, this can never
+    # lose or duplicate money no matter the timing.
+    updated = await db.scalping_wallet.find_one_and_update(
+        {"_id": SCALPING_WALLET_ID},
+        {"$inc": {"cash": amount, "total_transferred_in": amount}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
 
-    return {"ok": True, "scalping_cash": wallet["cash"], "main_cash": main_cash - amount}
+    return {"ok": True, "scalping_cash": updated.get("cash", amount), "main_cash": main_cash - amount}
 
 
 @api.get("/scalping/portfolio")
@@ -3392,14 +3434,15 @@ async def open_scalping_position(doc: dict[str, Any], cfg: Config) -> None:
         stop_loss = fill_price * (1 + SCALPING_SL_PCT)
         take_profit = fill_price * (1 - SCALPING_TP_PCT)
 
-    # Debit the cash FIRST, guarded on the reset counter unchanged since we
-    # read it: if a Reset happened in between (reset_seq bumped), this update
-    # matches nothing and we abort WITHOUT opening the position — this is
-    # what prevents a stale pre-reset cash value from "reviving" funds that
-    # the reset had just zeroed out.
+    # Debit the cash atomically (an $inc, not a computed $set — immune to any
+    # concurrent change to "cash" no matter the timing), guarded on the reset
+    # counter unchanged since we read it: if a Reset happened in between
+    # (reset_seq bumped), this update matches nothing and we abort WITHOUT
+    # opening the position — this is what prevents trading against funds a
+    # reset just wiped.
     result = await db.scalping_wallet.update_one(
         {"_id": SCALPING_WALLET_ID, "reset_seq": reset_seq},
-        {"$set": {"cash": cash - notional}},
+        {"$inc": {"cash": -notional}},
     )
     if result.matched_count == 0:
         logger.warning("Scalping open aborted: reset happened concurrently for %s", doc["symbol"])
@@ -3442,8 +3485,6 @@ async def close_scalping_positions() -> None:
             except (TypeError, ValueError):
                 continue
 
-    wallet = await get_scalping_wallet()
-    cash = wallet.get("cash", 0.0)
     cfg = await get_config()
 
     for p in open_positions:
@@ -3479,7 +3520,14 @@ async def close_scalping_positions() -> None:
         fees = (p["notional"] + exit_notional) * SCALPING_FEE_PCT
         pnl = gross_pnl - fees
 
-        cash += p["notional"] + pnl
+        # Atomic credit per position, immediately — not accumulated locally
+        # and written once at the end (which would risk clobbering a
+        # concurrent deposit/withdraw the same way the old transfer code did).
+        await db.scalping_wallet.update_one(
+            {"_id": SCALPING_WALLET_ID},
+            {"$inc": {"cash": p["notional"] + pnl}},
+            upsert=True,
+        )
 
         # Cooldown: pause re-opening on this symbol after a losing close.
         if pnl < 0:
@@ -3498,9 +3546,6 @@ async def close_scalping_positions() -> None:
             },
         )
 
-    wallet["cash"] = cash
-    await save_scalping_wallet(wallet)
-
 
 
 @api.post("/scalping/withdraw")
@@ -3517,14 +3562,19 @@ async def scalping_withdraw(req: ScalpingTransferRequest) -> dict[str, Any]:
             detail=f"Fondi insufficienti nel portafoglio scalping (disponibili: {round(scalping_cash, 2)})",
         )
 
-    wallet["cash"] = scalping_cash - amount
-    wallet["total_transferred_in"] = wallet.get("total_transferred_in", 0.0) - amount
-    await save_scalping_wallet(wallet)
+    # Atomic decrement (same reasoning as the deposit above): never clobbers
+    # a concurrent change to "cash" made by a position opening/closing.
+    updated = await db.scalping_wallet.find_one_and_update(
+        {"_id": SCALPING_WALLET_ID},
+        {"$inc": {"cash": -amount, "total_transferred_in": -amount}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
 
     main_cash = await get_paper_cash()
     await set_paper_cash(main_cash + amount)
 
-    return {"ok": True, "scalping_cash": wallet["cash"], "main_cash": main_cash + amount}
+    return {"ok": True, "scalping_cash": updated.get("cash", 0.0), "main_cash": main_cash + amount}
 
 
 @api.post("/scalping/reset")
@@ -3712,7 +3762,8 @@ async def monitor_grid_instances() -> None:
         return
     cfg = await get_config()
     wallet = await get_grid_wallet()
-    cash = wallet.get("cash", 0.0)
+    reset_seq = wallet.get("reset_seq", 0)
+    cash = wallet.get("cash", 0.0)  # used only to check affordability before a fill
 
     need_rest = any(price_feed.get(g["symbol"]) is None for g in instances)
     rest_map: dict[str, float] = {}
@@ -3741,7 +3792,14 @@ async def monitor_grid_instances() -> None:
                 exit_notional = cur * pos["quantity"]
                 fees = (pos["notional"] + exit_notional) * GRID_FEE_PCT
                 pnl = (cur - pos["entry"]) * pos["quantity"] - fees
-                cash += pos["notional"] + pnl
+                # Atomic credit, immediately per position (never accumulated
+                # locally and written once — that pattern is what let a
+                # concurrent deposit/withdraw get silently overwritten).
+                await db.grid_wallet.update_one(
+                    {"_id": GRID_WALLET_ID},
+                    {"$inc": {"cash": pos["notional"] + pnl}},
+                    upsert=True,
+                )
                 await db.grid_positions.update_one(
                     {"id": pos["id"]},
                     {"$set": {
@@ -3763,6 +3821,17 @@ async def monitor_grid_instances() -> None:
                 if notional < 1.0 or notional > cash:
                     continue
                 qty = notional / cur
+                # Debit atomically FIRST, guarded on the reset counter: if a
+                # Reset happened since we read the wallet, this matches
+                # nothing and we skip the fill entirely (no ghost position).
+                result = await db.grid_wallet.update_one(
+                    {"_id": GRID_WALLET_ID, "reset_seq": reset_seq},
+                    {"$inc": {"cash": -notional}},
+                )
+                if result.matched_count == 0:
+                    logger.warning("Grid fill aborted: reset happened concurrently for %s", grid["symbol"])
+                    continue
+                cash -= notional  # keep the local affordability check current for this cycle
                 await db.grid_positions.insert_one({
                     "id": str(uuid.uuid4()),
                     "grid_id": grid["id"],
@@ -3775,7 +3844,6 @@ async def monitor_grid_instances() -> None:
                     "opened_at": datetime.now(timezone.utc).isoformat(),
                     "status": "open",
                 })
-                cash -= notional
                 cell["status"] = "holding"
                 changed = True
             elif cell["status"] == "holding" and cur >= cell["sell_price"]:
@@ -3787,7 +3855,11 @@ async def monitor_grid_instances() -> None:
                     exit_notional = cur * pos["quantity"]
                     fees = (pos["notional"] + exit_notional) * GRID_FEE_PCT
                     pnl = (cur - pos["entry"]) * pos["quantity"] - fees
-                    cash += pos["notional"] + pnl
+                    await db.grid_wallet.update_one(
+                        {"_id": GRID_WALLET_ID},
+                        {"$inc": {"cash": pos["notional"] + pnl}},
+                        upsert=True,
+                    )
                     await db.grid_positions.update_one(
                         {"id": pos["id"]},
                         {"$set": {
@@ -3803,17 +3875,6 @@ async def monitor_grid_instances() -> None:
             await db.grid_instances.update_one(
                 {"id": grid["id"]}, {"$set": {"cells": cells}}
             )
-
-    # Guarded write: if a Reset happened while this cycle was running (the
-    # reset counter changed since we read the wallet), discard this cycle's
-    # cash changes instead of writing them on top of a just-reset wallet —
-    # same protection as the Scalping Bot, for the same reason.
-    result = await db.grid_wallet.update_one(
-        {"_id": GRID_WALLET_ID, "reset_seq": wallet.get("reset_seq", 0)},
-        {"$set": {"cash": cash}},
-    )
-    if result.matched_count == 0:
-        logger.warning("Grid wallet update aborted: reset happened concurrently")
 
 
 async def grid_monitor_loop() -> None:
@@ -3845,11 +3906,15 @@ async def grid_transfer(req: GridTransferRequest) -> dict[str, Any]:
             detail=f"Fondi insufficienti nel portafoglio principale (disponibili: {round(main_cash, 2)})",
         )
     await set_paper_cash(main_cash - amount)
-    wallet = await get_grid_wallet()
-    wallet["cash"] = wallet.get("cash", 0.0) + amount
-    wallet["total_transferred_in"] = wallet.get("total_transferred_in", 0.0) + amount
-    await save_grid_wallet(wallet)
-    return {"ok": True, "grid_cash": wallet["cash"], "main_cash": main_cash - amount}
+    # Atomic increment — same reasoning as the Scalping Bot's transfer: never
+    # clobbers a concurrent change to "cash" made by a cell filling/closing.
+    updated = await db.grid_wallet.find_one_and_update(
+        {"_id": GRID_WALLET_ID},
+        {"$inc": {"cash": amount, "total_transferred_in": amount}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return {"ok": True, "grid_cash": updated.get("cash", amount), "main_cash": main_cash - amount}
 
 
 @api.post("/grid/withdraw")
@@ -3864,12 +3929,15 @@ async def grid_withdraw(req: GridTransferRequest) -> dict[str, Any]:
             status_code=400,
             detail=f"Fondi insufficienti nel portafoglio griglia (disponibili: {round(grid_cash, 2)})",
         )
-    wallet["cash"] = grid_cash - amount
-    wallet["total_transferred_in"] = wallet.get("total_transferred_in", 0.0) - amount
-    await save_grid_wallet(wallet)
+    updated = await db.grid_wallet.find_one_and_update(
+        {"_id": GRID_WALLET_ID},
+        {"$inc": {"cash": -amount, "total_transferred_in": -amount}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
     main_cash = await get_paper_cash()
     await set_paper_cash(main_cash + amount)
-    return {"ok": True, "grid_cash": wallet["cash"], "main_cash": main_cash + amount}
+    return {"ok": True, "grid_cash": updated.get("cash", 0.0), "main_cash": main_cash + amount}
 
 
 @api.post("/grid/reset")

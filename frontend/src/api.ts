@@ -202,6 +202,11 @@ export const api = {
       method: "POST",
       body: JSON.stringify({ initial_capital: amount }),
     }),
+  addFunds: (amount: number) =>
+    req<{ ok: boolean; cash: number; initial_capital: number }>("/paper/add-funds", {
+      method: "POST",
+      body: JSON.stringify({ amount }),
+    }),
   setMode: (mode: "manual" | "auto") =>
     req<{ ok: boolean; mode: string; auto_execute: boolean }>("/paper/mode", {
       method: "POST",
