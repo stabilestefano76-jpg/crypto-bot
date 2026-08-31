@@ -3110,11 +3110,17 @@ async def run_scalping_scan() -> dict[str, Any]:
 
     tickers = await exchange.get_tickers()
     vol_map: dict[str, float] = {}
+    rest_price_map: dict[str, float] = {}
     for t in tickers:
         try:
             vol_map[t["symbol"]] = float(t.get("volValue") or 0)
         except (TypeError, ValueError):
             continue
+        try:
+            rest_price_map[t["symbol"]] = float(t.get("last") or 0)
+        except (TypeError, ValueError):
+            continue
+
 
     symbols = await exchange.get_symbols()
     quotes = {q.strip() for q in (cfg.quote_filter or "").split(",") if q.strip()}
@@ -3155,6 +3161,14 @@ async def run_scalping_scan() -> dict[str, Any]:
         result = analyze_scalping(highs, lows, closes, volumes, rsis, cfg)
         if not result.get("confirmed"):
             continue
+        # Use the freshest price available for the fill — NOT the last closed
+        # candle's close, which can be up to a full timeframe old (5 min) and
+        # was letting positions open already past their own tight SL/TP: (1)
+        # the live WebSocket cache, if this symbol already has an open
+        # position feeding it; (2) the REST ticker fetched moments ago at the
+        # top of this same scan (fresh within seconds, not minutes); (3) the
+        # candle close only as a last resort.
+        live_price = price_feed.get(symbol) or rest_price_map.get(symbol) or closes[-1]
         doc = {
             "id": str(uuid.uuid4()),
             "symbol": symbol,
@@ -3167,7 +3181,7 @@ async def run_scalping_scan() -> dict[str, Any]:
             "bb_upper": result["bb_upper"],
             "ema_fast": result["ema_fast"],
             "ema_slow": result["ema_slow"],
-            "price": closes[-1],
+            "price": live_price,
             "status": "active",
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
