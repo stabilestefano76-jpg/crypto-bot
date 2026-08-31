@@ -30,6 +30,9 @@ export default function PortfolioScreen() {
   const [resetting, setResetting] = useState(false);
   const [capitalInput, setCapitalInput] = useState("");
   const [capitalSaving, setCapitalSaving] = useState(false);
+  const [addFundsInput, setAddFundsInput] = useState("");
+  const [addFundsSaving, setAddFundsSaving] = useState(false);
+  const [addFundsMsg, setAddFundsMsg] = useState<string | null>(null);
   const [modeSaving, setModeSaving] = useState(false);
   const [connectVisible, setConnectVisible] = useState(false);
   const [exchange, setExchange] = useState<{
@@ -91,6 +94,25 @@ export default function PortfolioScreen() {
       await load();
     } finally {
       setCapitalSaving(false);
+    }
+  };
+
+  const onAddFunds = async () => {
+    const n = Number(addFundsInput);
+    if (!Number.isFinite(n) || n <= 0) return;
+    setAddFundsSaving(true);
+    setAddFundsMsg(null);
+    try {
+      await api.addFunds(n);
+      setAddFundsInput("");
+      setAddFundsMsg(`+$${n.toFixed(2)} aggiunti`);
+      setTimeout(() => setAddFundsMsg(null), 3000);
+      await load();
+    } catch (e: any) {
+      setAddFundsMsg(e?.message || "Ricarica non riuscita");
+      setTimeout(() => setAddFundsMsg(null), 4000);
+    } finally {
+      setAddFundsSaving(false);
     }
   };
 
@@ -275,6 +297,52 @@ export default function PortfolioScreen() {
 
           <View style={styles.divider} />
 
+          <Text style={styles.controlsLabel}>Ricarica fondi (senza reset)</Text>
+          <View style={styles.capitalRow}>
+            <TextInput
+              style={styles.capitalInput}
+              value={addFundsInput}
+              onChangeText={setAddFundsInput}
+              keyboardType="decimal-pad"
+              placeholder="es. 500"
+              placeholderTextColor={colors.onSurfaceTertiary}
+              testID="input-add-funds"
+            />
+            <Pressable
+              onPress={onAddFunds}
+              disabled={addFundsSaving}
+              style={({ pressed }) => [
+                styles.capitalBtn,
+                pressed && { opacity: 0.7 },
+              ]}
+              testID="add-funds-button"
+            >
+              {addFundsSaving ? (
+                <ActivityIndicator size="small" color={colors.onBrand} />
+              ) : (
+                <Text style={styles.capitalBtnText}>Ricarica</Text>
+              )}
+            </Pressable>
+          </View>
+          <Text style={styles.modeHelp}>
+            Aggiunge liquidità al saldo attuale: posizioni aperte e storico
+            restano intatti. Usa &quot;Set &amp; Reset&quot; qui sotto solo se
+            vuoi ripartire da zero.
+          </Text>
+          {addFundsMsg && (
+            <Text
+              style={{
+                color: addFundsMsg.startsWith("+") ? colors.success : colors.error,
+                fontSize: 11,
+                fontWeight: "700",
+              }}
+            >
+              {addFundsMsg}
+            </Text>
+          )}
+
+          <View style={styles.divider} />
+
           <Text style={styles.controlsLabel}>Initial Capital (USDT)</Text>
           <View style={styles.capitalRow}>
             <TextInput
@@ -302,6 +370,10 @@ export default function PortfolioScreen() {
               )}
             </Pressable>
           </View>
+          <Text style={styles.modeHelp}>
+            Attenzione: cancella posizioni aperte e storico, e riparte da
+            questo importo.
+          </Text>
 
           <View style={styles.divider} />
 
