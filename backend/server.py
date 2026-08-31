@@ -1528,6 +1528,39 @@ def detect_reversal_pattern(opens, highs, lows, closes, against: str) -> Optiona
     return None
 
 
+def detect_stepped_rejection_pattern(opens, highs, lows, closes, against: str) -> Optional[str]:
+    """Alternative reversal signal (checked alongside detect_reversal_pattern,
+    not instead of it): the last 3 candles each show a genuine, long rejection
+    wick against the trend (sellers/buyers still pushing hard each time), BUT
+    each candle's extreme is less far than the last — higher lows during a
+    downtrend (bullish case) or lower highs during an uptrend (bearish case).
+    This is buyers/sellers stepping in progressively earlier each time, a
+    concrete footprint of strengthening opposition right before a reversal —
+    distinct from a pattern of merely shrinking wicks, which would also
+    accept fading effort with no clear directional structure."""
+    if len(closes) < 3:
+        return None
+    idx = (-3, -2, -1)
+    if against == "bearish":  # trend UP -> want LOWER HIGHS with long upper-wick rejection
+        extremes = [highs[i] for i in idx]
+        spikes = [highs[i] - max(opens[i], closes[i]) for i in idx]
+        bodies = [abs(closes[i] - opens[i]) for i in idx]
+        stepping = extremes[0] > extremes[1] > extremes[2]
+        label = "Massimi Decrescenti con Rifiuto"
+    else:  # trend DOWN -> want HIGHER LOWS with long lower-wick rejection
+        extremes = [lows[i] for i in idx]
+        spikes = [min(opens[i], closes[i]) - lows[i] for i in idx]
+        bodies = [abs(closes[i] - opens[i]) for i in idx]
+        stepping = extremes[0] < extremes[1] < extremes[2]
+        label = "Minimi Crescenti con Rifiuto"
+    # "long" wick = at least as long as the candle's own body (avoids
+    # accepting doji-like candles with a barely-there wick as "rejection").
+    long_enough = all(s > 0 and s >= b for s, b in zip(spikes, bodies))
+    if stepping and long_enough:
+        return label
+    return None
+
+
 def _rsi_momentum_turn(rsis: list[Optional[float]], side: str, ob: float, os_: float) -> bool:
     vals = [r for r in rsis[-4:] if r is not None]
     if len(vals) < 2:
@@ -1601,11 +1634,15 @@ async def analyze_pair_counter(symbol: str, tf: str, cfg: Config) -> Optional[Si
     # Step 3: reversal pattern INSIDE the consolidation (before the breakout).
     #   long  -> bullish reversal (bullish engulfing / morning star)
     #   short -> bearish reversal (bearish engulfing / evening star)
+    # Two independent ways to confirm this — either is enough (not both):
+    # the classic candlestick pattern, OR three consecutive candles whose
+    # wicks against the trend shrink each time (fading momentum).
     against = "bullish" if side == "long" else "bearish"
-    pattern = detect_reversal_pattern(
-        [c[1] for c in box], [c[3] for c in box],
-        [c[4] for c in box], [c[2] for c in box], against,
-    )
+    box_opens, box_highs = [c[1] for c in box], [c[3] for c in box]
+    box_lows, box_closes = [c[4] for c in box], [c[2] for c in box]
+    pattern = detect_reversal_pattern(box_opens, box_highs, box_lows, box_closes, against)
+    if pattern is None:
+        pattern = detect_stepped_rejection_pattern(box_opens, box_highs, box_lows, box_closes, against)
     if pattern is None:
         await log_reject(symbol, tf, STRAT, "pattern di inversione non trovato")
         return None
@@ -1783,9 +1820,13 @@ async def analyze_pair_fvg_reversal(symbol: str, tf: str, cfg: Config) -> Option
         await log_reject(symbol, tf, STRAT, "esaurimento trend non confermato")
         return None
 
-    # Reversal pattern AGAINST the trend during the retracement.
+    # Reversal pattern AGAINST the trend during the retracement — either the
+    # classic candlestick pattern, or three consecutive shrinking wicks
+    # against the trend (fading momentum), same as Rev Pre-FVG.
     against = "bearish" if trend == "up" else "bullish"
     pattern = detect_reversal_pattern(opens, highs, lows, closes, against)
+    if pattern is None:
+        pattern = detect_stepped_rejection_pattern(opens, highs, lows, closes, against)
     if pattern is None:
         await log_reject(symbol, tf, STRAT, "pattern di inversione non trovato")
         return None
