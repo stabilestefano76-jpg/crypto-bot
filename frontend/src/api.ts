@@ -484,6 +484,11 @@ export const strategyWalletApi = {
       `/strategy-wallets/${strategy}/allocate`,
       { method: "POST", body: JSON.stringify({ amount }) }
     ),
+  withdraw: (strategy: StrategyName, amount: number) =>
+    req<{ ok: boolean; strategy: string; cash: number; main_cash: number }>(
+      `/strategy-wallets/${strategy}/withdraw`,
+      { method: "POST", body: JSON.stringify({ amount }) }
+    ),
   deallocate: (strategy: StrategyName) =>
     req<{ ok: boolean; strategy: string; main_cash: number }>(
       `/strategy-wallets/${strategy}/deallocate`,

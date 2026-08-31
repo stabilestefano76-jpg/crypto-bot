@@ -2829,6 +2829,60 @@ async def strategy_wallet_deallocate(strategy: str) -> dict[str, Any]:
     return {"ok": True, "strategy": strategy, "main_cash": main_cash + amount}
 
 
+@api.post("/strategy-wallets/{strategy}/withdraw")
+async def strategy_wallet_withdraw(strategy: str, req: StrategyAllocateRequest) -> dict[str, Any]:
+    """Withdraw a SPECIFIC amount from this strategy's isolated wallet back
+    to the shared main wallet (unlike /deallocate, which always takes
+    everything). If the withdrawal empties the isolated wallet, the strategy
+    automatically goes back on the shared pool. Refused while the strategy
+    has open positions. Atomic: the debit only applies if the isolated
+    wallet still has at least `amount` at the moment of the write, so it can
+    never go negative even under concurrent activity."""
+    if strategy not in STRATEGY_WALLET_NAMES:
+        raise HTTPException(status_code=400, detail="invalid strategy")
+    amount = req.amount
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="L'importo deve essere positivo")
+    open_count = await db.paper_positions.count_documents({"strategy": strategy})
+    if open_count > 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Chiudi prima le {open_count} posizioni aperte di questa strategia",
+        )
+    updated = await db.strategy_wallets.find_one_and_update(
+        {"_id": strategy, "allocated": True, "cash": {"$gte": amount}},
+        {"$inc": {"cash": -amount}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        w = await get_strategy_wallet(strategy)
+        avail = w.get("cash", 0.0) if w else 0.0
+        raise HTTPException(
+            status_code=400,
+            detail=f"Fondi insufficienti nel portafoglio isolato (disponibili: {round(avail, 2)})",
+        )
+    new_cash = updated.get("cash", 0.0)
+    if new_cash <= 0.0001:
+        # Fully emptied: revert to the shared pool automatically, same end
+        # state as /deallocate.
+        await db.strategy_wallets.update_one(
+            {"_id": strategy}, {"$set": {"cash": 0.0, "allocated": False}}
+        )
+        new_cash = 0.0
+    main_updated = await db.paper_state.find_one_and_update(
+        {"_id": PAPER_STATE_ID},
+        {"$inc": {"cash": amount}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return {
+        "ok": True,
+        "strategy": strategy,
+        "cash": round(new_cash, 4),
+        "main_cash": round(main_updated.get("cash", amount), 4),
+    }
+
+
 @api.get("/strategy/{strategy}/portfolio")
 async def strategy_portfolio(strategy: str) -> dict[str, Any]:
     """Portfolio view scoped to a single strategy: its positions/trades, and

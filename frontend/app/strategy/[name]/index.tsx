@@ -68,7 +68,9 @@ export default function StrategyScreen() {
   const [modalVisible, setModalVisible] = useState(false);
   const [amountText, setAmountText] = useState("");
   const [transferring, setTransferring] = useState(false);
-  const [deallocating, setDeallocating] = useState(false);
+  const [withdrawModalVisible, setWithdrawModalVisible] = useState(false);
+  const [withdrawText, setWithdrawText] = useState("");
+  const [withdrawing, setWithdrawing] = useState(false);
 
   const selected = useMemo(
     () => portfolio?.open_positions.find((p) => p.id === selectedId) ?? portfolio?.open_positions[0] ?? null,
@@ -148,28 +150,23 @@ export default function StrategyScreen() {
     }
   };
 
-  const onDeallocate = () => {
-    Alert.alert(
-      "Libera fondi",
-      "I fondi isolati di questa strategia torneranno nel portafoglio principale condiviso. Continuare?",
-      [
-        { text: "Annulla", style: "cancel" },
-        {
-          text: "Libera",
-          onPress: async () => {
-            setDeallocating(true);
-            try {
-              await strategyWalletApi.deallocate(strategy);
-              await load();
-            } catch (e: any) {
-              Alert.alert("Operazione fallita", e?.message || "Errore sconosciuto");
-            } finally {
-              setDeallocating(false);
-            }
-          },
-        },
-      ]
-    );
+  const onWithdraw = async () => {
+    const amount = parseFloat(withdrawText.replace(",", "."));
+    if (!amount || amount <= 0) {
+      Alert.alert("Importo non valido", "Inserisci un numero maggiore di zero.");
+      return;
+    }
+    setWithdrawing(true);
+    try {
+      await strategyWalletApi.withdraw(strategy, amount);
+      setWithdrawModalVisible(false);
+      setWithdrawText("");
+      await load();
+    } catch (e: any) {
+      Alert.alert("Prelievo fallito", e?.message || "Errore sconosciuto");
+    } finally {
+      setWithdrawing(false);
+    }
   };
 
   const renderPosition = (p: PaperPosition, closed: boolean, pnlOverride?: number) => {
@@ -308,33 +305,27 @@ export default function StrategyScreen() {
               </View>
             </View>
 
-            {portfolio?.wallet_type === "isolated" ? (
+            <View style={styles.depositWithdrawRow}>
               <Pressable
-                style={({ pressed }) => [styles.withdrawBtn, pressed && { opacity: 0.7 }]}
-                onPress={onDeallocate}
-                disabled={deallocating}
-              >
-                {deallocating ? (
-                  <ActivityIndicator size="small" color={colors.onSurface} />
-                ) : (
-                  <>
-                    <Ionicons name="arrow-up-circle" size={16} color={colors.onSurface} />
-                    <Text style={styles.withdrawBtnText}>Libera fondi (torna condiviso)</Text>
-                  </>
-                )}
-              </Pressable>
-            ) : (
-              <Pressable
-                style={({ pressed }) => [styles.transferBtn, pressed && { opacity: 0.7 }]}
+                style={({ pressed }) => [styles.depositBtn, pressed && { opacity: 0.7 }]}
                 onPress={() => setModalVisible(true)}
               >
-                <Ionicons name="arrow-down-circle" size={16} color={colors.onBrand} />
-                <Text style={styles.transferBtnText}>Alloca fondi dedicati</Text>
+                <Ionicons name="arrow-down-circle" size={16} color="#000" />
+                <Text style={styles.depositBtnText}>Deposita</Text>
               </Pressable>
-            )}
+              <Pressable
+                style={({ pressed }) => [styles.withdrawBtn, pressed && { opacity: 0.7 }]}
+                onPress={() => setWithdrawModalVisible(true)}
+                disabled={portfolio?.wallet_type !== "isolated"}
+              >
+                <Ionicons name="arrow-up-circle" size={16} color={colors.onSurface} />
+                <Text style={styles.withdrawBtnText}>Preleva</Text>
+              </Pressable>
+            </View>
             {portfolio?.wallet_type === "shared" && (
               <Text style={styles.sharedNote}>
-                Condiviso con le altre strategie tradizionali · principale: {money(walletStatus?.shared_cash)}
+                Condiviso con le altre strategie tradizionali · principale: {money(walletStatus?.shared_cash)}.
+                Deposita per isolare fondi dedicati a questa strategia.
               </Text>
             )}
           </View>
@@ -388,7 +379,7 @@ export default function StrategyScreen() {
       <Modal visible={modalVisible} transparent animationType="fade">
         <View style={styles.modalOverlay}>
           <View style={styles.modalBox}>
-            <Text style={styles.modalTitle}>Alloca fondi</Text>
+            <Text style={styles.modalTitle}>Deposita</Text>
             <Text style={styles.modalSubtitle}>
               Sposta fondi dal portafoglio principale a questa strategia. Da quel momento userà
               solo il saldo dedicato, indipendente dalle altre.
@@ -417,6 +408,48 @@ export default function StrategyScreen() {
                 disabled={transferring}
               >
                 {transferring ? (
+                  <ActivityIndicator color={colors.onBrand} size="small" />
+                ) : (
+                  <Text style={[styles.modalBtnText, { color: colors.onBrand }]}>Conferma</Text>
+                )}
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={withdrawModalVisible} transparent animationType="fade">
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalBox}>
+            <Text style={styles.modalTitle}>Preleva</Text>
+            <Text style={styles.modalSubtitle}>
+              Sposta fondi dal saldo isolato di questa strategia al portafoglio principale.
+              Se prelevi tutto, la strategia torna condivisa.
+            </Text>
+            <TextInput
+              style={styles.modalInput}
+              placeholder="Importo in USDT"
+              placeholderTextColor={colors.onSurfaceSecondary}
+              keyboardType="decimal-pad"
+              value={withdrawText}
+              onChangeText={setWithdrawText}
+            />
+            <View style={styles.modalButtons}>
+              <Pressable
+                style={[styles.modalBtn, { backgroundColor: colors.surfaceTertiary }]}
+                onPress={() => {
+                  setWithdrawModalVisible(false);
+                  setWithdrawText("");
+                }}
+              >
+                <Text style={styles.modalBtnText}>Annulla</Text>
+              </Pressable>
+              <Pressable
+                style={[styles.modalBtn, { backgroundColor: colors.brand }]}
+                onPress={onWithdraw}
+                disabled={withdrawing}
+              >
+                {withdrawing ? (
                   <ActivityIndicator color={colors.onBrand} size="small" />
                 ) : (
                   <Text style={[styles.modalBtnText, { color: colors.onBrand }]}>Conferma</Text>
@@ -479,7 +512,13 @@ const styles = StyleSheet.create({
   walletLabel: { color: colors.onSurfaceSecondary, fontSize: font.sm, marginBottom: 2 },
   walletValue: { color: colors.onSurface, fontSize: font.lg, fontWeight: "700" },
   walletValueBig: { color: colors.onSurface, fontSize: font.xl, fontWeight: "800" },
-  transferBtn: {
+  depositWithdrawRow: {
+    flexDirection: "row",
+    gap: spacing.sm,
+    marginTop: spacing.xs,
+  },
+  depositBtn: {
+    flex: 1,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
@@ -487,10 +526,10 @@ const styles = StyleSheet.create({
     backgroundColor: colors.brand,
     borderRadius: radius.pill,
     paddingVertical: spacing.sm,
-    marginTop: spacing.xs,
   },
-  transferBtnText: { color: colors.onBrand, fontWeight: "700", fontSize: font.base },
+  depositBtnText: { color: "#000", fontWeight: "700", fontSize: font.base },
   withdrawBtn: {
+    flex: 1,
     flexDirection: "row",
     alignItems: "center",
     justifyContent: "center",
@@ -498,7 +537,6 @@ const styles = StyleSheet.create({
     backgroundColor: colors.surfaceTertiary,
     borderRadius: radius.pill,
     paddingVertical: spacing.sm,
-    marginTop: spacing.xs,
   },
   withdrawBtnText: { color: colors.onSurface, fontWeight: "700", fontSize: font.base },
   sharedNote: {
