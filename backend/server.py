@@ -159,6 +159,7 @@ class Config(BaseModel):
     grid_atr_spacing_mult: float = 1.8  # distance between grid levels = this * ATR
     grid_range_break_atr_mult: float = 3.0  # emergency stop: price this many ATR below the lowest level
     grid_max_pairs: int = 4  # max symbols with an active grid at once
+    grid_replace_improvement_pct: float = 20.0  # candidate must be this much MORE lateral (lower bb_width+ema_gap) than the worst idle active grid to replace it
 
 
 class Signal(BaseModel):
@@ -3819,8 +3820,14 @@ async def create_grid_instance(symbol: str, cfg: Config) -> Optional[dict[str, A
 
 
 async def run_grid_scan() -> dict[str, Any]:
-    """Pick eligible (ranging, high-volume) pairs without an active grid yet,
-    and create grids for them up to `grid_max_pairs` concurrent symbols."""
+    """Score EVERY eligible (ranging, high-volume) candidate pair first, THEN
+    fill open slots with the best-scoring ones (tightest Bollinger + flattest
+    EMA) — not just the first ones found scanning in volume order. Once slots
+    are full, whatever's left over is still considered for a replacement: if
+    a leftover candidate is meaningfully MORE lateral than the worst-scoring
+    currently-active grid that has NO cell currently holding (no capital
+    mid-trade gets forced out — only idle, still-armed capital is ever
+    reassigned), it swaps in."""
     cfg = await get_config()
     if not cfg.grid_enabled:
         return {"skipped": True, "reason": "grid disabled"}
@@ -3829,12 +3836,10 @@ async def run_grid_scan() -> dict[str, Any]:
         return {"skipped": True, "reason": "no funds in grid wallet"}
 
     active_instances = await db.grid_instances.find(
-        {"status": "active"}, {"_id": 0, "symbol": 1}
+        {"status": "active"}, {"_id": 0}
     ).to_list(100)
     active_symbols = {g["symbol"] for g in active_instances}
     slots = cfg.grid_max_pairs - len(active_instances)
-    if slots <= 0:
-        return {"scanned": 0, "created": 0}
 
     tickers = await exchange.get_tickers()
     vol_map: dict[str, float] = {}
@@ -3865,15 +3870,72 @@ async def run_grid_scan() -> dict[str, Any]:
     candidates.sort(key=lambda s: vol_map.get(s, 0), reverse=True)
     candidates = candidates[:30]  # cap scan for performance
 
-    created = 0
+    # Score EVERY candidate up front (one pass), instead of stopping at the
+    # first ones that qualify — so slot-filling can pick the tightest/best,
+    # not just the fastest-found-in-volume-order.
+    scored: list[tuple[float, str]] = []  # (score, symbol) — lower = more lateral
     for sym in candidates:
-        if slots <= 0:
-            break
+        cand_candles = await exchange.get_klines(sym, cfg.grid_timeframe)
+        if len(cand_candles) < 60:
+            continue
+        cand_close = [c[2] for c in cand_candles]
+        cand_elig = analyze_grid_eligibility(cand_close, cfg)
+        if not cand_elig["ranging"]:
+            continue
+        scored.append((cand_elig["bb_width_pct"] + cand_elig["ema_gap_pct"], sym))
+    scored.sort(key=lambda x: x[0])  # best (lowest/tightest) first
+
+    created = 0
+    used = 0
+    while slots > 0 and used < len(scored):
+        _, sym = scored[used]
+        used += 1
         grid = await create_grid_instance(sym, cfg)
         if grid:
             created += 1
             slots -= 1
-    return {"scanned": len(candidates), "created": created}
+    leftover = scored[used:]  # already scored, not used to fill a slot
+
+    # --- Replacement pass: slots are full, but the leftover candidates are
+    # still worth checking against the weakest idle active grids. ---
+    replaced = 0
+    if leftover:
+        holding_grid_ids = {
+            p["grid_id"] for p in await db.grid_positions.find(
+                {"status": "open"}, {"_id": 0, "grid_id": 1}
+            ).to_list(1000)
+        }
+        idle_actives = [g for g in active_instances if g["id"] not in holding_grid_ids]
+        # Score every idle active grid with its CURRENT tightness (not the
+        # value from whenever it was created — the market may have drifted).
+        idle_scored: list[tuple[float, dict[str, Any]]] = []
+        for g in idle_actives:
+            gcandles = await exchange.get_klines(g["symbol"], cfg.grid_timeframe)
+            if len(gcandles) < 60:
+                continue
+            gclose = [c[2] for c in gcandles]
+            gelig = analyze_grid_eligibility(gclose, cfg)
+            score = gelig["bb_width_pct"] + gelig["ema_gap_pct"]
+            idle_scored.append((score, g))
+        idle_scored.sort(key=lambda x: x[0], reverse=True)  # worst (highest) first
+
+        for cand_score, sym in leftover:
+            if not idle_scored:
+                break
+            worst_score, worst_grid = idle_scored[0]
+            required = worst_score * (1 - cfg.grid_replace_improvement_pct / 100)
+            if cand_score >= required or worst_score <= 0:
+                continue  # not enough of an improvement to justify swapping
+            await db.grid_instances.update_one(
+                {"id": worst_grid["id"]},
+                {"$set": {"status": "stopped", "stopped_reason": "replaced_by_better_pair"}},
+            )
+            new_grid = await create_grid_instance(sym, cfg)
+            if new_grid:
+                replaced += 1
+                idle_scored.pop(0)  # that slot is now taken by the new grid
+
+    return {"scanned": len(candidates), "created": created, "replaced": replaced}
 
 
 async def monitor_grid_instances() -> None:
