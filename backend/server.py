@@ -1572,14 +1572,19 @@ def _rsi_momentum_turn(rsis: list[Optional[float]], side: str, ob: float, os_: f
 
 
 async def analyze_pair_counter(symbol: str, tf: str, cfg: Config) -> Optional[Signal]:
-    """Pre-FVG reversal breakout strategy (spec-exact, replaces old counter-trend).
+    """Pre-FVG reversal strategy (spec-exact, replaces old counter-trend).
 
-    Sequence: an impulse leaves an unfilled FVG -> price consolidates in a tight
-    box -> a reversal candle pattern forms INSIDE the box -> price breaks the box.
-    Trade direction = the breakout direction. Target = the OPPOSITE (far) edge of
-    the FVG left behind by the impulse the reversal contradicts, in the same
-    direction as the breakout. Confirmations: volume spike on the breakout + the
-    RSI filters (HTF extreme, momentum turn, divergence coherent with entry).
+    Sequence: an impulse leaves an unfilled FVG -> price consolidates in a
+    tight box -> a reversal pattern (candlestick, OR three candles with
+    higher-lows/lower-highs + rejection wicks) forms at the end of the box.
+    Trade direction is AGAINST the higher-timeframe trend (same reasoning as
+    FVG Reversal) — the reversal pattern itself is the trigger; no separate
+    wait for price to close beyond the box is required anymore, since the
+    stepped-rejection pattern already IS the directional signal, and waiting
+    for an extra breakout candle on top of it was rarely satisfied.
+    Target = the OPPOSITE (far) edge of the FVG left behind by the impulse
+    the reversal contradicts. Confirmations: volume spike + RSI filters
+    (HTF extreme, momentum turn, divergence coherent with entry).
     """
     STRAT = "counter_trend"
     candles = await exchange.get_klines(symbol, tf)
@@ -1597,46 +1602,46 @@ async def analyze_pair_counter(symbol: str, tf: str, cfg: Config) -> Optional[Si
         await log_reject(symbol, tf, STRAT, "ATR non calcolabile")
         return None
 
-    # Step 1: consolidation box = the K candles BEFORE the last (breakout) candle.
+    # Trend context from the HIGHER timeframe (same reasoning as FVG
+    # Reversal): the box's direction is judged one level up, not on the
+    # scanning timeframe itself, which reads as "range" far too often.
+    htf = _higher_tf(tf)
+    hcandles = await exchange.get_klines(symbol, htf)
+    if len(hcandles) < 20:
+        await log_reject(symbol, tf, STRAT, "dati insufficienti sul timeframe alto")
+        return None
+    structure = detect_market_structure(hcandles, cfg.pivot_window)
+    if structure == "range":
+        await log_reject(symbol, tf, STRAT, "trend non definito (mercato laterale)")
+        return None
+    trend = structure  # 'up' or 'down'
+    side = "short" if trend == "up" else "long"  # AGAINST the trend
+
+    # Step 1: consolidation box = the last K candles (tightness context).
     k = cfg.consolidation_min_candles
-    if len(candles) < k + 2:
+    if len(candles) < k + 1:
         await log_reject(symbol, tf, STRAT, "dati insufficienti")
         return None
-    box = candles[-(k + 1):-1]
+    box = candles[-k:]
     box_high = max(c[3] for c in box)
     box_low = min(c[4] for c in box)
     if (box_high - box_low) > cfg.consolidation_max_atr * atr:
         await log_reject(symbol, tf, STRAT, "consolidamento troppo ampio")
         return None
 
-    # Step 2: breakout direction from the last CLOSED candle (close-confirmed).
-    bo_close = closes[-1]
-    if bo_close > box_high:
-        side = "long"
-    elif bo_close < box_low:
-        side = "short"
-    else:
-        await log_reject(symbol, tf, STRAT, "nessun breakout confermato")
-        return None
-
     # --- Trend Exhaustion Score (additive, before the reversal-pattern search) ---
-    # The trade direction is the breakout direction (`side`); the trend this
-    # strategy trades AGAINST is therefore the opposite direction.
     rsis = rsi_wilder(closes, cfg.rsi_period)
-    exhaustion_trend = "down" if side == "long" else "up"
     exhaustion = detect_trend_exhaustion(
-        opens, highs, lows, closes, vols, rsis, exhaustion_trend, cfg
+        opens, highs, lows, closes, vols, rsis, trend, cfg
     )
     if not exhaustion["confirmed"]:
         await log_reject(symbol, tf, STRAT, "esaurimento trend non confermato")
         return None
 
-    # Step 3: reversal pattern INSIDE the consolidation (before the breakout).
-    #   long  -> bullish reversal (bullish engulfing / morning star)
-    #   short -> bearish reversal (bearish engulfing / evening star)
-    # Two independent ways to confirm this — either is enough (not both):
-    # the classic candlestick pattern, OR three consecutive candles whose
-    # wicks against the trend shrink each time (fading momentum).
+    # Step 2: reversal pattern AT THE END OF the box — this is now the
+    # trigger itself, not a confirmation of an already-happened breakout.
+    # Either the classic candlestick pattern, OR three consecutive candles
+    # with higher-lows/lower-highs + a genuine rejection wick each time.
     against = "bullish" if side == "long" else "bearish"
     box_opens, box_highs = [c[1] for c in box], [c[3] for c in box]
     box_lows, box_closes = [c[4] for c in box], [c[2] for c in box]
@@ -1647,10 +1652,10 @@ async def analyze_pair_counter(symbol: str, tf: str, cfg: Config) -> Optional[Si
         await log_reject(symbol, tf, STRAT, "pattern di inversione non trovato")
         return None
 
-    # Step 4: the impulse FVG the reversal contradicts, in the breakout direction.
+    # Step 3: the impulse FVG the reversal contradicts, in the trade direction.
     #   long  -> a BEARISH FVG above  (impulse was down; price fills upward)
     #   short -> a BULLISH FVG below  (impulse was up; price fills downward)
-    entry = box_high if side == "long" else box_low
+    entry = closes[-1]
     fvgs = detect_all_fvgs(highs, lows, cfg.fvg_lookback)
     if side == "long":
         targets = [f for f in fvgs if f["kind"] == "bearish" and f["top"] > entry]
@@ -1681,7 +1686,7 @@ async def analyze_pair_counter(symbol: str, tf: str, cfg: Config) -> Optional[Si
             await log_reject(symbol, tf, STRAT, "target non valido")
             return None
 
-    # Step 5: stop beyond the consolidation box (ATR/structure buffer).
+    # Step 4: stop beyond the consolidation box (ATR/structure buffer).
     sl_buffer = max(cfg.atr_sl_multiplier * atr, entry * (cfg.sl_padding_pct / 100))
     stop_loss = (box_low - sl_buffer) if side == "long" else (box_high + sl_buffer)
     risk = abs(entry - stop_loss)
@@ -1693,14 +1698,13 @@ async def analyze_pair_counter(symbol: str, tf: str, cfg: Config) -> Optional[Si
         await log_reject(symbol, tf, STRAT, "R:R insufficiente")
         return None
 
-    # Step 6: confirmations — volume spike on breakout + RSI filters.
+    # Step 5: confirmations — volume spike + RSI filters.
     vol_ratio = volume_spike_ratio(vols, cfg.volume_ma_period)
     if vol_ratio < cfg.volume_spike_multiplier:
-        await log_reject(symbol, tf, STRAT, "volume insufficiente sul breakout")
+        await log_reject(symbol, tf, STRAT, "volume insufficiente")
         return None
-    # (a) higher-TF extreme (oversold for long / overbought for short)
-    htf = _higher_tf(tf)
-    hcandles = await exchange.get_klines(symbol, htf)
+    # (a) higher-TF extreme (oversold for long / overbought for short) —
+    # reuses the hcandles already fetched above for the trend read.
     hrsis = rsi_wilder([c[2] for c in hcandles], cfg.rsi_period) if len(hcandles) > cfg.rsi_period else []
     hval = next((r for r in reversed(hrsis) if r is not None), None)
     if hval is None:
@@ -1726,7 +1730,7 @@ async def analyze_pair_counter(symbol: str, tf: str, cfg: Config) -> Optional[Si
         symbol=symbol, timeframe=tf, side=side,
         entry=round(entry, 8), stop_loss=round(stop_loss, 8),
         take_profit=round(tp1, 8), rr_ratio=cfg.rr_ratio,
-        confirmations=["Consolidation Breakout", pattern, "Volume Spike",
+        confirmations=["Box Ristretto", pattern, "Volume Spike",
                        "RSI HTF Extreme", "RSI Momentum Turn", "RSI Divergence"]
                        + exhaustion["signals"],
         strength=6, score=0.0, max_score=0.0,
