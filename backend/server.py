@@ -3747,10 +3747,9 @@ async def save_grid_wallet(doc: dict[str, Any]) -> None:
 
 
 def analyze_grid_eligibility(closes: list[float], cfg: Config) -> dict[str, Any]:
-    """A market is 'laterale' (range-bound, safe for a grid) when both the
-    Bollinger Bands are tight AND the fast/slow EMAs are close together (no
-    clear trend direction). Reuses the same building blocks as the other
-    strategies (_ema, _bollinger)."""
+    """LEGACY (no longer used to build grids — kept only in case old code
+    elsewhere still calls it). A market is 'laterale' (range-bound) when
+    both the Bollinger Bands are tight AND the fast/slow EMAs are close."""
     ema_f = _ema(closes, cfg.grid_ema_fast)
     ema_s = _ema(closes, cfg.grid_ema_slow)
     lower, mid, upper = _bollinger(closes, cfg.grid_bb_period, cfg.grid_bb_std)
@@ -3768,9 +3767,18 @@ def analyze_grid_eligibility(closes: list[float], cfg: Config) -> dict[str, Any]
     }
 
 
-async def create_grid_instance(symbol: str, cfg: Config) -> Optional[dict[str, Any]]:
-    """Build a new grid for `symbol`: wide/sparse ATR-spaced cells below the
-    current price. Only created when the market is currently 'laterale'."""
+async def build_grid_plan(symbol: str, cfg: Config) -> Optional[dict[str, Any]]:
+    """Look for a live long-only setup: a confirmed UPTREND on the higher
+    timeframe, currently retracing DOWN into the bullish FVG left by its own
+    impulse — the same structural idea as Rev Pre-FVG / FVG Reversal, but
+    executed as a staggered multi-level buy grid across the FVG zone instead
+    of one single entry. Returns None if no such live setup exists right now
+    for this symbol (no uptrend, no FVG, or price too far from the zone).
+
+    Target: NOT full trend resumption — a 50% recovery of the retracement
+    leg (from the FVG's bottom back up toward the swing high that preceded
+    it), a modest and more achievable level, shared by every cell in this
+    grid. Long-only, matching spot (no shorts)."""
     candles = await exchange.get_klines(symbol, cfg.grid_timeframe)
     if len(candles) < 60:
         return None
@@ -3778,62 +3786,172 @@ async def create_grid_instance(symbol: str, cfg: Config) -> Optional[dict[str, A
     highs = [c[3] for c in candles]
     lows = [c[4] for c in candles]
 
-    elig = analyze_grid_eligibility(closes, cfg)
-    if not elig["ranging"]:
+    htf = _higher_tf(cfg.grid_timeframe)
+    hcandles = await exchange.get_klines(symbol, htf)
+    if len(hcandles) < 20:
         return None
+    if detect_market_structure(hcandles, cfg.pivot_window) != "up":
+        return None  # long-only: needs a genuinely confirmed uptrend
 
     atr = atr_wilder(highs, lows, closes, cfg.grid_atr_period)
     if not atr or atr <= 0:
         return None
 
-    center = closes[-1]
-    spacing = atr * cfg.grid_atr_spacing_mult
-    cells: list[dict[str, Any]] = []
-    for i in range(1, cfg.grid_num_levels + 1):
+    fvgs = detect_all_fvgs(highs, lows, cfg.fvg_lookback)
+    bullish_fvgs = [f for f in fvgs if f["kind"] == "bullish"]
+    if not bullish_fvgs:
+        return None
+    origin = max(bullish_fvgs, key=lambda f: f["gap"])  # most significant impulse
+    fvg_top, fvg_bottom = origin["top"], origin["bottom"]
+
+    current = closes[-1]
+    # Only relevant if price is actually retracing at/near the zone right
+    # now — not still far above it, and not already broken well below it.
+    if current > fvg_top * 1.02 or current < fvg_bottom * 0.97:
+        return None
+
+    i = origin["index"]
+    lookback_start = max(0, i - 15)
+    swing_high = max(highs[lookback_start:i + 1]) if i > lookback_start else fvg_top
+    if swing_high <= fvg_top:
+        return None  # no real impulse leg above the gap — not a usable setup
+
+    target = fvg_bottom + 0.5 * (swing_high - fvg_bottom)
+    if target <= fvg_top:
+        target = fvg_top  # keep the target sane in a degenerate case
+
+    n = cfg.grid_num_levels
+    step = (fvg_top - fvg_bottom) / max(1, n - 1) if n > 1 else 0.0
+    cells = []
+    for idx in range(n):
+        buy_price = fvg_top - idx * step
         cells.append({
-            "index": i,
-            "buy_price": round(center - i * spacing, 8),
-            "sell_price": round(center - (i - 1) * spacing, 8),
-            "status": "armed",  # armed | holding
+            "index": idx + 1,
+            "buy_price": round(buy_price, 8),
+            "sell_price": round(target, 8),
+            "status": "armed",
         })
 
-    wallet = await get_grid_wallet()
-    notional_per_cell = (wallet.get("cash", 0.0) / max(1, cfg.grid_max_pairs)) / cfg.grid_num_levels
+    # Score for ranking candidates (lower = better): a bigger impulse
+    # relative to volatility is a more significant, more credible setup.
+    score = -(origin["gap"] / atr)
 
-    doc = {
-        "id": str(uuid.uuid4()),
+    return {
         "symbol": symbol,
-        "timeframe": cfg.grid_timeframe,
-        "center_price": round(center, 8),
-        "spacing": round(spacing, 8),
+        "score": score,
+        "center_price": round(current, 8),
         "atr": round(atr, 8),
         "cells": cells,
+        "fvg_top": round(fvg_top, 8),
+        "fvg_bottom": round(fvg_bottom, 8),
+        "swing_high": round(swing_high, 8),
+        "target": round(target, 8),
+    }
+
+
+async def create_grid_instance_from_plan(plan: dict[str, Any], cfg: Config) -> dict[str, Any]:
+    """Persist a plan already computed by build_grid_plan — kept separate so
+    the scan can score many candidates without re-fetching/re-computing
+    anything when it's time to actually create the chosen ones."""
+    wallet = await get_grid_wallet()
+    notional_per_cell = (wallet.get("cash", 0.0) / max(1, cfg.grid_max_pairs)) / cfg.grid_num_levels
+    n = cfg.grid_num_levels
+    spacing = (plan["fvg_top"] - plan["fvg_bottom"]) / max(1, n - 1) if n > 1 else 0.0
+    doc = {
+        "id": str(uuid.uuid4()),
+        "symbol": plan["symbol"],
+        "timeframe": cfg.grid_timeframe,
+        "center_price": plan["center_price"],
+        "spacing": round(spacing, 8),
+        "atr": plan["atr"],
+        "cells": plan["cells"],
         "notional_per_cell": round(notional_per_cell, 4),
-        "status": "active",  # active | stopped
+        "status": "active",
         "stopped_reason": None,
         "created_at": datetime.now(timezone.utc).isoformat(),
-        "bb_width_pct": elig["bb_width_pct"],
-        "ema_gap_pct": elig["ema_gap_pct"],
+        # Legacy fields kept for schema/frontend compatibility — no longer
+        # meaningful under the FVG-retracement design (always 0 now).
+        "bb_width_pct": 0.0,
+        "ema_gap_pct": 0.0,
+        # New, informative fields for this design.
+        "fvg_top": plan["fvg_top"],
+        "fvg_bottom": plan["fvg_bottom"],
+        "swing_high": plan["swing_high"],
+        "target": plan["target"],
     }
     await db.grid_instances.insert_one(doc)
     return doc
 
 
+async def check_grid_reversals(cfg: Config) -> int:
+    """Close any ACTIVE grid whose higher-timeframe structure has flipped to
+    a confirmed downtrend (lower highs + lower lows) — the real invalidation
+    for a long-only 'buy the uptrend retracement' grid, checked on the scan
+    cadence (not every 3s — a structural reversal doesn't need that
+    frequency, and it saves hammering the exchange with extra candle
+    fetches). This runs in ADDITION to the fast ATR-distance emergency stop
+    in monitor_grid_instances, which stays as a quick circuit-breaker for a
+    sudden crash between scan cycles."""
+    active = await db.grid_instances.find({"status": "active"}, {"_id": 0}).to_list(100)
+    stopped = 0
+    for g in active:
+        hcandles = await exchange.get_klines(g["symbol"], _higher_tf(cfg.grid_timeframe))
+        if len(hcandles) < 20:
+            continue
+        if detect_market_structure(hcandles, cfg.pivot_window) != "down":
+            continue
+        cur = price_feed.get(g["symbol"])
+        if not cur:
+            tickers = await exchange.get_tickers()
+            cur = next((float(t.get("last") or 0) for t in tickers if t.get("symbol") == g["symbol"]), None)
+        if not cur:
+            continue
+        holding = await db.grid_positions.find(
+            {"grid_id": g["id"], "status": "open"}, {"_id": 0}
+        ).to_list(100)
+        for pos in holding:
+            exit_notional = cur * pos["quantity"]
+            fees = (pos["notional"] + exit_notional) * GRID_FEE_PCT
+            pnl = (cur - pos["entry"]) * pos["quantity"] - fees
+            await db.grid_wallet.update_one(
+                {"_id": GRID_WALLET_ID}, {"$inc": {"cash": pos["notional"] + pnl}}, upsert=True
+            )
+            await db.grid_positions.update_one(
+                {"id": pos["id"]},
+                {"$set": {
+                    "status": "closed", "close_price": cur,
+                    "close_reason": "trend_reversal_confirmed", "pnl_usdt": round(pnl, 4),
+                    "closed_at": datetime.now(timezone.utc).isoformat(),
+                }},
+            )
+        await db.grid_instances.update_one(
+            {"id": g["id"]},
+            {"$set": {"status": "stopped", "stopped_reason": "trend_reversal_confirmed"}},
+        )
+        stopped += 1
+    return stopped
+
+
 async def run_grid_scan() -> dict[str, Any]:
-    """Score EVERY eligible (ranging, high-volume) candidate pair first, THEN
-    fill open slots with the best-scoring ones (tightest Bollinger + flattest
-    EMA) — not just the first ones found scanning in volume order. Once slots
-    are full, whatever's left over is still considered for a replacement: if
-    a leftover candidate is meaningfully MORE lateral than the worst-scoring
-    currently-active grid that has NO cell currently holding (no capital
-    mid-trade gets forced out — only idle, still-armed capital is ever
-    reassigned), it swaps in."""
+    """Score EVERY candidate pair for a live 'buy the uptrend retracement
+    into its own FVG' setup first, THEN fill open slots with the best-scored
+    ones (biggest impulse relative to volatility) — not just the first ones
+    found scanning in volume order. Once slots are full, whatever's left
+    over is still considered for a replacement: if a leftover candidate is a
+    meaningfully better setup than the worst-scoring currently-active grid
+    that has NO cell currently holding (no capital mid-trade gets forced
+    out — only idle, still-armed capital is ever reassigned), it swaps in.
+    Also closes any active grid whose higher-timeframe trend has confirmed-
+    reversed, before doing anything else."""
     cfg = await get_config()
     if not cfg.grid_enabled:
         return {"skipped": True, "reason": "grid disabled"}
     wallet = await get_grid_wallet()
+
+    reversals_closed = await check_grid_reversals(cfg)
+
     if wallet.get("cash", 0.0) <= 1.0:
-        return {"skipped": True, "reason": "no funds in grid wallet"}
+        return {"skipped": True, "reason": "no funds in grid wallet", "reversals_closed": reversals_closed}
 
     active_instances = await db.grid_instances.find(
         {"status": "active"}, {"_id": 0}
@@ -3870,30 +3988,23 @@ async def run_grid_scan() -> dict[str, Any]:
     candidates.sort(key=lambda s: vol_map.get(s, 0), reverse=True)
     candidates = candidates[:30]  # cap scan for performance
 
-    # Score EVERY candidate up front (one pass), instead of stopping at the
-    # first ones that qualify — so slot-filling can pick the tightest/best,
-    # not just the fastest-found-in-volume-order.
-    scored: list[tuple[float, str]] = []  # (score, symbol) — lower = more lateral
+    # Score EVERY candidate up front (one pass) — so slot-filling can pick
+    # the best live setup, not just the fastest-found-in-volume-order.
+    scored: list[tuple[float, dict[str, Any]]] = []  # (score, plan) — lower = better
     for sym in candidates:
-        cand_candles = await exchange.get_klines(sym, cfg.grid_timeframe)
-        if len(cand_candles) < 60:
-            continue
-        cand_close = [c[2] for c in cand_candles]
-        cand_elig = analyze_grid_eligibility(cand_close, cfg)
-        if not cand_elig["ranging"]:
-            continue
-        scored.append((cand_elig["bb_width_pct"] + cand_elig["ema_gap_pct"], sym))
-    scored.sort(key=lambda x: x[0])  # best (lowest/tightest) first
+        plan = await build_grid_plan(sym, cfg)
+        if plan:
+            scored.append((plan["score"], plan))
+    scored.sort(key=lambda x: x[0])  # best (most significant relative impulse) first
 
     created = 0
     used = 0
     while slots > 0 and used < len(scored):
-        _, sym = scored[used]
+        _, plan = scored[used]
         used += 1
-        grid = await create_grid_instance(sym, cfg)
-        if grid:
-            created += 1
-            slots -= 1
+        await create_grid_instance_from_plan(plan, cfg)
+        created += 1
+        slots -= 1
     leftover = scored[used:]  # already scored, not used to fill a slot
 
     # --- Replacement pass: slots are full, but the leftover candidates are
@@ -3906,36 +4017,40 @@ async def run_grid_scan() -> dict[str, Any]:
             ).to_list(1000)
         }
         idle_actives = [g for g in active_instances if g["id"] not in holding_grid_ids]
-        # Score every idle active grid with its CURRENT tightness (not the
-        # value from whenever it was created — the market may have drifted).
+        # Re-score every idle active grid's setup RIGHT NOW (not the value
+        # from whenever it was created) — if its setup no longer holds at
+        # all (trend faded, price moved off the zone), treat it as
+        # infinitely bad so any valid candidate can take its place.
         idle_scored: list[tuple[float, dict[str, Any]]] = []
         for g in idle_actives:
-            gcandles = await exchange.get_klines(g["symbol"], cfg.grid_timeframe)
-            if len(gcandles) < 60:
-                continue
-            gclose = [c[2] for c in gcandles]
-            gelig = analyze_grid_eligibility(gclose, cfg)
-            score = gelig["bb_width_pct"] + gelig["ema_gap_pct"]
+            gplan = await build_grid_plan(g["symbol"], cfg)
+            score = gplan["score"] if gplan else float("inf")
             idle_scored.append((score, g))
-        idle_scored.sort(key=lambda x: x[0], reverse=True)  # worst (highest) first
+        idle_scored.sort(key=lambda x: x[0], reverse=True)  # worst (highest/inf) first
 
-        for cand_score, sym in leftover:
+        for cand_score, plan in leftover:
             if not idle_scored:
                 break
             worst_score, worst_grid = idle_scored[0]
-            required = worst_score * (1 - cfg.grid_replace_improvement_pct / 100)
-            if cand_score >= required or worst_score <= 0:
-                continue  # not enough of an improvement to justify swapping
+            if worst_score == float("inf"):
+                should_replace = True  # that active grid's setup is fully gone
+            else:
+                margin = abs(worst_score) * (cfg.grid_replace_improvement_pct / 100)
+                should_replace = cand_score <= worst_score - margin
+            if not should_replace:
+                continue
             await db.grid_instances.update_one(
                 {"id": worst_grid["id"]},
                 {"$set": {"status": "stopped", "stopped_reason": "replaced_by_better_pair"}},
             )
-            new_grid = await create_grid_instance(sym, cfg)
-            if new_grid:
-                replaced += 1
-                idle_scored.pop(0)  # that slot is now taken by the new grid
+            await create_grid_instance_from_plan(plan, cfg)
+            replaced += 1
+            idle_scored.pop(0)  # that slot is now taken by the new grid
 
-    return {"scanned": len(candidates), "created": created, "replaced": replaced}
+    return {
+        "scanned": len(candidates), "created": created, "replaced": replaced,
+        "reversals_closed": reversals_closed,
+    }
 
 
 async def monitor_grid_instances() -> None:
