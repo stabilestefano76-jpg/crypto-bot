@@ -1778,6 +1778,39 @@ async def log_reject(symbol: str, tf: str, strategy: str, reason: str) -> None:
         pass
 
 
+async def prune_diagnostic_logs() -> None:
+    """Keep the diagnostic logs bounded — they exist to spot RECENT
+    bottlenecks (the debug log only ever reports on a rolling 3h window
+    anyway), not to be kept forever. `log_reject` fires on EVERY rejected
+    candidate on EVERY 1-minute scan (~hundreds of writes/minute across all
+    pairs/timeframes/strategies) — left unchecked this filled the entire
+    database quota and blocked ALL writes app-wide (paper trades, wallets,
+    Settings — everything). Timestamps are stored as ISO-8601 strings, not
+    native dates, so this uses a string-range delete rather than a MongoDB
+    TTL index (which only works on native Date fields)."""
+    now = datetime.now(timezone.utc)
+    try:
+        cutoff = (now - timedelta(hours=6)).isoformat()
+        await db.strategy_debug_log.delete_many({"at": {"$lt": cutoff}})
+    except Exception as e:  # noqa: BLE001
+        logger.warning("prune strategy_debug_log failed: %s", e)
+    try:
+        cutoff2 = (now - timedelta(days=3)).isoformat()
+        await db.entry_timing_log.delete_many({"signal_created_at": {"$lt": cutoff2}})
+    except Exception as e:  # noqa: BLE001
+        logger.warning("prune entry_timing_log failed: %s", e)
+
+
+async def log_prune_loop() -> None:
+    """Runs the diagnostic-log cleanup every 30 minutes, forever."""
+    while True:
+        try:
+            await prune_diagnostic_logs()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("log_prune_loop error: %s", e)
+        await asyncio.sleep(1800)
+
+
 scan_state = ScanState()
 
 
@@ -2370,6 +2403,7 @@ async def lifespan(_app: FastAPI):
     ws_task = asyncio.create_task(price_feed.run())
     premature_task = asyncio.create_task(premature_stop_loop())
     entry_timing_task = asyncio.create_task(entry_timing_loop())
+    log_prune_task = asyncio.create_task(log_prune_loop())
     yield
     scan_task.cancel()
     monitor_task.cancel()
@@ -2378,6 +2412,7 @@ async def lifespan(_app: FastAPI):
     ws_task.cancel()
     premature_task.cancel()
     entry_timing_task.cancel()
+    log_prune_task.cancel()
     await exchange.close()
     client.close()
 
