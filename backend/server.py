@@ -136,7 +136,8 @@ class Config(BaseModel):
     # "counter_trend" / Rev Pre-FVG and "fvg_reversal" / FVG Reversal). Not
     # used by "scoring" or "impulse_fvg". ---
     exhaustion_lookback: int = 10
-    exhaustion_min_score: float = 2.0
+    exhaustion_min_score: float = 1.0  # was 2.0 — lowered so it stops being an extra hard gate; raise back to 2.0 (or more) in Settings any time
+    trend_structure_strict: bool = False  # False = only ONE of higher-high/higher-low (or the "down" mirror) is needed to call a trend, not both — set True in Settings to go back to the strict textbook definition
     # --- RSI Reversion strategy (independent, simple): RSI extreme -> confirmed
     # reentry -> target back near RSI-50 (proxied by price returning to its own
     # N-period average). Deliberately no tight stop, only a wide catastrophic
@@ -1451,8 +1452,15 @@ async def monitor_paper_positions() -> None:
 # ===========================================================================
 # STRATEGY 2: Impulse FVG + Consolidation + Multi-TP (additive, selectable)
 # ===========================================================================
-def detect_market_structure(candles: list[list[float]], window: int) -> str:
-    """Return 'up' (HH+HL), 'down' (LH+LL) or 'range' from swing structure."""
+def detect_market_structure(candles: list[list[float]], window: int, strict: bool = True) -> str:
+    """Return 'up' (HH+HL, or just HH/HL alone when `strict=False`), 'down'
+    (LH+LL, or just LH/LL alone when `strict=False`) or 'range' from swing
+    structure. Non-strict mode exists because requiring BOTH conditions at
+    once is the textbook definition, but real markets constantly have one
+    leg confirmed before the other (e.g. a fresh higher high during a
+    shallow pullback that hasn't yet made a higher low) — which the strict
+    version classifies as 'range' even though the market is clearly still
+    trending."""
     highs = [c[3] for c in candles]
     lows = [c[4] for c in candles]
     low_idx, high_idx = detect_pivots(highs, window)  # highs pivots
@@ -1465,10 +1473,16 @@ def detect_market_structure(candles: list[list[float]], window: int) -> str:
     hl = swing_lows[-1] > swing_lows[-2]
     lh = swing_highs[-1] < swing_highs[-2]
     ll = swing_lows[-1] < swing_lows[-2]
-    if hh and hl:
-        return "up"
-    if lh and ll:
-        return "down"
+    if strict:
+        if hh and hl:
+            return "up"
+        if lh and ll:
+            return "down"
+    else:
+        if hh or hl:
+            return "up"
+        if lh or ll:
+            return "down"
     return "range"
 
 
@@ -1611,7 +1625,7 @@ async def analyze_pair_counter(symbol: str, tf: str, cfg: Config) -> Optional[Si
     if len(hcandles) < 20:
         await log_reject(symbol, tf, STRAT, "dati insufficienti sul timeframe alto")
         return None
-    structure = detect_market_structure(hcandles, cfg.pivot_window)
+    structure = detect_market_structure(hcandles, cfg.pivot_window, strict=cfg.trend_structure_strict)
     if structure == "range":
         await log_reject(symbol, tf, STRAT, "trend non definito (mercato laterale)")
         return None
@@ -1795,7 +1809,7 @@ async def analyze_pair_fvg_reversal(symbol: str, tf: str, cfg: Config) -> Option
         await log_reject(symbol, tf, STRAT, "dati insufficienti sul timeframe alto")
         return None
 
-    structure = detect_market_structure(hcandles, cfg.pivot_window)
+    structure = detect_market_structure(hcandles, cfg.pivot_window, strict=cfg.trend_structure_strict)
     if structure == "range":
         await log_reject(symbol, tf, STRAT, "trend non definito (mercato laterale)")
         return None
