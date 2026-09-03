@@ -285,6 +285,35 @@ export default function SettingsScreen() {
             </Section>
           )}
 
+          {(stratOn("counter_trend") || stratOn("fvg_reversal")) && (
+            <Section title="Rilevamento Trend & Esaurimento (condiviso)">
+              <ToggleRow
+                label="Rilevamento trend rigido"
+                value={cfg.trend_structure_strict}
+                onChange={(v) => update({ trend_structure_strict: v })}
+                testID="toggle-trend-strict"
+              />
+              <NumRow
+                label="Punteggio minimo esaurimento (0-4)"
+                value={cfg.exhaustion_min_score}
+                onChange={(v) => update({ exhaustion_min_score: v })}
+                step={1}
+                testID="input-exhaustion-min"
+              />
+              <Text style={styles.scoreHintText}>
+                Usati sia da Rev Pre-FVG che da FVG Reversal. Rigido spento
+                (default): basta massimi crescenti OPPURE minimi crescenti
+                (non entrambi) per riconoscere un trend — molto più
+                permissivo. Accendilo per tornare alla definizione rigorosa
+                (entrambi insieme). Punteggio esaurimento: su 4 condizioni
+                possibili (candele che si accorciano, volume in calo, RSI
+                meno estremo, ombra di rifiuto), quante ne servono almeno —
+                default 1 (basta una sola). Il Grid Bot non è toccato da
+                questi due parametri, resta sempre rigoroso.
+              </Text>
+            </Section>
+          )}
+
           <Section title="Scan Engine">
             <NumRow
               label="Scan interval (min)"
