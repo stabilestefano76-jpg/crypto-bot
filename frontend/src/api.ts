@@ -502,3 +502,21 @@ export const strategyApi = {
   portfolio: (strategy: StrategyName) =>
     req<StrategyPortfolio>(`/strategy/${strategy}/portfolio`),
 };
+
+// ---------------------------------------------------------------------------
+// Unified events feed (all 5 sections, chronological) — powers the Eventi tab
+// ---------------------------------------------------------------------------
+export type BotEvent = {
+  id: string;
+  type: "open" | "close";
+  section: "counter_trend" | "fvg_reversal" | "rsi_reversion" | "scalping" | "grid";
+  symbol: string;
+  side?: "long" | "short";
+  pnl_usdt?: number | null;
+  at: string;
+};
+
+export const eventsApi = {
+  list: (limit: number = 100) =>
+    req<{ events: BotEvent[]; count: number }>(`/events?limit=${limit}`),
+};

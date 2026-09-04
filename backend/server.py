@@ -2441,6 +2441,67 @@ async def update_config(cfg: Config) -> Config:
     return await save_config(cfg)
 
 
+@api.get("/events")
+async def get_events(limit: int = 100) -> dict[str, Any]:
+    """Unified chronological feed of open/close events across ALL five
+    sections (the 3 traditional strategies sharing paper_positions/
+    paper_trades, Scalping, and Grid) — powers the app's single 'Eventi'
+    screen so the person doesn't have to check five separate sections to
+    see what just happened."""
+    events: list[dict[str, Any]] = []
+
+    opens = await db.paper_positions.find({}, {"_id": 0}).sort("opened_at", -1).to_list(limit)
+    for p in opens:
+        events.append({
+            "id": f"{p['id']}_open", "type": "open",
+            "section": p.get("strategy", "counter_trend"),
+            "symbol": p["symbol"], "side": p.get("side"),
+            "pnl_usdt": None, "at": p["opened_at"],
+        })
+    closes = await db.paper_trades.find({}, {"_id": 0}).sort("closed_at", -1).limit(limit).to_list(limit)
+    for t in closes:
+        events.append({
+            "id": f"{t['id']}_close", "type": "close",
+            "section": t.get("strategy", "counter_trend"),
+            "symbol": t["symbol"], "side": t.get("side"),
+            "pnl_usdt": t.get("pnl_usdt"), "at": t["closed_at"],
+        })
+
+    s_open = await db.scalping_positions.find({"status": "open"}, {"_id": 0}).sort("opened_at", -1).limit(limit).to_list(limit)
+    for p in s_open:
+        events.append({
+            "id": f"{p['id']}_open", "type": "open", "section": "scalping",
+            "symbol": p["symbol"], "side": p.get("side"),
+            "pnl_usdt": None, "at": p["opened_at"],
+        })
+    s_close = await db.scalping_positions.find({"status": "closed"}, {"_id": 0}).sort("closed_at", -1).limit(limit).to_list(limit)
+    for p in s_close:
+        events.append({
+            "id": f"{p['id']}_close", "type": "close", "section": "scalping",
+            "symbol": p["symbol"], "side": p.get("side"),
+            "pnl_usdt": p.get("pnl_usdt"), "at": p.get("closed_at"),
+        })
+
+    g_open = await db.grid_positions.find({"status": "open"}, {"_id": 0}).sort("opened_at", -1).limit(limit).to_list(limit)
+    for p in g_open:
+        events.append({
+            "id": f"{p['id']}_open", "type": "open", "section": "grid",
+            "symbol": p["symbol"], "side": "long",
+            "pnl_usdt": None, "at": p["opened_at"],
+        })
+    g_close = await db.grid_positions.find({"status": "closed"}, {"_id": 0}).sort("closed_at", -1).limit(limit).to_list(limit)
+    for p in g_close:
+        events.append({
+            "id": f"{p['id']}_close", "type": "close", "section": "grid",
+            "symbol": p["symbol"], "side": "long",
+            "pnl_usdt": p.get("pnl_usdt"), "at": p.get("closed_at"),
+        })
+
+    events.sort(key=lambda e: e["at"], reverse=True)
+    trimmed = events[:limit]
+    return {"events": trimmed, "count": len(trimmed)}
+
+
 @api.get("/pairs")
 async def list_pairs(limit: int = 200) -> dict[str, Any]:
     cfg = await get_config()
