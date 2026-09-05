@@ -114,9 +114,29 @@ export default function SettingsScreen() {
           contentContainerStyle={styles.body}
           keyboardShouldPersistTaps="handled"
         >
-          <Section title="Strategie segnali (parallele)">
+          <Section title="Motori attivi (tutte le sezioni)">
             {(() => {
+              // Le 3 strategie tradizionali sono un array multi-selezione
+              // (enabled_strategies); Scalping e Grid Bot hanno invece un
+              // proprio interruttore booleano indipendente — questa
+              // funzione unifica entrambe le logiche in un solo gruppo di
+              // bottoni, così ogni sezione del bot si accende/spegne da un
+              // unico pannello (utile per incanalare il budget quando si
+              // passerà al reale).
+              const isActive = (val: string): boolean => {
+                if (val === "scalping") return cfg.scalping_enabled;
+                if (val === "grid") return cfg.grid_enabled;
+                return stratOn(val);
+              };
               const toggle = (val: string) => {
+                if (val === "scalping") {
+                  update({ scalping_enabled: !cfg.scalping_enabled });
+                  return;
+                }
+                if (val === "grid") {
+                  update({ grid_enabled: !cfg.grid_enabled });
+                  return;
+                }
                 const set = new Set(enabledStrategies);
                 if (set.has(val)) set.delete(val);
                 else set.add(val);
@@ -128,8 +148,10 @@ export default function SettingsScreen() {
                     ["counter_trend", "Rev Pre-FVG"],
                     ["fvg_reversal", "FVG Reversal"],
                     ["rsi_reversion", "RSI Reversion"],
+                    ["scalping", "Scalping"],
+                    ["grid", "Grid Bot"],
                   ] as const).map(([val, label]) => {
-                    const active = stratOn(val);
+                    const active = isActive(val);
                     return (
                       <Pressable
                         key={val}
@@ -149,12 +171,16 @@ export default function SettingsScreen() {
               );
             })()}
             <Text style={styles.scoreHintText}>
-              Selezione multipla: girano in parallelo a capitale condiviso (a
-              meno di allocare fondi dedicati dalla schermata Strategie). Rev
-              Pre-FVG = breakout del consolidamento verso il fill FVG. FVG
-              Reversal = contro-trend sul ritracciamento verso la FVG
-              (parametri indipendenti). RSI Reversion = rientro da
-              ipercomprato/ipervenduto confermato da divergenza.
+              Ogni bottone accende/spegne quella sezione del bot in modo
+              indipendente. Rev Pre-FVG, FVG Reversal, RSI Reversion girano in
+              parallelo a capitale condiviso (a meno di allocare fondi
+              dedicati dalla schermata Strategie). Rev Pre-FVG = breakout del
+              consolidamento verso il fill FVG. FVG Reversal = contro-trend
+              sul ritracciamento verso la FVG (parametri indipendenti). RSI
+              Reversion = rientro da ipercomprato/ipervenduto confermato da
+              divergenza. Scalping e Grid Bot hanno sempre avuto portafogli
+              propri separati — qui puoi anche fermarli del tutto, utile per
+              decidere quali motori usare quando si passerà al reale.
             </Text>
           </Section>
 
