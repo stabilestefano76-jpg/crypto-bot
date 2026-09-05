@@ -339,6 +339,12 @@ export default function SettingsScreen() {
                 step={1}
                 testID="input-exhaustion-min"
               />
+              <NumRow
+                label="Finestra di ricerca esaurimento (candele)"
+                value={cfg.exhaustion_lookback}
+                onChange={(v) => update({ exhaustion_lookback: v })}
+                testID="input-exhaustion-lookback"
+              />
               <Text style={styles.scoreHintText}>
                 Usati sia da Rev Pre-FVG che da FVG Reversal. Rigido spento
                 (default): basta massimi crescenti OPPURE minimi crescenti
@@ -347,8 +353,12 @@ export default function SettingsScreen() {
                 (entrambi insieme). Punteggio esaurimento: su 4 condizioni
                 possibili (candele che si accorciano, volume in calo, RSI
                 meno estremo, ombra di rifiuto), quante ne servono almeno —
-                default 1 (basta una sola). Il Grid Bot non è toccato da
-                questi due parametri, resta sempre rigoroso.
+                default 1 (basta una sola). Finestra di ricerca: quante
+                candele indietro vengono analizzate per queste 4 condizioni —
+                default 20 (una finestra troppo piccola lasciava pochissimo
+                spazio a trovare i due picchi RSI richiesti dalla condizione
+                RSI). Il Grid Bot non è toccato da questi parametri, resta
+                sempre rigoroso.
               </Text>
             </Section>
           )}

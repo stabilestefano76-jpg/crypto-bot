@@ -71,6 +71,7 @@ export type Config = {
   tp1_pct: number;
   post_tp1_advance_pct: number;
   exhaustion_min_score: number;
+  exhaustion_lookback: number;
   trend_structure_strict: boolean;
   trailing_enabled: boolean;
   trailing_atr_mult: number;

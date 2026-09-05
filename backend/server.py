@@ -138,7 +138,7 @@ class Config(BaseModel):
     # --- Trend Exhaustion Score (additive, COUNTER-TREND strategies only:
     # "counter_trend" / Rev Pre-FVG and "fvg_reversal" / FVG Reversal). Not
     # used by "scoring" or "impulse_fvg". ---
-    exhaustion_lookback: int = 10
+    exhaustion_lookback: int = 20  # was 10 — too small a window left condition #3 (needs 2 confirmed RSI pivots) almost no room to ever find them
     exhaustion_min_score: float = 1.0  # was 2.0 — lowered so it stops being an extra hard gate; raise back to 2.0 (or more) in Settings any time
     trend_structure_strict: bool = False  # False = only ONE of higher-high/higher-low (or the "down" mirror) is needed to call a trend, not both — set True in Settings to go back to the strict textbook definition
     trailing_enabled: bool = True  # shared by Scalping and Grid: once price reaches the original target, arm a trailing stop instead of closing immediately, to let a strong run continue
@@ -446,7 +446,7 @@ def detect_trend_exhaustion(
     if len(bodies) >= 6:
         recent_avg = sum(bodies[-3:]) / 3
         prior_avg = sum(bodies[-6:-3]) / 3
-        if prior_avg > 0 and recent_avg < prior_avg * 0.7:
+        if prior_avg > 0 and recent_avg < prior_avg * 0.8:
             signals.append("Candele in Contrazione")
 
     # 2) Volume fading while price still advances in the trend direction.
