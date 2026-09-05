@@ -3997,6 +3997,8 @@ async def build_grid_plan(symbol: str, cfg: Config) -> Optional[dict[str, Any]]:
             "status": "armed",
             "trailing_active": False,
             "peak_price": None,
+            "needs_low_confirmation": False,
+            "low_confirmed": False,
         })
 
     # Score for ranking candidates (lower = better): a bigger impulse
@@ -4283,7 +4285,59 @@ async def monitor_grid_instances() -> None:
             continue
 
         changed = False
+
+        # --- Cascade profit-lock: when price returns up to the entry of the
+        # highest-priced (shallowest) currently-holding cell, close every
+        # OTHER holding cell that's already in profit at that price — rather
+        # than leaving them to wait for the shared far target, which can
+        # reverse before ever being reached. The trigger cell itself stays
+        # open (at that exact price it's only at breakeven, not yet ahead).
+        holding_cells = [c for c in cells if c["status"] == "holding"]
+        if len(holding_cells) >= 2:
+            highest_entry = max(c["buy_price"] for c in holding_cells)
+            if cur >= highest_entry:
+                for cell in holding_cells:
+                    if cell["buy_price"] >= highest_entry:
+                        continue  # this is the trigger cell itself — leave it open
+                    pos = await db.grid_positions.find_one(
+                        {"grid_id": grid["id"], "cell_index": cell["index"], "status": "open"},
+                        {"_id": 0},
+                    )
+                    if pos:
+                        exit_notional = cur * pos["quantity"]
+                        fees = (pos["notional"] + exit_notional) * GRID_FEE_PCT
+                        pnl = (cur - pos["entry"]) * pos["quantity"] - fees
+                        await db.grid_wallet.update_one(
+                            {"_id": GRID_WALLET_ID},
+                            {"$inc": {"cash": pos["notional"] + pnl}},
+                            upsert=True,
+                        )
+                        await db.grid_positions.update_one(
+                            {"id": pos["id"]},
+                            {"$set": {
+                                "status": "closed", "close_price": cur,
+                                "close_reason": "cascade_recovery", "pnl_usdt": round(pnl, 4),
+                                "closed_at": datetime.now(timezone.utc).isoformat(),
+                            }},
+                        )
+                    cell["status"] = "armed"
+                    cell["trailing_active"] = False
+                    cell["peak_price"] = None
+                    cell["needs_low_confirmation"] = True
+                    cell["low_confirmed"] = False
+                    changed = True
+
         for cell in cells:
+            if cell["status"] == "armed" and cell.get("needs_low_confirmation") and not cell.get("low_confirmed"):
+                # This cell was closed by the cascade profit-lock — it may
+                # only re-buy after price has actually undershot the grid's
+                # absolute floor (a confirmed low), then risen back up to
+                # touch its own level again. Until that undershoot happens,
+                # it stays armed but inert even if price dips to its level.
+                if cur < lowest_buy:
+                    cell["low_confirmed"] = True
+                    changed = True
+                continue
             if cell["status"] == "armed" and cur <= cell["buy_price"]:
                 notional = grid["notional_per_cell"]
                 if notional < 1.0 or notional > cash:
