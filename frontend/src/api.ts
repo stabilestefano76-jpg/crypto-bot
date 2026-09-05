@@ -86,6 +86,9 @@ export type Config = {
   rsi_rev_min_extreme_candles: number;
   rsi_rev_catastrophic_atr_mult: number;
   rsi_rev_trailing_atr_mult: number;
+  scalping_max_open_positions: number;
+  scalping_sl_atr_mult: number;
+  scalping_tp_atr_mult: number;
   max_pairs_per_scan: number;
   enabled_pairs: string[];
   excluded_pairs: string[];

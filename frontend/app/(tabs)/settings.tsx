@@ -353,6 +353,43 @@ export default function SettingsScreen() {
             </Section>
           )}
 
+          {cfg.scalping_enabled && (
+            <Section title="Scalping Strategy">
+              <NumRow
+                label="Max operazioni simultanee"
+                value={cfg.scalping_max_open_positions}
+                onChange={(v) => update({ scalping_max_open_positions: v })}
+                testID="input-scalping-max-open"
+              />
+              <NumRow
+                label="Stop loss (×ATR)"
+                value={cfg.scalping_sl_atr_mult}
+                onChange={(v) => update({ scalping_sl_atr_mult: v })}
+                step={0.1}
+                testID="input-scalping-sl-atr"
+              />
+              <NumRow
+                label="Take profit (×ATR)"
+                value={cfg.scalping_tp_atr_mult}
+                onChange={(v) => update({ scalping_tp_atr_mult: v })}
+                step={0.1}
+                testID="input-scalping-tp-atr"
+              />
+              <Text style={styles.scoreHintText}>
+                EMA9/21 + VWAP + Bollinger su 5m, con RSI(9) come conferma di
+                momentum (sopra 50 per i long, sotto 50 per gli short) e un
+                controllo sul trend del timeframe superiore (scarta i long in
+                un trend ribassista netto, e viceversa) — evita di aprire
+                operazioni che remano contro la corrente generale. Stop e
+                target si adattano all&apos;ATR di ogni coppia invece di una
+                percentuale fissa uguale per tutte. Massimo{" "}
+                {cfg.scalping_max_open_positions} operazioni aperte insieme,
+                per non accumulare rischio correlato in un solo movimento di
+                mercato.
+              </Text>
+            </Section>
+          )}
+
           <Section title="Trailing Stop (Scalping + Grid)">
             <ToggleRow
               label="Trailing stop attivo"

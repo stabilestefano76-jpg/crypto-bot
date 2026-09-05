@@ -92,6 +92,9 @@ class Config(BaseModel):
     scalping_min_hold_seconds: int = 60  # min time before the invalidation check can close early
     scalping_cooldown_minutes: int = 10  # pause on a symbol after a losing scalping trade
     scalping_invalidation_buffer_pct: float = 0.15  # min % beyond VWAP required, on top of the EMA cross, to count as invalidated
+    scalping_max_open_positions: int = 5  # cap on concurrent Scalping trades — was unlimited, which let a correlated batch pile up during a broad market move
+    scalping_sl_atr_mult: float = 1.0  # stop distance in ATR multiples (falls back to the fixed % constants if ATR is 0/unavailable)
+    scalping_tp_atr_mult: float = 2.0  # target distance in ATR multiples
     signal_validity_candles: int = 5  # a condition counts if it happened within N bars
     fvg_lookback: int = 40  # how far back to look for an open FVG
     reversal_rejection_wick_ratio: float = 1.5  # wick/body ratio for rejection candle
@@ -3331,12 +3334,22 @@ def analyze_scalping(highs, lows, closes, volumes, rsis, cfg) -> dict:
 
     side = None
     reasons = []
-    if ema_fast[-1] > ema_slow[-1] and last_close > vwap and last_close <= lower_bb * 1.01:
+    if (
+        ema_fast[-1] > ema_slow[-1]
+        and last_close > vwap
+        and last_close <= lower_bb * 1.01
+        and last_rsi > 50
+    ):
         side = "long"
-        reasons = ["EMA9>EMA21", "Above VWAP", "Near lower BB"]
-    elif ema_fast[-1] < ema_slow[-1] and last_close < vwap and last_close >= upper_bb * 0.99:
+        reasons = ["EMA9>EMA21", "Above VWAP", "Near lower BB", "RSI>50"]
+    elif (
+        ema_fast[-1] < ema_slow[-1]
+        and last_close < vwap
+        and last_close >= upper_bb * 0.99
+        and last_rsi < 50
+    ):
         side = "short"
-        reasons = ["EMA9<EMA21", "Below VWAP", "Near upper BB"]
+        reasons = ["EMA9<EMA21", "Below VWAP", "Near upper BB", "RSI<50"]
 
     if vol_ok and side:
         reasons.append("Volume Spike")
@@ -3421,6 +3434,20 @@ async def run_scalping_scan() -> dict[str, Any]:
         result = analyze_scalping(highs, lows, closes, volumes, rsis, cfg)
         if not result.get("confirmed"):
             continue
+        # Reject a scalp that fights an established broader trend: a local
+        # 5m EMA9/21 flicker can go long right in the middle of a genuine
+        # higher-timeframe downtrend (and vice versa) — exactly what let a
+        # broad, correlated batch of long scalps pile up during a market-wide
+        # selloff. Only blocks a CLEARLY opposing trend; "range" on the
+        # higher timeframe doesn't block either direction.
+        htf = _higher_tf(tf)
+        hcandles = await exchange.get_klines(symbol, htf)
+        if len(hcandles) >= 20:
+            structure = detect_market_structure(hcandles, cfg.pivot_window)
+            if result["side"] == "long" and structure == "down":
+                continue
+            if result["side"] == "short" and structure == "up":
+                continue
         # Use the freshest price available for the fill — NOT the last closed
         # candle's close, which can be up to a full timeframe old (5 min) and
         # was letting positions open already past their own tight SL/TP: (1)
@@ -3631,9 +3658,9 @@ async def scalping_portfolio() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 # Scalping Bot: auto-execution of real (paper) positions
 # ---------------------------------------------------------------------------
-SCALPING_SL_PCT = 0.004   # 0.4% gross stop loss (net ~0.6% after fees)
-SCALPING_TP_PCT = 0.014   # 1.4% gross take profit (net ~1.2% after fees, 2:1 reward/risk)
-SCALPING_WALLET_RISK_PCT = 0.20  # % of scalping cash used per trade
+SCALPING_SL_PCT = 0.004   # fallback only, used when ATR is unavailable (0 or missing)
+SCALPING_TP_PCT = 0.014   # fallback only, used when ATR is unavailable (0 or missing)
+SCALPING_WALLET_RISK_PCT = 0.05  # % of scalping cash used per trade (was 0.20 — brought in line with the 1-2% industry norm, adapted for an already-isolated scalping sub-wallet)
 SCALPING_FEE_PCT = 0.001  # 0.10% Bybit spot fee per side (open + close = 0.20% round trip)
 
 
@@ -3704,6 +3731,10 @@ async def open_scalping_position(doc: dict[str, Any], cfg: Config) -> None:
     if existing:
         return  # already have an open position on this pair
 
+    open_count = await db.scalping_positions.count_documents({"status": "open"})
+    if open_count >= cfg.scalping_max_open_positions:
+        return  # cap on concurrent Scalping trades — prevents a correlated pile-up
+
     notional = cash * SCALPING_WALLET_RISK_PCT
     if notional < 1.0:
         notional = min(cash, 1.0)
@@ -3713,8 +3744,18 @@ async def open_scalping_position(doc: dict[str, Any], cfg: Config) -> None:
         return
     quantity = notional / fill_price
 
+    atr = doc.get("atr", 0.0)
     side = doc["side"]
-    if side == "long":
+    if atr > 0:
+        sl_dist = cfg.scalping_sl_atr_mult * atr
+        tp_dist = cfg.scalping_tp_atr_mult * atr
+        if side == "long":
+            stop_loss = fill_price - sl_dist
+            take_profit = fill_price + tp_dist
+        else:
+            stop_loss = fill_price + sl_dist
+            take_profit = fill_price - tp_dist
+    elif side == "long":
         stop_loss = fill_price * (1 - SCALPING_SL_PCT)
         take_profit = fill_price * (1 + SCALPING_TP_PCT)
     else:
