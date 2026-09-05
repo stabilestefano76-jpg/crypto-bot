@@ -72,6 +72,8 @@ export type Config = {
   post_tp1_advance_pct: number;
   exhaustion_min_score: number;
   trend_structure_strict: boolean;
+  trailing_enabled: boolean;
+  trailing_atr_mult: number;
   enabled_strategies?: string[];
   fvgr_tp1_pct: number;
   fvgr_tp2_pct: number;

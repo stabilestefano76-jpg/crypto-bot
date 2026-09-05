@@ -138,6 +138,8 @@ class Config(BaseModel):
     exhaustion_lookback: int = 10
     exhaustion_min_score: float = 1.0  # was 2.0 — lowered so it stops being an extra hard gate; raise back to 2.0 (or more) in Settings any time
     trend_structure_strict: bool = False  # False = only ONE of higher-high/higher-low (or the "down" mirror) is needed to call a trend, not both — set True in Settings to go back to the strict textbook definition
+    trailing_enabled: bool = True  # shared by Scalping and Grid: once price reaches the original target, arm a trailing stop instead of closing immediately, to let a strong run continue
+    trailing_atr_mult: float = 1.0  # how far (in ATR multiples) price may pull back from its post-target peak before the trailing stop closes the trade
     # --- RSI Reversion strategy (independent, simple): RSI extreme -> confirmed
     # reentry -> target back near RSI-50 (proxied by price returning to its own
     # N-period average). Deliberately no tight stop, only a wide catastrophic
@@ -3379,6 +3381,7 @@ async def run_scalping_scan() -> dict[str, Any]:
         # top of this same scan (fresh within seconds, not minutes); (3) the
         # candle close only as a last resort.
         live_price = price_feed.get(symbol) or rest_price_map.get(symbol) or closes[-1]
+        atr = atr_wilder(highs, lows, closes, cfg.atr_period) or 0.0
         doc = {
             "id": str(uuid.uuid4()),
             "symbol": symbol,
@@ -3392,6 +3395,7 @@ async def run_scalping_scan() -> dict[str, Any]:
             "ema_fast": result["ema_fast"],
             "ema_slow": result["ema_slow"],
             "price": live_price,
+            "atr": atr,
             "status": "active",
             "created_at": datetime.now(timezone.utc).isoformat(),
         }
@@ -3695,6 +3699,9 @@ async def open_scalping_position(doc: dict[str, Any], cfg: Config) -> None:
         "take_profit": take_profit,
         "quantity": quantity,
         "notional": notional,
+        "atr": doc.get("atr", 0.0),
+        "trailing_active": False,
+        "peak_price": None,
         "opened_at": datetime.now(timezone.utc).isoformat(),
         "status": "open",
     }
@@ -3727,25 +3734,61 @@ async def close_scalping_positions() -> None:
         if not cur:
             continue
 
-        hit = None
-        if p["side"] == "long":
-            if cur <= p["stop_loss"]:
-                hit = "stop_loss"
-            elif cur >= p["take_profit"]:
-                hit = "take_profit"
+        # --- Trailing stop, once armed (price already reached the original
+        # target once) --- take priority over everything else: a trade that
+        # got this far is a winner, and the only question left is how much
+        # further to let it run before locking in the gain.
+        if cfg.trailing_enabled and p.get("trailing_active"):
+            atr = p.get("atr") or 0.0
+            peak = p.get("peak_price") or cur
+            if p["side"] == "long":
+                new_peak = max(peak, cur)
+                trail_level = new_peak - cfg.trailing_atr_mult * atr
+                hit_trailing = cur <= trail_level
+            else:
+                new_peak = min(peak, cur)
+                trail_level = new_peak + cfg.trailing_atr_mult * atr
+                hit_trailing = cur >= trail_level
+            if new_peak != peak:
+                await db.scalping_positions.update_one(
+                    {"id": p["id"]}, {"$set": {"peak_price": new_peak}}
+                )
+            if not hit_trailing:
+                continue
+            hit = "trailing_stop"
         else:
-            if cur >= p["stop_loss"]:
-                hit = "stop_loss"
-            elif cur <= p["take_profit"]:
-                hit = "take_profit"
+            hit = None
+            if p["side"] == "long":
+                if cur <= p["stop_loss"]:
+                    hit = "stop_loss"
+                elif cur >= p["take_profit"]:
+                    if cfg.trailing_enabled and (p.get("atr") or 0) > 0:
+                        # Arm trailing instead of closing — don't realize yet.
+                        await db.scalping_positions.update_one(
+                            {"id": p["id"]},
+                            {"$set": {"trailing_active": True, "peak_price": cur}},
+                        )
+                        continue
+                    hit = "take_profit"
+            else:
+                if cur >= p["stop_loss"]:
+                    hit = "stop_loss"
+                elif cur <= p["take_profit"]:
+                    if cfg.trailing_enabled and (p.get("atr") or 0) > 0:
+                        await db.scalping_positions.update_one(
+                            {"id": p["id"]},
+                            {"$set": {"trailing_active": True, "peak_price": cur}},
+                        )
+                        continue
+                    hit = "take_profit"
 
-        # Additive check: close EARLY if the setup that justified the trade
-        # is no longer valid (trade going against us), before SL/TP is hit.
-        if not hit and await check_scalping_invalidation(p, cfg):
-            hit = "invalidation"
+            # Additive check: close EARLY if the setup that justified the trade
+            # is no longer valid (trade going against us), before SL/TP is hit.
+            if not hit and await check_scalping_invalidation(p, cfg):
+                hit = "invalidation"
 
-        if not hit:
-            continue
+            if not hit:
+                continue
 
         if p["side"] == "long":
             gross_pnl = (cur - p["entry"]) * p["quantity"]
@@ -3940,6 +3983,8 @@ async def build_grid_plan(symbol: str, cfg: Config) -> Optional[dict[str, Any]]:
             "buy_price": round(buy_price, 8),
             "sell_price": round(target, 8),
             "status": "armed",
+            "trailing_active": False,
+            "peak_price": None,
         })
 
     # Score for ranking candidates (lower = better): a bigger impulse
@@ -4257,30 +4302,70 @@ async def monitor_grid_instances() -> None:
                 })
                 cell["status"] = "holding"
                 changed = True
+            elif cell["status"] == "holding" and cell.get("trailing_active"):
+                atr = grid.get("atr") or 0.0
+                peak = cell.get("peak_price") or cur
+                new_peak = max(peak, cur)
+                if new_peak != peak:
+                    cell["peak_price"] = new_peak
+                    changed = True
+                trail_level = new_peak - cfg.trailing_atr_mult * atr
+                if cur <= trail_level:
+                    pos = await db.grid_positions.find_one(
+                        {"grid_id": grid["id"], "cell_index": cell["index"], "status": "open"},
+                        {"_id": 0},
+                    )
+                    if pos:
+                        exit_notional = cur * pos["quantity"]
+                        fees = (pos["notional"] + exit_notional) * GRID_FEE_PCT
+                        pnl = (cur - pos["entry"]) * pos["quantity"] - fees
+                        await db.grid_wallet.update_one(
+                            {"_id": GRID_WALLET_ID},
+                            {"$inc": {"cash": pos["notional"] + pnl}},
+                            upsert=True,
+                        )
+                        await db.grid_positions.update_one(
+                            {"id": pos["id"]},
+                            {"$set": {
+                                "status": "closed", "close_price": cur,
+                                "close_reason": "trailing_stop", "pnl_usdt": round(pnl, 4),
+                                "closed_at": datetime.now(timezone.utc).isoformat(),
+                            }},
+                        )
+                    cell["status"] = "armed"
+                    cell["trailing_active"] = False
+                    cell["peak_price"] = None
+                    changed = True
             elif cell["status"] == "holding" and cur >= cell["sell_price"]:
-                pos = await db.grid_positions.find_one(
-                    {"grid_id": grid["id"], "cell_index": cell["index"], "status": "open"},
-                    {"_id": 0},
-                )
-                if pos:
-                    exit_notional = cur * pos["quantity"]
-                    fees = (pos["notional"] + exit_notional) * GRID_FEE_PCT
-                    pnl = (cur - pos["entry"]) * pos["quantity"] - fees
-                    await db.grid_wallet.update_one(
-                        {"_id": GRID_WALLET_ID},
-                        {"$inc": {"cash": pos["notional"] + pnl}},
-                        upsert=True,
+                if cfg.trailing_enabled and (grid.get("atr") or 0) > 0:
+                    # Arm trailing instead of closing now — let a strong run continue.
+                    cell["trailing_active"] = True
+                    cell["peak_price"] = cur
+                    changed = True
+                else:
+                    pos = await db.grid_positions.find_one(
+                        {"grid_id": grid["id"], "cell_index": cell["index"], "status": "open"},
+                        {"_id": 0},
                     )
-                    await db.grid_positions.update_one(
-                        {"id": pos["id"]},
-                        {"$set": {
-                            "status": "closed", "close_price": cur,
-                            "close_reason": "target", "pnl_usdt": round(pnl, 4),
-                            "closed_at": datetime.now(timezone.utc).isoformat(),
-                        }},
-                    )
-                cell["status"] = "armed"
-                changed = True
+                    if pos:
+                        exit_notional = cur * pos["quantity"]
+                        fees = (pos["notional"] + exit_notional) * GRID_FEE_PCT
+                        pnl = (cur - pos["entry"]) * pos["quantity"] - fees
+                        await db.grid_wallet.update_one(
+                            {"_id": GRID_WALLET_ID},
+                            {"$inc": {"cash": pos["notional"] + pnl}},
+                            upsert=True,
+                        )
+                        await db.grid_positions.update_one(
+                            {"id": pos["id"]},
+                            {"$set": {
+                                "status": "closed", "close_price": cur,
+                                "close_reason": "target", "pnl_usdt": round(pnl, 4),
+                                "closed_at": datetime.now(timezone.utc).isoformat(),
+                            }},
+                        )
+                    cell["status"] = "armed"
+                    changed = True
 
         if changed:
             await db.grid_instances.update_one(

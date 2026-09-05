@@ -314,6 +314,31 @@ export default function SettingsScreen() {
             </Section>
           )}
 
+          <Section title="Trailing Stop (Scalping + Grid)">
+            <ToggleRow
+              label="Trailing stop attivo"
+              value={cfg.trailing_enabled}
+              onChange={(v) => update({ trailing_enabled: v })}
+              testID="toggle-trailing-enabled"
+            />
+            <NumRow
+              label="Distanza trailing (×ATR)"
+              value={cfg.trailing_atr_mult}
+              onChange={(v) => update({ trailing_atr_mult: v })}
+              step={0.1}
+              testID="input-trailing-atr-mult"
+            />
+            <Text style={styles.scoreHintText}>
+              Quando il prezzo raggiunge il target originale, invece di
+              chiudere subito l&apos;operazione resta aperta: tiene traccia
+              del massimo raggiunto e chiude solo se il prezzo retrocede di
+              questa distanza (in multipli di ATR) da quel massimo — così un
+              movimento forte può continuare a rendere invece di fermarsi al
+              primo obiettivo. Disattivalo per tornare alla chiusura secca al
+              target, come prima.
+            </Text>
+          </Section>
+
           <Section title="Scan Engine">
             <NumRow
               label="Scan interval (min)"
