@@ -300,13 +300,26 @@ export default function SettingsScreen() {
                 step={0.5}
                 testID="input-rsirev-atr"
               />
+              <NumRow
+                label="Trailing profitto (×ATR)"
+                value={cfg.rsi_rev_trailing_atr_mult}
+                onChange={(v) => update({ rsi_rev_trailing_atr_mult: v })}
+                step={0.5}
+                testID="input-rsirev-trailing"
+              />
               <Text style={styles.scoreHintText}>
                 Entra quando l&apos;RSI rientra dalla zona estrema (dopo almeno{" "}
                 {cfg.rsi_rev_min_extreme_candles} candele oltre soglia) con
                 divergenza confermata. Target = prezzo torna sulla propria
                 media a {cfg.rsi_period} periodi (proxy di &quot;RSI torna a
-                50&quot;). Nessuno stop stretto: solo lo stop catastrofico a{" "}
-                {cfg.rsi_rev_catastrophic_atr_mult}×ATR, per i casi estremi.
+                50&quot;). Nessuno stop stretto: quando il prezzo è già in
+                guadagno, un trailing largo ({cfg.rsi_rev_trailing_atr_mult}
+                ×ATR) protegge da un crollo improvviso senza tagliare le
+                normali oscillazioni. Lo stop catastrofico a{" "}
+                {cfg.rsi_rev_catastrophic_atr_mult}×ATR resta comunque attivo
+                come ultima rete di sicurezza. Usa l&apos;interruttore
+                &quot;Trailing stop attivo&quot; più sotto per
+                disattivare/riattivare anche questo.
               </Text>
             </Section>
           )}

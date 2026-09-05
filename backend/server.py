@@ -148,6 +148,7 @@ class Config(BaseModel):
     rsi_rev_oversold: float = 20.0
     rsi_rev_min_extreme_candles: int = 3  # min candles RSI must stay beyond 80/20 before reentry counts
     rsi_rev_catastrophic_atr_mult: float = 6.0  # wide safety stop, only for extreme/structural cases
+    rsi_rev_trailing_atr_mult: float = 3.0  # wide trailing once in profit — only to catch a genuine sudden reversal, not to lock in small moves
     # --- Grid Bot (independent strategy: range/laterale trading) ---
     grid_enabled: bool = True
     grid_timeframe: str = "1h"  # timeframe used for range detection, ATR and spacing
@@ -242,6 +243,8 @@ class PaperPosition(BaseModel):
     strategy: str = "counter_trend"
     tp1: float = 0.0
     tp2: float = 0.0
+    atr: float = 0.0  # copied from the signal at open — used by RSI Reversion's trailing stop
+    peak_price: Optional[float] = None  # RSI Reversion trailing: best price seen since armed
 
 
 class PaperTrade(BaseModel):
@@ -931,6 +934,7 @@ async def open_paper_position(signal: dict[str, Any]) -> Optional[PaperPosition]
         strategy=signal.get("strategy", "counter_trend"),
         tp1=float(signal.get("tp1", 0.0)),
         tp2=float(signal.get("tp2", 0.0)),
+        atr=float(signal.get("atr", 0.0)),
     )
     await db.paper_positions.insert_one(pos.model_dump())
     # Persist slippage log entry
@@ -1364,6 +1368,52 @@ async def manage_fvg_reversal_position(pos: dict[str, Any], price: float, cfg: C
     return pos
 
 
+async def manage_rsi_reversion_position(pos: dict[str, Any], price: float, cfg: Config) -> dict[str, Any]:
+    """RSI Reversion: intentionally no partial close, no breakeven, no
+    timeout-to-breakeven — the whole premise is to wait for the rebalance
+    without being cut early by normal noise. The ONE addition here is a wide
+    ATR-based trailing stop, armed only once the trade is in profit — meant
+    purely to catch a genuine sudden reversal, not to lock in small moves.
+    Before this, only the far-away catastrophic stop (6×ATR by default)
+    protected a winning trade from giving everything back."""
+    if not cfg.trailing_enabled:
+        return pos
+    entry = float(pos.get("fill_price") or pos.get("entry") or 0)
+    atr = float(pos.get("atr") or 0)
+    if entry <= 0 or atr <= 0:
+        return pos
+    long = pos["side"] == "long"
+    in_profit = (price > entry) if long else (price < entry)
+
+    if not pos.get("trailing_active"):
+        if not in_profit:
+            return pos
+        await db.paper_positions.update_one(
+            {"id": pos["id"]},
+            {"$set": {"trailing_active": True, "peak_price": price}},
+        )
+        return {**pos, "trailing_active": True, "peak_price": price}
+
+    peak = pos.get("peak_price") or price
+    new_peak = max(peak, price) if long else min(peak, price)
+    if new_peak != peak:
+        await db.paper_positions.update_one(
+            {"id": pos["id"]}, {"$set": {"peak_price": new_peak}}
+        )
+        pos = {**pos, "peak_price": new_peak}
+
+    trail_level = (
+        new_peak - cfg.rsi_rev_trailing_atr_mult * atr if long
+        else new_peak + cfg.rsi_rev_trailing_atr_mult * atr
+    )
+    hit = price <= trail_level if long else price >= trail_level
+    if hit:
+        outcome = "win" if ((price - entry) if long else (entry - price)) >= 0 else "loss"
+        await close_paper_position(pos, price, outcome)
+        return {**pos, "quantity": 0}
+    return pos
+
+
 async def manage_open_position(pos: dict[str, Any], price: float, cfg: Config) -> dict[str, Any]:
     """Run the 3 additive managers + partial close. Returns the possibly-updated
     position dict (with fresh current_stop)."""
@@ -1374,12 +1424,10 @@ async def manage_open_position(pos: dict[str, Any], price: float, cfg: Config) -
     # FVG Reversal strategy: TP1/TP2 + post-TP1 stop + trailing.
     if pos.get("strategy") == "fvg_reversal":
         return await manage_fvg_reversal_position(pos, price, cfg)
-    # RSI Reversion: plain SL/TP only, on purpose — no partial close, no
-    # timeout-to-breakeven, no trailing. The strategy's whole premise is
-    # "wait for the rebalance"; the additive managers would fight that by
-    # cutting the trade early. Only the wide catastrophic stop protects it.
+    # RSI Reversion: plain SL/TP, no partial close, no timeout-to-breakeven —
+    # only a wide profit-protecting trailing stop (see above).
     if pos.get("strategy") == "rsi_reversion":
-        return pos
+        return await manage_rsi_reversion_position(pos, price, cfg)
     # Partial close first (does not affect stop)
     await maybe_partial_close(pos, price, cfg)
     # Timeout -> breakeven
