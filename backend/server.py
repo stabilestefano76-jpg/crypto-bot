@@ -3956,6 +3956,14 @@ async def build_grid_plan(symbol: str, cfg: Config) -> Optional[dict[str, Any]]:
         return None
     origin = max(bullish_fvgs, key=lambda f: f["gap"])  # most significant impulse
     fvg_top, fvg_bottom = origin["top"], origin["bottom"]
+    # Reject a degenerate (near-zero-height) FVG outright — this is what
+    # caused a real bug: when the gap barely has any height, every cell's
+    # buy_price and the sell target can collapse onto the same price,
+    # producing an instant buy-sell round trip that only bleeds fees,
+    # repeating every few seconds forever. Require genuine room relative
+    # to volatility before treating this as a usable setup.
+    if (fvg_top - fvg_bottom) < 0.1 * atr:
+        return None
 
     current = closes[-1]
     # Only relevant if price is actually retracing at/near the zone right
@@ -3970,8 +3978,12 @@ async def build_grid_plan(symbol: str, cfg: Config) -> Optional[dict[str, Any]]:
         return None  # no real impulse leg above the gap — not a usable setup
 
     target = fvg_bottom + 0.5 * (swing_high - fvg_bottom)
-    if target <= fvg_top:
-        target = fvg_top  # keep the target sane in a degenerate case
+    # If the target doesn't land MEANINGFULLY above the top buy level, this
+    # setup is unusable — reject it outright rather than clamping it to
+    # fvg_top (which is exactly what produced the instant-flip fee-bleed
+    # loop: buy_price == sell_price for every cell).
+    if (target - fvg_top) < 0.1 * atr:
+        return None
 
     n = cfg.grid_num_levels
     step = (fvg_top - fvg_bottom) / max(1, n - 1) if n > 1 else 0.0
