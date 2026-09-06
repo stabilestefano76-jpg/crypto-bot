@@ -71,6 +71,8 @@ export default function StrategyScreen() {
   const [withdrawModalVisible, setWithdrawModalVisible] = useState(false);
   const [withdrawText, setWithdrawText] = useState("");
   const [withdrawing, setWithdrawing] = useState(false);
+  const [resetModalVisible, setResetModalVisible] = useState(false);
+  const [resetting, setResetting] = useState(false);
 
   const selected = useMemo(
     () => portfolio?.open_positions.find((p) => p.id === selectedId) ?? portfolio?.open_positions[0] ?? null,
@@ -169,6 +171,19 @@ export default function StrategyScreen() {
     }
   };
 
+  const onReset = async () => {
+    setResetting(true);
+    try {
+      await strategyApi.reset(strategy);
+      setResetModalVisible(false);
+      await load();
+    } catch (e: any) {
+      Alert.alert("Reset non riuscito", e?.message || "Errore sconosciuto");
+    } finally {
+      setResetting(false);
+    }
+  };
+
   const renderPosition = (p: PaperPosition, closed: boolean, pnlOverride?: number) => {
     const pnl = closed ? pnlOverride ?? 0 : p.unrealized_pnl ?? 0;
     const pnlColor = pnl >= 0 ? colors.success : colors.error;
@@ -221,7 +236,13 @@ export default function StrategyScreen() {
           <Ionicons name="chevron-back" size={26} color={colors.onSurface} />
         </Pressable>
         <Text style={styles.title}>{meta.title}</Text>
-        <View style={{ width: 26 }} />
+        <Pressable
+          onPress={() => setResetModalVisible(true)}
+          hitSlop={12}
+          testID="strategy-reset-button"
+        >
+          <Ionicons name="trash-outline" size={20} color={colors.error} />
+        </Pressable>
       </View>
       <Text style={styles.subtitle}>{meta.subtitle}</Text>
 
@@ -453,6 +474,42 @@ export default function StrategyScreen() {
                   <ActivityIndicator color={colors.onBrand} size="small" />
                 ) : (
                   <Text style={[styles.modalBtnText, { color: colors.onBrand }]}>Conferma</Text>
+                )}
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
+
+      <Modal visible={resetModalVisible} transparent animationType="fade">
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalBox} testID="strategy-reset-confirm-modal">
+            <Text style={styles.modalTitle}>Reset {meta.title}</Text>
+            <Text style={styles.modalSubtitle}>
+              Cancella tutte le posizioni aperte e lo storico chiuso di questa strategia.
+              {portfolio?.wallet_type === "isolated"
+                ? " Il saldo isolato torna alla cifra allocata, azzerando solo il P&L delle operazioni."
+                : " Il saldo condiviso con le altre strategie non viene toccato."}
+              {" "}Azione irreversibile.
+            </Text>
+            <View style={styles.modalButtons}>
+              <Pressable
+                style={[styles.modalBtn, { backgroundColor: colors.surfaceTertiary }]}
+                onPress={() => setResetModalVisible(false)}
+                testID="strategy-reset-cancel"
+              >
+                <Text style={styles.modalBtnText}>Annulla</Text>
+              </Pressable>
+              <Pressable
+                style={[styles.modalBtn, { backgroundColor: colors.error }]}
+                onPress={onReset}
+                disabled={resetting}
+                testID="strategy-reset-confirm"
+              >
+                {resetting ? (
+                  <ActivityIndicator color="#fff" size="small" />
+                ) : (
+                  <Text style={[styles.modalBtnText, { color: "#fff" }]}>Cancella tutto</Text>
                 )}
               </Pressable>
             </View>

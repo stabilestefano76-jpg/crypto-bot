@@ -3109,6 +3109,30 @@ async def strategy_wallet_withdraw(strategy: str, req: StrategyAllocateRequest) 
     }
 
 
+@api.post("/strategy/{strategy}/reset")
+async def strategy_reset(strategy: str) -> dict[str, Any]:
+    """Reset a single strategy's own history: removes its open positions and
+    closed trades. If it has an isolated wallet, undoes just the
+    accumulated trading P&L from its cash (keeps whatever was allocated
+    intact — same spirit as Scalping/Grid's reset). Does NOT touch the
+    other two strategies, and does NOT touch the shared main wallet if this
+    strategy is currently on the shared pool (cash there isn't
+    attributable to a single strategy)."""
+    if strategy not in STRATEGY_WALLET_NAMES:
+        raise HTTPException(status_code=400, detail="invalid strategy")
+    w = await get_strategy_wallet(strategy)
+    if w is not None:
+        closed = await db.paper_trades.find({"strategy": strategy}, {"_id": 0}).to_list(10000)
+        realized = sum(t.get("pnl_usdt", 0.0) for t in closed)
+        open_positions = await db.paper_positions.find({"strategy": strategy}, {"_id": 0}).to_list(1000)
+        locked = sum(p["entry"] * p["quantity"] for p in open_positions)
+        new_cash = w.get("cash", 0.0) - realized + locked
+        await db.strategy_wallets.update_one({"_id": strategy}, {"$set": {"cash": new_cash}})
+    await db.paper_positions.delete_many({"strategy": strategy})
+    await db.paper_trades.delete_many({"strategy": strategy})
+    return {"ok": True, "strategy": strategy}
+
+
 @api.get("/strategy/{strategy}/portfolio")
 async def strategy_portfolio(strategy: str) -> dict[str, Any]:
     """Portfolio view scoped to a single strategy: its positions/trades, and

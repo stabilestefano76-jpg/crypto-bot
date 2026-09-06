@@ -508,6 +508,10 @@ export const strategyWalletApi = {
 export const strategyApi = {
   portfolio: (strategy: StrategyName) =>
     req<StrategyPortfolio>(`/strategy/${strategy}/portfolio`),
+  reset: (strategy: StrategyName) =>
+    req<{ ok: boolean; strategy: string }>(`/strategy/${strategy}/reset`, {
+      method: "POST",
+    }),
 };
 
 // ---------------------------------------------------------------------------
