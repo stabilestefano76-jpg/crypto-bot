@@ -892,6 +892,23 @@ async def open_paper_position(signal: dict[str, Any]) -> Optional[PaperPosition]
     if not fill_price or fill_price <= 0:
         fill_price = signal["entry"]
 
+    # Guard against a stale signal: stop_loss/take_profit are absolute market
+    # levels computed from the signal's (older) entry price, not adjusted for
+    # the fresh fill_price above. If price already moved past either level by
+    # the time we actually get here, the position would be born already
+    # "at/beyond target" (or already past its stop) — the very next check
+    # would then close it immediately using that stale level as the exit
+    # price, which can produce a NEGATIVE real pnl while still being labeled
+    # a "win" (target hit) simply because price is on the far side of it.
+    # Cleanest fix: skip opening entirely rather than open a trade whose
+    # premise the market has already invalidated.
+    if signal["side"] == "long":
+        if fill_price >= signal["take_profit"] or fill_price <= signal["stop_loss"]:
+            return None
+    else:
+        if fill_price <= signal["take_profit"] or fill_price >= signal["stop_loss"]:
+            return None
+
     risk_usdt = max(1.0, cash * pcfg.risk_per_trade_pct / 100)
     risk_per_unit = abs(signal["entry"] - signal["stop_loss"])
     if risk_per_unit <= 0:
