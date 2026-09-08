@@ -236,13 +236,7 @@ export default function StrategyScreen() {
           <Ionicons name="chevron-back" size={26} color={colors.onSurface} />
         </Pressable>
         <Text style={styles.title}>{meta.title}</Text>
-        <Pressable
-          onPress={() => setResetModalVisible(true)}
-          hitSlop={12}
-          testID="strategy-reset-button"
-        >
-          <Ionicons name="trash-outline" size={20} color={colors.error} />
-        </Pressable>
+        <View style={{ width: 26 }} />
       </View>
       <Text style={styles.subtitle}>{meta.subtitle}</Text>
 
@@ -362,9 +356,18 @@ export default function StrategyScreen() {
             <Text style={styles.sectionTitle}>
               Storico recente ({portfolio?.closed_count ?? 0}) · Win rate {portfolio?.win_rate ?? 0}%
             </Text>
-            <Pressable onPress={() => router.push(`/strategy/${strategy}/history` as any)} hitSlop={8}>
-              <Text style={styles.historyLink}>Vedi tutto ›</Text>
-            </Pressable>
+            <View style={{ flexDirection: "row", alignItems: "center", gap: spacing.md }}>
+              <Pressable
+                onPress={() => setResetModalVisible(true)}
+                hitSlop={12}
+                testID="strategy-reset-button"
+              >
+                <Ionicons name="trash-outline" size={18} color={colors.error} />
+              </Pressable>
+              <Pressable onPress={() => router.push(`/strategy/${strategy}/history` as any)} hitSlop={8}>
+                <Text style={styles.historyLink}>Vedi tutto ›</Text>
+              </Pressable>
+            </View>
           </View>
           {(portfolio?.closed_trades ?? []).length === 0 ? (
             <Text style={styles.emptyText}>Nessuna operazione chiusa ancora.</Text>
