@@ -4130,13 +4130,18 @@ async def build_grid_plan(symbol: str, cfg: Config) -> Optional[dict[str, Any]]:
 
     n = cfg.grid_num_levels
     step = (fvg_top - fvg_bottom) / max(1, n - 1) if n > 1 else 0.0
+    # Classic grid mechanic: each buy level gets its OWN sell target just
+    # above it (spaced by ATR), instead of every cell sharing one distant
+    # target. Buys portions on the way down, sells portions on the way up —
+    # many small round-trips instead of waiting for one big recovery.
+    spacing = cfg.grid_atr_spacing_mult * atr
     cells = []
     for idx in range(n):
         buy_price = fvg_top - idx * step
         cells.append({
             "index": idx + 1,
             "buy_price": round(buy_price, 8),
-            "sell_price": round(target, 8),
+            "sell_price": round(buy_price + spacing, 8),
             "status": "armed",
             "trailing_active": False,
             "peak_price": None,

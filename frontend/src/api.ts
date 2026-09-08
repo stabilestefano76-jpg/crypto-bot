@@ -93,6 +93,10 @@ export type Config = {
   max_pairs_per_scan: number;
   enabled_pairs: string[];
   excluded_pairs: string[];
+  scalping_enabled: boolean;
+  grid_enabled: boolean;
+  grid_num_levels: number;
+  grid_atr_spacing_mult: number;
 };
 
 export type ScanState = {

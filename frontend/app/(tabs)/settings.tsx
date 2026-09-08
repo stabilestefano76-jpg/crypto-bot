@@ -400,6 +400,34 @@ export default function SettingsScreen() {
             </Section>
           )}
 
+          {cfg.grid_enabled && (
+            <Section title="Grid Bot">
+              <NumRow
+                label="Numero livelli di acquisto"
+                value={cfg.grid_num_levels}
+                onChange={(v) => update({ grid_num_levels: v })}
+                testID="input-grid-num-levels"
+              />
+              <NumRow
+                label="Distanza target per livello (×ATR)"
+                value={cfg.grid_atr_spacing_mult}
+                onChange={(v) => update({ grid_atr_spacing_mult: v })}
+                step={0.1}
+                testID="input-grid-atr-spacing"
+              />
+              <Text style={styles.scoreHintText}>
+                Quante celle di acquisto crea ogni griglia, distribuite dal
+                fondo al bordo della propria zona FVG — più livelli
+                significa acquisti più ravvicinati (mediando più spesso), meno
+                livelli significa acquisti più distanziati. Ogni livello ha il
+                proprio target di vendita, calcolato automaticamente sopra il
+                proprio prezzo di entrata (distanza in ATR): compra a scaglioni
+                scendendo, vende a scaglioni salendo — non più un unico
+                target lontano condiviso da tutte le celle.
+              </Text>
+            </Section>
+          )}
+
           <Section title="Trailing Stop (Scalping + Grid)">
             <ToggleRow
               label="Trailing stop attivo"
