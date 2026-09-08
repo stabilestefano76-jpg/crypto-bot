@@ -1630,17 +1630,20 @@ def detect_stepped_rejection_pattern(opens, highs, lows, closes, against: str) -
         extremes = [highs[i] for i in idx]
         spikes = [highs[i] - max(opens[i], closes[i]) for i in idx]
         bodies = [abs(closes[i] - opens[i]) for i in idx]
-        stepping = extremes[0] > extremes[1] > extremes[2]
+        stepping = extremes[0] >= extremes[1] >= extremes[2]
         label = "Massimi Decrescenti con Rifiuto"
     else:  # trend DOWN -> want HIGHER LOWS with long lower-wick rejection
         extremes = [lows[i] for i in idx]
         spikes = [min(opens[i], closes[i]) - lows[i] for i in idx]
         bodies = [abs(closes[i] - opens[i]) for i in idx]
-        stepping = extremes[0] < extremes[1] < extremes[2]
+        stepping = extremes[0] <= extremes[1] <= extremes[2]
         label = "Minimi Crescenti con Rifiuto"
-    # "long" wick = at least as long as the candle's own body (avoids
-    # accepting doji-like candles with a barely-there wick as "rejection").
-    long_enough = all(s > 0 and s >= b for s, b in zip(spikes, bodies))
+    # "long" wick = at least 80% of the candle's own body (avoids accepting
+    # doji-like candles with a barely-there wick as "rejection"; was a full
+    # 100% match required on all 3 candles, which proved too strict in
+    # practice — this keeps the spirit of a genuine rejection wick while
+    # tolerating the normal noise real candles have).
+    long_enough = all(s > 0 and s >= b * 0.8 for s, b in zip(spikes, bodies))
     if stepping and long_enough:
         return label
     return None
@@ -3075,6 +3078,16 @@ async def strategy_wallet_withdraw(strategy: str, req: StrategyAllocateRequest) 
             status_code=400,
             detail=f"Chiudi prima le {open_count} posizioni aperte di questa strategia",
         )
+    # Rounding-display tolerance: the on-screen balance is rounded to cents,
+    # so the real stored value can sit a tiny fraction below it after many
+    # small accumulated operations. If the request is within a cent of
+    # what's actually there, withdraw exactly what's available instead of
+    # rejecting a withdrawal of "the whole displayed balance" — but never
+    # adjust upward, so this can't ever push cash negative.
+    w_check = await get_strategy_wallet(strategy)
+    available = w_check.get("cash", 0.0) if w_check else 0.0
+    if amount > available and (amount - available) <= 0.01:
+        amount = available
     updated = await db.strategy_wallets.find_one_and_update(
         {"_id": strategy, "allocated": True, "cash": {"$gte": amount}},
         {"$inc": {"cash": -amount}},
