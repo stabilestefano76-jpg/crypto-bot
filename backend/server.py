@@ -164,7 +164,7 @@ class Config(BaseModel):
     grid_atr_period: int = 14
     grid_num_levels: int = 4  # wide/sparse grid: few levels below the center price
     grid_atr_spacing_mult: float = 1.8  # distance between grid levels = this * ATR
-    grid_range_break_atr_mult: float = 3.0  # emergency stop: price this many ATR below the lowest level
+    grid_range_break_atr_mult: float = 3.0  # unused since spot removed the forced emergency stop — kept only so old grid documents that still reference it don't break
     grid_max_pairs: int = 4  # max symbols with an active grid at once
     grid_replace_improvement_pct: float = 20.0  # candidate must be this much MORE lateral (lower bb_width+ema_gap) than the worst idle active grid to replace it
 
@@ -4212,6 +4212,7 @@ async def create_grid_instance_from_plan(plan: dict[str, Any], cfg: Config) -> d
         "fvg_bottom": plan["fvg_bottom"],
         "swing_high": plan["swing_high"],
         "target": plan["target"],
+        "extension_count": 0,  # how many extra buy levels added below the original zone (capped at 4)
     }
     await db.grid_instances.insert_one(doc)
     return doc
@@ -4419,37 +4420,40 @@ async def monitor_grid_instances() -> None:
         # Emergency stop: price fell well below the lowest grid cell — this
         # means the market broke out of the range into a real downtrend.
         lowest_buy = min(c["buy_price"] for c in cells)
-        if cur < lowest_buy - cfg.grid_range_break_atr_mult * grid["atr"]:
-            holding = await db.grid_positions.find(
-                {"grid_id": grid["id"], "status": "open"}, {"_id": 0}
-            ).to_list(100)
-            for pos in holding:
-                exit_notional = cur * pos["quantity"]
-                fees = (pos["notional"] + exit_notional) * GRID_FEE_PCT
-                pnl = (cur - pos["entry"]) * pos["quantity"] - fees
-                # Atomic credit, immediately per position (never accumulated
-                # locally and written once — that pattern is what let a
-                # concurrent deposit/withdraw get silently overwritten).
-                await db.grid_wallet.update_one(
-                    {"_id": GRID_WALLET_ID},
-                    {"$inc": {"cash": pos["notional"] + pnl}},
-                    upsert=True,
-                )
-                await db.grid_positions.update_one(
-                    {"id": pos["id"]},
-                    {"$set": {
-                        "status": "closed", "close_price": cur,
-                        "close_reason": "emergency_stop", "pnl_usdt": round(pnl, 4),
-                        "closed_at": datetime.now(timezone.utc).isoformat(),
-                    }},
-                )
+
+        # Extend the ladder downward (up to 4 extra levels total) when price
+        # has fallen meaningfully below the lowest existing buy — using the
+        # SAME spacing as the rest of the ladder, so it's a natural
+        # continuation rather than an arbitrary new distance. Gives the grid
+        # more room to keep averaging down in a real crash before the harder
+        # emergency stop below ever needs to fire. One new level per tick at
+        # most — a single sharp wick shouldn't instantly max out all 4.
+        if grid.get("extension_count", 0) < 4 and cur < lowest_buy - grid["spacing"]:
+            new_buy = lowest_buy - grid["spacing"]
+            new_cell = {
+                "index": len(cells) + 1,
+                "buy_price": round(new_buy, 8),
+                "sell_price": round(new_buy + cfg.grid_atr_spacing_mult * grid["atr"], 8),
+                "status": "armed",
+                "trailing_active": False,
+                "peak_price": None,
+                "needs_low_confirmation": False,
+                "low_confirmed": False,
+            }
+            cells = cells + [new_cell]
             await db.grid_instances.update_one(
                 {"id": grid["id"]},
-                {"$set": {"status": "stopped", "stopped_reason": "range_break"}},
+                {"$set": {"cells": cells}, "$inc": {"extension_count": 1}},
             )
-            continue
+            grid["cells"] = cells
+            lowest_buy = new_buy
 
-        changed = False
+        # Emergency stop removed: in spot there's no liquidation risk, and
+        # forcing a sale at a loss just crystallizes it. The only remaining
+        # cap on capital committed to a falling market is the 4-extension
+        # limit above — once exhausted, positions simply wait, however long
+        # it takes, for price to recover into their own targets.
+
 
         # --- Cascade profit-lock: when price returns up to the entry of the
         # highest-priced (shallowest) currently-holding cell, close every
