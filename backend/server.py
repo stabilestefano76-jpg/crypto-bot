@@ -1588,6 +1588,24 @@ def _higher_tf(tf: str) -> str:
     return {"15m": "1h", "1h": "4h", "4h": "1d", "1d": "1d"}.get(tf, "1h")
 
 
+def find_recent_reversal_pattern(opens, highs, lows, closes, against: str, lookback: int = 5) -> Optional[str]:
+    """Scan the last `lookback` candles for a reversal pattern (classic or
+    stepped), not just the very last one. Both detectors only ever look at
+    the final 1-3 candles of whatever arrays they're given — checking only
+    the single most recent candle meant a genuine reversal that formed a
+    few candles before the actual breakout was being missed entirely just
+    because it wasn't the exact last bar checked."""
+    n = len(closes)
+    for end in range(n, max(2, n - lookback), -1):
+        pattern = detect_reversal_pattern(opens[:end], highs[:end], lows[:end], closes[:end], against)
+        if pattern:
+            return pattern
+        pattern = detect_stepped_rejection_pattern(opens[:end], highs[:end], lows[:end], closes[:end], against)
+        if pattern:
+            return pattern
+    return None
+
+
 def detect_reversal_pattern(opens, highs, lows, closes, against: str) -> Optional[str]:
     """Detect engulfing or star pattern oriented `against` ('bearish'|'bullish')."""
     if len(closes) < 3:
@@ -1742,9 +1760,7 @@ async def analyze_pair_counter(symbol: str, tf: str, cfg: Config) -> Optional[Si
     against = "bullish" if side == "long" else "bearish"
     box_opens, box_highs = [c[1] for c in box], [c[3] for c in box]
     box_lows, box_closes = [c[4] for c in box], [c[2] for c in box]
-    pattern = detect_reversal_pattern(box_opens, box_highs, box_lows, box_closes, against)
-    if pattern is None:
-        pattern = detect_stepped_rejection_pattern(box_opens, box_highs, box_lows, box_closes, against)
+    pattern = find_recent_reversal_pattern(box_opens, box_highs, box_lows, box_closes, against)
     if pattern is None:
         await log_reject(symbol, tf, STRAT, "pattern di inversione non trovato")
         return None
@@ -1958,9 +1974,7 @@ async def analyze_pair_fvg_reversal(symbol: str, tf: str, cfg: Config) -> Option
     # classic candlestick pattern, or three consecutive shrinking wicks
     # against the trend (fading momentum), same as Rev Pre-FVG.
     against = "bearish" if trend == "up" else "bullish"
-    pattern = detect_reversal_pattern(opens, highs, lows, closes, against)
-    if pattern is None:
-        pattern = detect_stepped_rejection_pattern(opens, highs, lows, closes, against)
+    pattern = find_recent_reversal_pattern(opens, highs, lows, closes, against)
     if pattern is None:
         await log_reject(symbol, tf, STRAT, "pattern di inversione non trovato")
         return None
