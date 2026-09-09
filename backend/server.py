@@ -1595,8 +1595,15 @@ def detect_reversal_pattern(opens, highs, lows, closes, against: str) -> Optiona
     o1, c1 = opens[-2], closes[-2]
     o0, c0 = opens[-1], closes[-1]
     if against == "bearish":  # trend up -> want bearish reversal
-        # Bearish engulfing
-        if c1 > o1 and c0 < o0 and c0 <= o1 and o0 >= c1:
+        # Bearish engulfing — using "strong reversal candle" bounds (body at
+        # least as big as the prior one, closing past its midpoint) rather
+        # than requiring a textbook-perfect full engulf (both edges
+        # containing the prior body exactly). A real, significant reversal
+        # candle very often just misses that exact full-engulf requirement
+        # by a hair while still being a genuine, meaningful signal.
+        body1 = abs(c1 - o1)
+        body0 = abs(c0 - o0)
+        if c1 > o1 and c0 < o0 and body0 >= body1 and c0 < (o1 + c1) / 2:
             return "Bearish Engulfing"
         # Evening star (3 candles)
         o2, c2 = opens[-3], closes[-3]
@@ -1604,7 +1611,9 @@ def detect_reversal_pattern(opens, highs, lows, closes, against: str) -> Optiona
         if c2 > o2 and mid_small and c0 < o0 and c0 < (o2 + c2) / 2:
             return "Evening Star"
     else:  # trend down -> want bullish reversal
-        if c1 < o1 and c0 > o0 and c0 >= o1 and o0 <= c1:
+        body1 = abs(c1 - o1)
+        body0 = abs(c0 - o0)
+        if c1 < o1 and c0 > o0 and body0 >= body1 and c0 > (o1 + c1) / 2:
             return "Bullish Engulfing"
         o2, c2 = opens[-3], closes[-3]
         mid_small = abs(c1 - o1) < abs(c2 - o2) * 0.5
@@ -2054,26 +2063,31 @@ async def analyze_pair_rsi_reversion(symbol: str, tf: str, cfg: Config) -> Optio
     os_ = cfg.rsi_rev_oversold
     min_extreme = cfg.rsi_rev_min_extreme_candles
 
-    def consecutive_extreme_before_last(threshold: float, above: bool) -> int:
-        """Count consecutive candles, going backwards from the one right
-        before the last, that stayed beyond `threshold`."""
+    def extreme_count_in_window(threshold: float, above: bool, window: int = 8) -> int:
+        """Count how many of the last `window` candles before the current
+        one were beyond `threshold` — NOT requiring an unbroken consecutive
+        run. Real RSI rarely holds a threshold with zero noise; a single
+        candle dipping back inside for one bar was resetting the whole count
+        to 0 under the old strict-consecutive check, even after a genuinely
+        sustained extreme move."""
         count = 0
         i = len(rsis) - 2
-        while i >= 0 and rsis[i] is not None:
+        checked = 0
+        while i >= 0 and rsis[i] is not None and checked < window:
             beyond = (rsis[i] >= threshold) if above else (rsis[i] <= threshold)
-            if not beyond:
-                break
-            count += 1
+            if beyond:
+                count += 1
+            checked += 1
             i -= 1
         return count
 
     side: Optional[str] = None
     # Filter 1 (candle-close confirmation) + Filter 3 (min time in extreme
     # zone) are both checked here: the reentry must be on THIS closed candle,
-    # preceded by enough consecutive candles genuinely beyond the threshold.
-    if rsis[-1] < ob and consecutive_extreme_before_last(ob, above=True) >= min_extreme:
+    # preceded by enough candles genuinely beyond the threshold recently.
+    if rsis[-1] < ob and extreme_count_in_window(ob, above=True) >= min_extreme:
         side = "short"
-    elif rsis[-1] > os_ and consecutive_extreme_before_last(os_, above=False) >= min_extreme:
+    elif rsis[-1] > os_ and extreme_count_in_window(os_, above=False) >= min_extreme:
         side = "long"
     if side is None:
         await log_reject(symbol, tf, STRAT, "nessun rientro da zona estrema")
@@ -3460,6 +3474,8 @@ async def run_scalping_scan() -> dict[str, Any]:
             continue
         if quotes and s.get("quoteCurrency") not in quotes:
             continue
+        if s.get("baseCurrency") in SCALPING_EXCLUDED_STABLE_BASES:
+            continue  # stablecoin-vs-stablecoin: too little real movement for commissions to ever be worth it
         if cfg.excluded_pairs and sym in cfg.excluded_pairs:
             continue
         if cfg.enabled_pairs and sym not in cfg.enabled_pairs:
@@ -3715,6 +3731,7 @@ async def scalping_portfolio() -> dict[str, Any]:
 SCALPING_SL_PCT = 0.004   # fallback only, used when ATR is unavailable (0 or missing)
 SCALPING_TP_PCT = 0.014   # fallback only, used when ATR is unavailable (0 or missing)
 SCALPING_WALLET_RISK_PCT = 0.05  # % of scalping cash used per trade (was 0.20 — brought in line with the 1-2% industry norm, adapted for an already-isolated scalping sub-wallet)
+SCALPING_EXCLUDED_STABLE_BASES = {"USDC", "USDT", "EURC", "DAI", "BUSD", "TUSD", "FDUSD"}  # stablecoin-vs-stablecoin pairs move too little for fees to ever be worth it on a fast scalp
 SCALPING_FEE_PCT = 0.001  # 0.10% Bybit spot fee per side (open + close = 0.20% round trip)
 
 
