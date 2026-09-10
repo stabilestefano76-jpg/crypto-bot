@@ -167,6 +167,25 @@ class Config(BaseModel):
     grid_range_break_atr_mult: float = 3.0  # unused since spot removed the forced emergency stop — kept only so old grid documents that still reference it don't break
     grid_max_pairs: int = 4  # max symbols with an active grid at once
     grid_replace_improvement_pct: float = 20.0  # candidate must be this much MORE lateral (lower bb_width+ema_gap) than the worst idle active grid to replace it
+    # --- Top 10 Long (multi-setup: pullback / breakout-retest / momentum / mean-reversion) ---
+    top10_enabled: bool = True
+    top10_universe_size: int = 10  # how many coins to consider each scan, ranked by 24h volume (proxy for market cap)
+    top10_risk_pct: float = 0.75  # % of wallet cash risked per trade (spec range: 0.5-1%)
+    top10_min_setup_score: float = 75.0  # composite score (0-100) required to auto-open
+    top10_min_rr: float = 2.0  # minimum reward:risk to TP1
+    top10_tp1_pct: float = 2.0  # first take-profit, % above entry
+    top10_tp1_close_pct: float = 50.0  # % of position closed at TP1
+    top10_tp2_pct: float = 3.0  # second take-profit, % above entry
+    top10_tp2_close_pct: float = 35.0  # % of ORIGINAL position closed at TP2 (remainder becomes the TP3 "runner")
+    top10_runner_trailing_atr_mult: float = 2.0  # after TP2, the small remaining runner trails by this many ATR — approximates "TP3 = next resistance if momentum stays strong"
+    top10_max_daily_losses: int = 2  # consecutive losing trades before pausing for the rest of the UTC day
+    top10_max_daily_loss_pct: float = 2.0  # cumulative daily loss (% of wallet) before pausing for the rest of the UTC day
+    top10_max_total_risk_pct: float = 2.0  # total risk allowed open at once across all Top10 positions combined
+    top10_ema_fast: int = 20
+    top10_ema_medium: int = 50
+    top10_ema_slow: int = 200
+    top10_rsi_period: int = 14
+    top10_atr_period: int = 14
 
 
 class Signal(BaseModel):
@@ -2339,6 +2358,7 @@ async def scheduler_loop() -> None:
             await run_scan()
             await run_scalping_scan()
             await run_grid_scan()
+            await run_top10_scan()
         except Exception as e:  # noqa: BLE001
             logger.exception("Scan loop error: %s", e)
         await asyncio.sleep(max(60, cfg.scan_interval_minutes * 60))
@@ -2501,6 +2521,7 @@ async def lifespan(_app: FastAPI):
     monitor_task = asyncio.create_task(paper_monitor_loop())
     scalping_monitor_task = asyncio.create_task(scalping_monitor_loop())
     grid_monitor_task = asyncio.create_task(grid_monitor_loop())
+    top10_monitor_task = asyncio.create_task(top10_monitor_loop())
     ws_task = asyncio.create_task(price_feed.run())
     premature_task = asyncio.create_task(premature_stop_loop())
     entry_timing_task = asyncio.create_task(entry_timing_loop())
@@ -3383,6 +3404,15 @@ def _ema(values: list[float], period: int) -> list[float]:
     for v in values[1:]:
         out.append(v * k + out[-1] * (1 - k))
     return out
+
+
+def _macd(closes: list[float], fast: int = 12, slow: int = 26, signal: int = 9):
+    """Returns (macd_line, signal_line) as lists aligned with `closes`."""
+    ema_fast = _ema(closes, fast)
+    ema_slow = _ema(closes, slow)
+    macd_line = [f - s for f, s in zip(ema_fast, ema_slow)]
+    signal_line = _ema(macd_line, signal)
+    return macd_line, signal_line
 
 
 def _vwap(highs, lows, closes, volumes) -> float:
@@ -4635,6 +4665,18 @@ async def grid_monitor_loop() -> None:
         await asyncio.sleep(3)
 
 
+async def top10_monitor_loop() -> None:
+    """Check Top10 stop/TP1/TP2/runner-trailing every 3s using the
+    real-time WS price cache — same reasoning as the other monitors."""
+    await asyncio.sleep(8)
+    while True:
+        try:
+            await monitor_top10_positions()
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Top10 monitor error: %s", e)
+        await asyncio.sleep(3)
+
+
 class GridTransferRequest(BaseModel):
     amount: float
 
@@ -4697,6 +4739,569 @@ async def grid_reset() -> dict[str, Any]:
     await save_grid_wallet({"cash": 0.0, "total_transferred_in": 0.0, "reset_seq": next_seq})
     return {"ok": True, "cash": 0.0}
 
+
+
+
+# ============================================================================
+# TOP 10 LONG — multi-setup strategy (Pullback / Breakout-Retest / Momentum /
+# Mean-Reversion) over the top coins by 24h volume (proxy for market cap).
+# Long-only, spot. Own isolated wallet, own position lifecycle, independent
+# of the 3 traditional strategies and of Scalping/Grid.
+# ============================================================================
+
+TOP10_WALLET_ID = "top10_wallet_singleton"
+TOP10_FEE_PCT = 0.001
+
+
+async def get_top10_wallet() -> dict[str, Any]:
+    doc = await db.top10_wallet.find_one({"_id": TOP10_WALLET_ID}, {"_id": 0})
+    if not doc:
+        doc = {"cash": 0.0, "total_transferred_in": 0.0, "reset_seq": 0}
+        await db.top10_wallet.update_one(
+            {"_id": TOP10_WALLET_ID}, {"$set": doc}, upsert=True
+        )
+    doc.setdefault("reset_seq", 0)
+    return doc
+
+
+async def get_top10_daily_state() -> dict[str, Any]:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    doc = await db.top10_daily_state.find_one({"_id": today}, {"_id": 0})
+    if not doc:
+        doc = {"date": today, "consecutive_losses": 0, "daily_pnl_usdt": 0.0}
+        await db.top10_daily_state.update_one({"_id": today}, {"$set": doc}, upsert=True)
+    doc.setdefault("consecutive_losses", 0)
+    doc.setdefault("daily_pnl_usdt", 0.0)
+    return doc
+
+
+async def record_top10_trade_outcome(pnl_usdt: float) -> None:
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    if pnl_usdt < 0:
+        await db.top10_daily_state.update_one(
+            {"_id": today},
+            {"$inc": {"daily_pnl_usdt": pnl_usdt, "consecutive_losses": 1}, "$set": {"date": today}},
+            upsert=True,
+        )
+    else:
+        await db.top10_daily_state.update_one(
+            {"_id": today},
+            {"$inc": {"daily_pnl_usdt": pnl_usdt}, "$set": {"date": today, "consecutive_losses": 0}},
+            upsert=True,
+        )
+
+
+async def get_top10_universe(cfg: Config) -> list[str]:
+    """Top N coins by 24h volume (proxy for market cap — this exchange has
+    no market-cap feed), deduplicated by base asset across all supported
+    quote currencies so we pick the single most-liquid pair per coin,
+    excluding stablecoins."""
+    tickers = await exchange.get_tickers()
+    vol_map: dict[str, float] = {}
+    for t in tickers:
+        try:
+            vol_map[t["symbol"]] = float(t.get("volValue") or 0)
+        except (TypeError, ValueError):
+            continue
+    symbols = await exchange.get_symbols()
+    quotes = {q.strip() for q in (cfg.quote_filter or "").split(",") if q.strip()}
+    best_per_base: dict[str, tuple[str, float]] = {}
+    for s in symbols:
+        if not s.get("enableTrading"):
+            continue
+        sym = s.get("symbol")
+        base = s.get("baseCurrency")
+        if not sym or not base:
+            continue
+        if quotes and s.get("quoteCurrency") not in quotes:
+            continue
+        if base in SCALPING_EXCLUDED_STABLE_BASES:
+            continue
+        vol = vol_map.get(sym, 0)
+        if vol < cfg.min_24h_volume_usdt:
+            continue
+        if base not in best_per_base or vol > best_per_base[base][1]:
+            best_per_base[base] = (sym, vol)
+    ranked = sorted(best_per_base.values(), key=lambda x: x[1], reverse=True)
+    return [sym for sym, _ in ranked[: cfg.top10_universe_size]]
+
+
+async def compute_top10_trend_score(symbol: str, cfg: Config) -> tuple[float, dict[str, Any]]:
+    """0-100 trend-strength gate on the 4H timeframe: price vs EMA200,
+    EMA20/50/200 alignment, HH/HL structure, momentum, volume coherence."""
+    candles = await exchange.get_klines(symbol, "4h")
+    if len(candles) < cfg.top10_ema_slow + 5:
+        return 0.0, {}
+    closes = [c[2] for c in candles]
+    volumes = [c[5] for c in candles]
+    ema_fast = _ema(closes, cfg.top10_ema_fast)
+    ema_med = _ema(closes, cfg.top10_ema_medium)
+    ema_slow = _ema(closes, cfg.top10_ema_slow)
+    price = closes[-1]
+    structure = detect_market_structure(candles, window=5, strict=False)
+    vol_avg = sum(volumes[-20:]) / min(20, len(volumes))
+    vol_now = volumes[-1]
+
+    score = 0.0
+    if price > ema_slow[-1]:
+        score += 25
+    if ema_fast[-1] > ema_med[-1]:
+        score += 20
+    if ema_med[-1] > ema_slow[-1]:
+        score += 20
+    if structure == "up":
+        score += 20
+    elif structure == "range":
+        score += 5
+    momentum = (closes[-1] - closes[-6]) / closes[-6] * 100 if len(closes) > 6 and closes[-6] else 0.0
+    if momentum > 0:
+        score += 10
+    if vol_now >= vol_avg:
+        score += 5
+    return score, {"momentum_pct": momentum, "structure": structure}
+
+
+def detect_top10_pullback(cfg: Config, h1_candles: list[list[float]]) -> Optional[dict[str, Any]]:
+    """Trend + impulse + orderly pullback with declining volume, confirmation
+    candle near EMA20/support with rising volume on the reentry."""
+    closes = [c[2] for c in h1_candles]
+    highs = [c[3] for c in h1_candles]
+    lows = [c[4] for c in h1_candles]
+    opens = [c[1] for c in h1_candles]
+    volumes = [c[5] for c in h1_candles]
+    if len(closes) < 30:
+        return None
+    ema20 = _ema(closes, 20)
+    recent_high = max(highs[-15:-2])
+    pulled_back = closes[-2] < recent_high * 0.99
+    near_support = abs(closes[-1] - ema20[-1]) / closes[-1] < 0.015
+    vol_avg = sum(volumes[-10:-1]) / max(1, len(volumes[-10:-1]))
+    pullback_vol_declining = volumes[-2] < vol_avg
+    confirm_candle = closes[-1] > opens[-1]
+    confirm_volume_up = volumes[-1] > vol_avg
+    if pulled_back and near_support and confirm_candle and confirm_volume_up:
+        quality = 20 if pullback_vol_declining else 12
+        stop = min(lows[-3:]) * 0.998
+        return {"type": "PULLBACK", "entry": closes[-1], "stop": stop, "quality": quality}
+    return None
+
+
+def detect_top10_breakout_retest(cfg: Config, h1_candles: list[list[float]]) -> Optional[dict[str, Any]]:
+    """A resistance broken on above-average volume with a real close (not a
+    wick), then a retest of that level as support, still holding above it."""
+    closes = [c[2] for c in h1_candles]
+    highs = [c[3] for c in h1_candles]
+    lows = [c[4] for c in h1_candles]
+    volumes = [c[5] for c in h1_candles]
+    if len(closes) < 30:
+        return None
+    resistance = max(highs[-25:-5])
+    vol_avg = sum(volumes[-20:]) / 20
+    breakout_idx = None
+    for i in range(-5, 0):
+        if closes[i] > resistance and volumes[i] > vol_avg * 1.2:
+            breakout_idx = i
+            break
+    if breakout_idx is None or closes[-1] < resistance:
+        return None
+    retested = min(lows[breakout_idx:]) <= resistance * 1.01
+    not_too_extended = (closes[-1] - resistance) / resistance < 0.03
+    if retested and not_too_extended:
+        stop = resistance * 0.99
+        return {"type": "BREAKOUT_RETEST", "entry": closes[-1], "stop": stop, "quality": 20}
+    return None
+
+
+def detect_top10_momentum(cfg: Config, h1_candles: list[list[float]], btc_perf_24h: float) -> Optional[dict[str, Any]]:
+    """Relatively stronger than BTC, still rising, not parabolically extended."""
+    closes = [c[2] for c in h1_candles]
+    lows = [c[4] for c in h1_candles]
+    if len(closes) < 30:
+        return None
+    perf_24h = (closes[-1] - closes[-25]) / closes[-25] * 100 if len(closes) > 25 and closes[-25] else 0.0
+    relative_strength = perf_24h - btc_perf_24h
+    low_20 = min(lows[-20:])
+    extended = (closes[-1] - low_20) / low_20 > 0.20 if low_20 else True
+    if relative_strength > 2 and perf_24h > 0 and not extended:
+        stop = min(lows[-5:]) * 0.99
+        return {"type": "MOMENTUM", "entry": closes[-1], "stop": stop, "quality": min(20, 10 + relative_strength)}
+    return None
+
+
+def detect_top10_mean_reversion(cfg: Config, h1_candles: list[list[float]], trend_score: float) -> Optional[dict[str, Any]]:
+    """Only away from a strong 4H downtrend: RSI extremely oversold, selling
+    volume exhausting into a significant support, reversal candle."""
+    if trend_score < 30:
+        return None
+    closes = [c[2] for c in h1_candles]
+    lows = [c[4] for c in h1_candles]
+    opens = [c[1] for c in h1_candles]
+    volumes = [c[5] for c in h1_candles]
+    if len(closes) < 40:
+        return None
+    rsi_vals = rsi_wilder(closes, cfg.top10_rsi_period)
+    rsi_now = rsi_vals[-1] if rsi_vals else None
+    if rsi_now is None or rsi_now > 25:
+        return None
+    strong_support = min(lows[-40:-2])
+    near_support = closes[-1] <= strong_support * 1.02
+    selling_exhausting = volumes[-1] < (sum(volumes[-6:-1]) / 5)
+    reversal_candle = closes[-1] > opens[-1]
+    if near_support and selling_exhausting and reversal_candle:
+        stop = strong_support * 0.985
+        return {"type": "MEAN_REVERSION", "entry": closes[-1], "stop": stop, "quality": 18}
+    return None
+
+
+async def run_top10_scan() -> dict[str, Any]:
+    cfg = await get_config()
+    if not cfg.top10_enabled:
+        return {"skipped": True, "reason": "top10 disabled"}
+
+    daily = await get_top10_daily_state()
+    wallet = await get_top10_wallet()
+    if daily["consecutive_losses"] >= cfg.top10_max_daily_losses:
+        return {"skipped": True, "reason": "daily consecutive loss limit reached"}
+    reference_capital = wallet.get("total_transferred_in") or wallet.get("cash", 0.0)
+    if reference_capital > 0:
+        loss_limit = -abs(cfg.top10_max_daily_loss_pct) / 100 * reference_capital
+        if daily["daily_pnl_usdt"] <= loss_limit:
+            return {"skipped": True, "reason": "daily loss limit reached"}
+
+    open_count = await db.top10_positions.count_documents({"status": "open"})
+    max_concurrent = max(1, int(cfg.top10_max_total_risk_pct / max(0.01, cfg.top10_risk_pct)))
+    if open_count >= max_concurrent:
+        return {"skipped": True, "reason": "total risk cap reached"}
+
+    universe = await get_top10_universe(cfg)
+    if not universe:
+        return {"opened": False, "reason": "empty universe"}
+
+    btc_symbol = next((s for s in universe if s.startswith("BTC")), universe[0])
+    btc_trend_score, btc_meta = await compute_top10_trend_score(btc_symbol, cfg)
+    btc_perf_24h = btc_meta.get("momentum_pct", 0.0)
+    regime = "bullish" if btc_trend_score >= 65 else ("bearish" if btc_trend_score < 40 else "range")
+
+    candidates: list[dict[str, Any]] = []
+    for symbol in universe:
+        if await db.top10_positions.find_one({"symbol": symbol, "status": "open"}):
+            continue
+        trend_score, trend_meta = await compute_top10_trend_score(symbol, cfg)
+        if regime == "bearish" and trend_score < 50:
+            await log_reject(symbol, "1h", "top10", "regime ribassista su BTC, trend debole")
+            continue
+
+        h1_candles = await exchange.get_klines(symbol, "1h")
+        if len(h1_candles) < 40:
+            await log_reject(symbol, "1h", "top10", "dati insufficienti")
+            continue
+
+        setup = None
+        if trend_score >= 50:
+            setup = detect_top10_pullback(cfg, h1_candles)
+            if not setup:
+                setup = detect_top10_breakout_retest(cfg, h1_candles)
+            if not setup:
+                setup = detect_top10_momentum(cfg, h1_candles, btc_perf_24h)
+        if not setup:
+            setup = detect_top10_mean_reversion(cfg, h1_candles, trend_score)
+        if not setup:
+            await log_reject(symbol, "1h", "top10", "nessun setup valido")
+            continue
+
+        entry = setup["entry"]
+        stop = setup["stop"]
+        if entry <= stop:
+            continue
+        tp1 = entry * (1 + cfg.top10_tp1_pct / 100)
+        rr = (tp1 - entry) / (entry - stop)
+        if rr < cfg.top10_min_rr:
+            await log_reject(symbol, "1h", "top10", "R:R insufficiente")
+            continue
+
+        structure_component = 20 if trend_meta.get("structure") == "up" else (10 if trend_meta.get("structure") == "range" else 0)
+        momentum_component = min(10, max(0, trend_meta.get("momentum_pct", 0.0)))
+        rr_component = min(10, (rr / cfg.top10_min_rr) * 5)
+        volume_component = 15 if setup.get("quality", 0) >= 15 else 8
+        setup_component = min(20, setup.get("quality", 10))
+        trend_component = trend_score / 100 * 25
+        setup_score = min(100.0, trend_component + structure_component + volume_component + setup_component + momentum_component + rr_component)
+
+        if setup_score < cfg.top10_min_setup_score:
+            await log_reject(symbol, "1h", "top10", f"punteggio insufficiente ({round(setup_score)}/100)")
+            continue
+
+        candidates.append({
+            "symbol": symbol, "setup": setup, "entry": entry, "stop": stop,
+            "tp1": tp1, "rr": rr, "score": setup_score,
+        })
+
+    if not candidates:
+        return {"opened": False, "reason": "no qualifying setup"}
+
+    candidates.sort(key=lambda c: c["score"], reverse=True)
+    best = candidates[0]
+    await open_top10_position(best, cfg)
+    return {"opened": True, "symbol": best["symbol"], "setup": best["setup"]["type"], "score": best["score"]}
+
+
+async def open_top10_position(candidate: dict[str, Any], cfg: Config) -> None:
+    wallet = await get_top10_wallet()
+    cash = wallet.get("cash", 0.0)
+    if cash <= 1.0:
+        return
+    entry = candidate["entry"]
+    stop = candidate["stop"]
+    risk_usdt = cash * cfg.top10_risk_pct / 100
+    stop_dist_pct = (entry - stop) / entry
+    if stop_dist_pct <= 0:
+        return
+    notional = min(risk_usdt / stop_dist_pct, cash)
+    if notional < 1.0:
+        return
+    quantity = notional / entry
+
+    symbol = candidate["symbol"]
+    h1_candles = await exchange.get_klines(symbol, "1h")
+    highs = [c[3] for c in h1_candles]
+    lows = [c[4] for c in h1_candles]
+    closes = [c[2] for c in h1_candles]
+    atr_val = atr_wilder(highs, lows, closes, cfg.top10_atr_period) or 0.0
+
+    doc = {
+        "id": str(uuid.uuid4()),
+        "symbol": symbol,
+        "side": "long",
+        "setup_type": candidate["setup"]["type"],
+        "entry": entry,
+        "stop_loss": stop,
+        "current_stop": stop,
+        "tp1": candidate["tp1"],
+        "tp2": entry * (1 + cfg.top10_tp2_pct / 100),
+        "quantity": quantity,
+        "notional": notional,
+        "risk_usdt": risk_usdt,
+        "atr": atr_val,
+        "score": candidate["score"],
+        "tp1_hit": False,
+        "tp2_hit": False,
+        "runner_active": False,
+        "peak_price": None,
+        "realized_partial_pnl": 0.0,
+        "status": "open",
+        "opened_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.top10_positions.insert_one(dict(doc))
+    await db.top10_wallet.update_one(
+        {"_id": TOP10_WALLET_ID}, {"$inc": {"cash": -notional}}, upsert=True
+    )
+
+
+async def monitor_top10_positions() -> None:
+    cfg = await get_config()
+    open_positions = await db.top10_positions.find({"status": "open"}, {"_id": 0}).to_list(200)
+    for pos in open_positions:
+        cur = price_feed.get(pos["symbol"])
+        if not cur:
+            cur = await price_feed.price_or_rest(pos["symbol"])
+        if not cur or cur <= 0:
+            continue
+
+        active_stop = pos.get("current_stop", pos["stop_loss"])
+        if cur <= active_stop:
+            qty = pos["quantity"]
+            notional_portion = pos["entry"] * qty
+            fees = (notional_portion + cur * qty) * TOP10_FEE_PCT
+            pnl = (cur - pos["entry"]) * qty - fees
+            await db.top10_wallet.update_one(
+                {"_id": TOP10_WALLET_ID}, {"$inc": {"cash": notional_portion + pnl}}, upsert=True
+            )
+            total_pnl = pnl + pos.get("realized_partial_pnl", 0.0)
+            await db.top10_positions.update_one(
+                {"id": pos["id"]},
+                {"$set": {
+                    "status": "closed", "close_price": cur, "close_reason": "stop_loss",
+                    "pnl_usdt": round(total_pnl, 4),
+                    "closed_at": datetime.now(timezone.utc).isoformat(),
+                }},
+            )
+            await record_top10_trade_outcome(total_pnl)
+            continue
+
+        if not pos.get("tp1_hit") and cur >= pos["tp1"]:
+            close_qty = pos["quantity"] * (cfg.top10_tp1_close_pct / 100)
+            remaining_qty = pos["quantity"] - close_qty
+            notional_portion = pos["entry"] * close_qty
+            fees = (notional_portion + cur * close_qty) * TOP10_FEE_PCT
+            pnl = (cur - pos["entry"]) * close_qty - fees
+            await db.top10_wallet.update_one(
+                {"_id": TOP10_WALLET_ID}, {"$inc": {"cash": notional_portion + pnl}}, upsert=True
+            )
+            await db.top10_positions.update_one(
+                {"id": pos["id"]},
+                {"$set": {
+                    "quantity": remaining_qty,
+                    "tp1_hit": True,
+                    "current_stop": pos["entry"],
+                    "realized_partial_pnl": pos.get("realized_partial_pnl", 0.0) + pnl,
+                }},
+            )
+            continue
+
+        if pos.get("tp1_hit") and not pos.get("tp2_hit") and cur >= pos["tp2"]:
+            original_qty = pos["notional"] / pos["entry"]
+            close_qty = min(pos["quantity"], original_qty * (cfg.top10_tp2_close_pct / 100))
+            remaining_qty = pos["quantity"] - close_qty
+            notional_portion = pos["entry"] * close_qty
+            fees = (notional_portion + cur * close_qty) * TOP10_FEE_PCT
+            pnl = (cur - pos["entry"]) * close_qty - fees
+            await db.top10_wallet.update_one(
+                {"_id": TOP10_WALLET_ID}, {"$inc": {"cash": notional_portion + pnl}}, upsert=True
+            )
+            if remaining_qty * cur < 1.0:
+                notional_r = pos["entry"] * remaining_qty
+                fees_r = (notional_r + cur * remaining_qty) * TOP10_FEE_PCT
+                pnl_r = (cur - pos["entry"]) * remaining_qty - fees_r
+                await db.top10_wallet.update_one(
+                    {"_id": TOP10_WALLET_ID}, {"$inc": {"cash": notional_r + pnl_r}}, upsert=True
+                )
+                total_pnl = pnl + pnl_r + pos.get("realized_partial_pnl", 0.0)
+                await db.top10_positions.update_one(
+                    {"id": pos["id"]},
+                    {"$set": {
+                        "status": "closed", "close_price": cur, "close_reason": "take_profit",
+                        "pnl_usdt": round(total_pnl, 4),
+                        "closed_at": datetime.now(timezone.utc).isoformat(),
+                    }},
+                )
+                await record_top10_trade_outcome(total_pnl)
+            else:
+                await db.top10_positions.update_one(
+                    {"id": pos["id"]},
+                    {"$set": {
+                        "quantity": remaining_qty,
+                        "tp2_hit": True,
+                        "runner_active": True,
+                        "peak_price": cur,
+                        "realized_partial_pnl": pos.get("realized_partial_pnl", 0.0) + pnl,
+                    }},
+                )
+            continue
+
+        if pos.get("runner_active"):
+            peak = max(pos.get("peak_price") or cur, cur)
+            if peak != pos.get("peak_price"):
+                await db.top10_positions.update_one({"id": pos["id"]}, {"$set": {"peak_price": peak}})
+            trail_level = peak - cfg.top10_runner_trailing_atr_mult * (pos.get("atr") or 0)
+            if cur <= trail_level:
+                qty = pos["quantity"]
+                notional_portion = pos["entry"] * qty
+                fees = (notional_portion + cur * qty) * TOP10_FEE_PCT
+                pnl = (cur - pos["entry"]) * qty - fees
+                await db.top10_wallet.update_one(
+                    {"_id": TOP10_WALLET_ID}, {"$inc": {"cash": notional_portion + pnl}}, upsert=True
+                )
+                total_pnl = pnl + pos.get("realized_partial_pnl", 0.0)
+                await db.top10_positions.update_one(
+                    {"id": pos["id"]},
+                    {"$set": {
+                        "status": "closed", "close_price": cur, "close_reason": "trailing_stop",
+                        "pnl_usdt": round(total_pnl, 4),
+                        "closed_at": datetime.now(timezone.utc).isoformat(),
+                    }},
+                )
+                await record_top10_trade_outcome(total_pnl)
+
+
+class Top10TransferRequest(BaseModel):
+    amount: float
+
+
+@api.post("/top10/deposit")
+async def top10_deposit(req: Top10TransferRequest) -> dict[str, Any]:
+    amount = req.amount
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="L'importo deve essere positivo")
+    main_cash = await get_paper_cash()
+    if amount > main_cash:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Fondi insufficienti nel portafoglio principale (disponibili: {round(main_cash, 2)})",
+        )
+    await set_paper_cash(main_cash - amount)
+    updated = await db.top10_wallet.find_one_and_update(
+        {"_id": TOP10_WALLET_ID},
+        {"$inc": {"cash": amount, "total_transferred_in": amount}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return {"ok": True, "top10_cash": updated.get("cash", amount), "main_cash": main_cash - amount}
+
+
+@api.post("/top10/withdraw")
+async def top10_withdraw(req: Top10TransferRequest) -> dict[str, Any]:
+    amount = req.amount
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="L'importo deve essere positivo")
+    w = await get_top10_wallet()
+    available = w.get("cash", 0.0)
+    if amount > available and (amount - available) <= 0.01:
+        amount = available
+    updated = await db.top10_wallet.find_one_and_update(
+        {"_id": TOP10_WALLET_ID, "cash": {"$gte": amount}},
+        {"$inc": {"cash": -amount}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not updated:
+        raise HTTPException(status_code=400, detail="Fondi insufficienti nel portafoglio Top10")
+    main_cash = await get_paper_cash()
+    await set_paper_cash(main_cash + amount)
+    return {"ok": True, "top10_cash": updated.get("cash", 0.0), "main_cash": main_cash + amount}
+
+
+@api.get("/top10/portfolio")
+async def top10_portfolio() -> dict[str, Any]:
+    wallet = await get_top10_wallet()
+    open_docs = await db.top10_positions.find({"status": "open"}, {"_id": 0}).to_list(200)
+    closed_docs = await db.top10_positions.find({"status": "closed"}, {"_id": 0}).sort("closed_at", -1).to_list(500)
+
+    unrealized = 0.0
+    open_out = []
+    open_value = 0.0
+    for pos in open_docs:
+        cur = price_feed.get(pos["symbol"]) or pos["entry"]
+        upnl = (cur - pos["entry"]) * pos["quantity"] + pos.get("realized_partial_pnl", 0.0)
+        unrealized += upnl
+        open_value += cur * pos["quantity"]
+        open_out.append({**pos, "current_price": cur, "unrealized_pnl": round(upnl, 4)})
+
+    realized = sum(c.get("pnl_usdt", 0.0) for c in closed_docs)
+    equity = wallet.get("cash", 0.0) + open_value
+    wins = sum(1 for c in closed_docs if c.get("pnl_usdt", 0.0) > 0)
+    losses = sum(1 for c in closed_docs if c.get("pnl_usdt", 0.0) <= 0)
+    return {
+        "cash": round(wallet.get("cash", 0.0), 4),
+        "equity": round(equity, 4),
+        "total_transferred_in": wallet.get("total_transferred_in", 0.0),
+        "unrealized_pnl": round(unrealized, 4),
+        "realized_pnl": round(realized, 4),
+        "open_positions": open_out,
+        "closed_positions": closed_docs[:100],
+        "open_count": len(open_docs),
+        "closed_count": len(closed_docs),
+        "win_rate": round(wins / (wins + losses) * 100, 1) if (wins + losses) else 0.0,
+    }
+
+
+@api.post("/top10/reset")
+async def top10_reset() -> dict[str, Any]:
+    await db.top10_positions.delete_many({})
+    await db.top10_wallet.update_one(
+        {"_id": TOP10_WALLET_ID},
+        {"$set": {"cash": 0.0, "total_transferred_in": 0.0}, "$inc": {"reset_seq": 1}},
+        upsert=True,
+    )
+    return {"ok": True}
 
 @api.get("/grid/portfolio")
 async def grid_portfolio() -> dict[str, Any]:

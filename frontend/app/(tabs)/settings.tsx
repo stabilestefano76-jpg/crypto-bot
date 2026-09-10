@@ -126,6 +126,7 @@ export default function SettingsScreen() {
               const isActive = (val: string): boolean => {
                 if (val === "scalping") return cfg.scalping_enabled;
                 if (val === "grid") return cfg.grid_enabled;
+                if (val === "top10") return cfg.top10_enabled;
                 return stratOn(val);
               };
               const toggle = (val: string) => {
@@ -135,6 +136,10 @@ export default function SettingsScreen() {
                 }
                 if (val === "grid") {
                   update({ grid_enabled: !cfg.grid_enabled });
+                  return;
+                }
+                if (val === "top10") {
+                  update({ top10_enabled: !cfg.top10_enabled });
                   return;
                 }
                 const set = new Set(enabledStrategies);
@@ -150,6 +155,7 @@ export default function SettingsScreen() {
                     ["rsi_reversion", "RSI Reversion"],
                     ["scalping", "Scalping"],
                     ["grid", "Grid Bot"],
+                    ["top10", "Top 10 Long"],
                   ] as const).map(([val, label]) => {
                     const active = isActive(val);
                     return (
@@ -424,6 +430,104 @@ export default function SettingsScreen() {
                 proprio prezzo di entrata (distanza in ATR): compra a scaglioni
                 scendendo, vende a scaglioni salendo — non più un unico
                 target lontano condiviso da tutte le celle.
+              </Text>
+            </Section>
+          )}
+
+          {cfg.top10_enabled && (
+            <Section title="Top 10 Long">
+              <NumRow
+                label="Numero coppie in universo"
+                value={cfg.top10_universe_size}
+                onChange={(v) => update({ top10_universe_size: v })}
+                testID="input-top10-universe"
+              />
+              <NumRow
+                label="Rischio per operazione (%)"
+                value={cfg.top10_risk_pct}
+                onChange={(v) => update({ top10_risk_pct: v })}
+                step={0.05}
+                testID="input-top10-risk"
+              />
+              <NumRow
+                label="Punteggio minimo (0-100)"
+                value={cfg.top10_min_setup_score}
+                onChange={(v) => update({ top10_min_setup_score: v })}
+                testID="input-top10-score"
+              />
+              <NumRow
+                label="R:R minimo"
+                value={cfg.top10_min_rr}
+                onChange={(v) => update({ top10_min_rr: v })}
+                step={0.1}
+                testID="input-top10-rr"
+              />
+              <NumRow
+                label="TP1 (%)"
+                value={cfg.top10_tp1_pct}
+                onChange={(v) => update({ top10_tp1_pct: v })}
+                step={0.1}
+                testID="input-top10-tp1"
+              />
+              <NumRow
+                label="Quota chiusa a TP1 (%)"
+                value={cfg.top10_tp1_close_pct}
+                onChange={(v) => update({ top10_tp1_close_pct: v })}
+                testID="input-top10-tp1-close"
+              />
+              <NumRow
+                label="TP2 (%)"
+                value={cfg.top10_tp2_pct}
+                onChange={(v) => update({ top10_tp2_pct: v })}
+                step={0.1}
+                testID="input-top10-tp2"
+              />
+              <NumRow
+                label="Quota chiusa a TP2 (%)"
+                value={cfg.top10_tp2_close_pct}
+                onChange={(v) => update({ top10_tp2_close_pct: v })}
+                testID="input-top10-tp2-close"
+              />
+              <NumRow
+                label="Trailing residuo post-TP2 (×ATR)"
+                value={cfg.top10_runner_trailing_atr_mult}
+                onChange={(v) => update({ top10_runner_trailing_atr_mult: v })}
+                step={0.1}
+                testID="input-top10-runner-trail"
+              />
+              <NumRow
+                label="Stop dopo perdite consecutive"
+                value={cfg.top10_max_daily_losses}
+                onChange={(v) => update({ top10_max_daily_losses: v })}
+                testID="input-top10-max-losses"
+              />
+              <NumRow
+                label="Stop dopo perdita giornaliera (%)"
+                value={cfg.top10_max_daily_loss_pct}
+                onChange={(v) => update({ top10_max_daily_loss_pct: v })}
+                step={0.1}
+                testID="input-top10-max-daily-loss"
+              />
+              <NumRow
+                label="Rischio totale simultaneo massimo (%)"
+                value={cfg.top10_max_total_risk_pct}
+                onChange={(v) => update({ top10_max_total_risk_pct: v })}
+                step={0.1}
+                testID="input-top10-max-total-risk"
+              />
+              <Text style={styles.scoreHintText}>
+                Long-only, su spot. Ad ogni scansione: controlla il regime di
+                mercato guardando BTC, poi cerca — in ordine — Pullback,
+                Breakout+Retest, Momentum o Mean Reversion sulle{" "}
+                {cfg.top10_universe_size} coppie con più volume (proxy della
+                capitalizzazione). Apre solo il miglior segnale trovato, se il
+                punteggio composito supera la soglia. Dopo TP1 chiude una
+                quota e sposta lo stop a pareggio; dopo TP2 ne chiude
+                un&apos;altra e lascia correre il resto con un trailing
+                largo (approssima il TP3 &quot;prossima resistenza&quot;).
+                Dopo {cfg.top10_max_daily_losses} perdite consecutive, o una
+                perdita giornaliera oltre il {cfg.top10_max_daily_loss_pct}%,
+                si ferma fino al giorno seguente.
               </Text>
             </Section>
           )}
