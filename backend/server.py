@@ -3518,8 +3518,8 @@ async def run_scalping_scan() -> dict[str, Any]:
             continue
         if quotes and s.get("quoteCurrency") not in quotes:
             continue
-        if s.get("baseCurrency") in SCALPING_EXCLUDED_STABLE_BASES:
-            continue  # stablecoin-vs-stablecoin: too little real movement for commissions to ever be worth it
+        if any((sym or "").upper().startswith(base) for base in SCALPING_EXCLUDED_STABLE_BASES):
+            continue  # stablecoin-vs-stablecoin: too little real movement for commissions to ever be worth it — checked on the symbol string itself, not the exchange's baseCurrency field, which isn't reliably populated for every fiat-adjacent pair
         if cfg.excluded_pairs and sym in cfg.excluded_pairs:
             continue
         if cfg.enabled_pairs and sym not in cfg.enabled_pairs:
@@ -4815,7 +4815,7 @@ async def get_top10_universe(cfg: Config) -> list[str]:
             continue
         if quotes and s.get("quoteCurrency") not in quotes:
             continue
-        if base in SCALPING_EXCLUDED_STABLE_BASES:
+        if base in SCALPING_EXCLUDED_STABLE_BASES or sym.upper().startswith(tuple(SCALPING_EXCLUDED_STABLE_BASES)):
             continue
         vol = vol_map.get(sym, 0)
         if vol < cfg.min_24h_volume_usdt:
