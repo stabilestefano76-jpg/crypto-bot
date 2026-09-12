@@ -1575,20 +1575,25 @@ def detect_market_structure(candles: list[list[float]], window: int, strict: boo
     return "range"
 
 
-def detect_all_fvgs(highs: list[float], lows: list[float], lookback: int) -> list[dict[str, Any]]:
-    """All still-open FVGs within lookback, each with kind/top/bottom/index/gap."""
+def detect_all_fvgs(highs: list[float], lows: list[float], closes: list[float], lookback: int) -> list[dict[str, Any]]:
+    """All still-open FVGs within lookback, each with kind/top/bottom/index/gap.
+    "Filled" is judged by CLOSE, not by wick — a candle that wicks into the
+    gap and rejects (closing back outside it) is exactly the reversal entry
+    this is meant to catch, so a mere wick touch must not disqualify the
+    zone; only a candle that actually CLOSES through it counts as truly
+    mitigated."""
     n = len(highs)
     start = max(2, n - lookback)
     out: list[dict[str, Any]] = []
     for i in range(start, n):
         if highs[i - 2] < lows[i]:  # bullish gap
             top, bottom = lows[i], highs[i - 2]
-            if not any(lows[j] <= bottom for j in range(i + 1, n)):
+            if not any(closes[j] <= bottom for j in range(i + 1, n)):
                 out.append({"kind": "bullish", "top": top, "bottom": bottom,
                             "index": i, "gap": top - bottom})
         if lows[i - 2] > highs[i]:  # bearish gap
             top, bottom = lows[i - 2], highs[i]
-            if not any(highs[j] >= top for j in range(i + 1, n)):
+            if not any(closes[j] >= top for j in range(i + 1, n)):
                 out.append({"kind": "bearish", "top": top, "bottom": bottom,
                             "index": i, "gap": top - bottom})
     return out
@@ -1788,7 +1793,7 @@ async def analyze_pair_counter(symbol: str, tf: str, cfg: Config) -> Optional[Si
     #   long  -> a BEARISH FVG above  (impulse was down; price fills upward)
     #   short -> a BULLISH FVG below  (impulse was up; price fills downward)
     entry = closes[-1]
-    fvgs = detect_all_fvgs(highs, lows, cfg.fvg_lookback)
+    fvgs = detect_all_fvgs(highs, lows, closes, cfg.fvg_lookback)
     if side == "long":
         targets = [f for f in fvgs if f["kind"] == "bearish" and f["top"] > entry]
         targets.sort(key=lambda f: f["top"])  # nearest far-edge first
@@ -1972,7 +1977,7 @@ async def analyze_pair_fvg_reversal(symbol: str, tf: str, cfg: Config) -> Option
         return None
 
     # Impulse FVG in the TREND direction (most significant = largest gap).
-    fvgs = detect_all_fvgs(highs, lows, cfg.fvg_lookback)
+    fvgs = detect_all_fvgs(highs, lows, closes, cfg.fvg_lookback)
     trend_kind = "bullish" if trend == "up" else "bearish"
     impulse_fvgs = [f for f in fvgs if f["kind"] == trend_kind]
     if not impulse_fvgs:
@@ -4154,7 +4159,7 @@ async def build_grid_plan(symbol: str, cfg: Config) -> Optional[dict[str, Any]]:
     if not atr or atr <= 0:
         return None
 
-    fvgs = detect_all_fvgs(highs, lows, cfg.fvg_lookback)
+    fvgs = detect_all_fvgs(highs, lows, closes, cfg.fvg_lookback)
     bullish_fvgs = [f for f in fvgs if f["kind"] == "bullish"]
     if not bullish_fvgs:
         return None
