@@ -187,6 +187,20 @@ class Config(BaseModel):
     top10_ema_slow: int = 200
     top10_rsi_period: int = 14
     top10_atr_period: int = 14
+    # --- RSI Rebound: RSI dips below a deep-oversold threshold, then closes
+    # back above it — long entry, stop below the recent structural low,
+    # trailing stop/target once in profit (same mechanic as Scalping/Grid). ---
+    rsi_rebound_enabled: bool = True
+    rsi_rebound_timeframe: str = "1h"
+    rsi_rebound_period: int = 14
+    rsi_rebound_oversold: float = 20.0
+    rsi_rebound_lookback: int = 10  # how many recent candles to check for the oversold dip
+    rsi_rebound_stop_lookback: int = 5  # candles used to find the recent structural low for the stop
+    rsi_rebound_risk_pct: float = 5.0  # % of wallet cash used as position notional per trade
+    rsi_rebound_tp_atr_mult: float = 2.0  # initial target — also the point where trailing activates
+    rsi_rebound_trailing_atr_mult: float = 1.2
+    rsi_rebound_max_open_positions: int = 5
+
 
 
 class Signal(BaseModel):
@@ -2367,6 +2381,7 @@ async def scheduler_loop() -> None:
             await run_scalping_scan()
             await run_grid_scan()
             await run_top10_scan()
+            await run_rsi_rebound_scan()
         except Exception as e:  # noqa: BLE001
             logger.exception("Scan loop error: %s", e)
         await asyncio.sleep(max(60, cfg.scan_interval_minutes * 60))
@@ -2530,6 +2545,7 @@ async def lifespan(_app: FastAPI):
     scalping_monitor_task = asyncio.create_task(scalping_monitor_loop())
     grid_monitor_task = asyncio.create_task(grid_monitor_loop())
     top10_monitor_task = asyncio.create_task(top10_monitor_loop())
+    rsi_rebound_monitor_task = asyncio.create_task(rsi_rebound_monitor_loop())
     ws_task = asyncio.create_task(price_feed.run())
     premature_task = asyncio.create_task(premature_stop_loop())
     entry_timing_task = asyncio.create_task(entry_timing_loop())
@@ -4744,6 +4760,18 @@ async def top10_monitor_loop() -> None:
         await asyncio.sleep(3)
 
 
+async def rsi_rebound_monitor_loop() -> None:
+    """Check RSI Rebound stop/trailing every 3s using the real-time WS
+    price cache — same reasoning as the other monitors."""
+    await asyncio.sleep(8)
+    while True:
+        try:
+            await monitor_rsi_rebound_positions()
+        except Exception as e:  # noqa: BLE001
+            logger.exception("RSI Rebound monitor error: %s", e)
+        await asyncio.sleep(3)
+
+
 class GridTransferRequest(BaseModel):
     amount: float
 
@@ -5376,6 +5404,307 @@ async def top10_reset() -> dict[str, Any]:
     await db.top10_positions.delete_many({})
     await db.top10_wallet.update_one(
         {"_id": TOP10_WALLET_ID},
+        {"$set": {"cash": 0.0, "total_transferred_in": 0.0}, "$inc": {"reset_seq": 1}},
+        upsert=True,
+    )
+    return {"ok": True}
+
+
+
+# ============================================================================
+# RSI REBOUND — RSI dips below a deep-oversold threshold, then closes back
+# above it: long entry. Stop below the recent structural low, ATR-based
+# trailing target once in profit (same mechanic as Scalping). Own isolated
+# wallet, own position lifecycle.
+# ============================================================================
+
+RSI_REBOUND_WALLET_ID = "rsi_rebound_wallet_singleton"
+RSI_REBOUND_FEE_PCT = 0.001
+
+
+async def get_rsi_rebound_wallet() -> dict[str, Any]:
+    doc = await db.rsi_rebound_wallet.find_one({"_id": RSI_REBOUND_WALLET_ID}, {"_id": 0})
+    if not doc:
+        doc = {"cash": 0.0, "total_transferred_in": 0.0, "reset_seq": 0}
+        await db.rsi_rebound_wallet.update_one(
+            {"_id": RSI_REBOUND_WALLET_ID}, {"$set": doc}, upsert=True
+        )
+    doc.setdefault("reset_seq", 0)
+    return doc
+
+
+def detect_rsi_rebound_signal(candles: list[list[float]], cfg: Config) -> Optional[dict[str, Any]]:
+    """RSI dipped below `rsi_rebound_oversold` at some point in the last
+    `rsi_rebound_lookback` candles, and the latest CLOSED candle has RSI
+    back above that threshold with a bullish (green) close — the recovery
+    confirmation candle."""
+    closes = [c[2] for c in candles]
+    opens = [c[1] for c in candles]
+    lows = [c[4] for c in candles]
+    if len(closes) < cfg.rsi_rebound_period + cfg.rsi_rebound_lookback + 2:
+        return None
+    rsis = rsi_wilder(closes, cfg.rsi_rebound_period)
+    if rsis[-1] is None:
+        return None
+    if rsis[-1] < cfg.rsi_rebound_oversold:
+        return None  # not back above yet
+    lookback_window = rsis[-(cfg.rsi_rebound_lookback + 1):-1]
+    was_oversold = any(r is not None and r < cfg.rsi_rebound_oversold for r in lookback_window)
+    if not was_oversold:
+        return None
+    if closes[-1] <= opens[-1]:
+        return None  # confirmation candle must be bullish
+    stop = min(lows[-cfg.rsi_rebound_stop_lookback:]) * 0.998
+    entry = closes[-1]
+    if entry <= stop:
+        return None
+    return {"entry": entry, "stop": stop, "rsi": rsis[-1]}
+
+
+async def run_rsi_rebound_scan() -> None:
+    cfg = await get_config()
+    if not cfg.rsi_rebound_enabled:
+        return
+
+    open_count = await db.rsi_rebound_positions.count_documents({"status": "open"})
+    if open_count >= cfg.rsi_rebound_max_open_positions:
+        return
+
+    wallet = await get_rsi_rebound_wallet()
+    cash = wallet.get("cash", 0.0)
+    if cash <= 1.0:
+        return
+
+    tickers = await exchange.get_tickers()
+    vol_map: dict[str, float] = {}
+    for t in tickers:
+        try:
+            vol_map[t["symbol"]] = float(t.get("volValue") or 0)
+        except (TypeError, ValueError):
+            continue
+    symbols = await exchange.get_symbols()
+    quotes = {q.strip() for q in (cfg.quote_filter or "").split(",") if q.strip()}
+    candidates: list[str] = []
+    for s in symbols:
+        if not s.get("enableTrading"):
+            continue
+        sym = s.get("symbol")
+        if not sym:
+            continue
+        if quotes and s.get("quoteCurrency") not in quotes:
+            continue
+        if any(sym.upper().startswith(base) for base in SCALPING_EXCLUDED_STABLE_BASES):
+            continue
+        if cfg.excluded_pairs and sym in cfg.excluded_pairs:
+            continue
+        if cfg.enabled_pairs and sym not in cfg.enabled_pairs:
+            continue
+        if vol_map.get(sym, 0) < cfg.min_24h_volume_usdt:
+            continue
+        if not await is_volume_stable(sym, cfg):
+            continue
+        candidates.append(sym)
+    candidates.sort(key=lambda s: vol_map.get(s, 0), reverse=True)
+    candidates = candidates[:30]
+
+    for symbol in candidates:
+        if open_count >= cfg.rsi_rebound_max_open_positions:
+            break
+        if await db.rsi_rebound_positions.find_one({"symbol": symbol, "status": "open"}):
+            continue
+        candles = await exchange.get_klines(symbol, cfg.rsi_rebound_timeframe)
+        if len(candles) < cfg.rsi_rebound_period + cfg.rsi_rebound_lookback + 2:
+            await log_reject(symbol, cfg.rsi_rebound_timeframe, "rsi_rebound", "dati insufficienti")
+            continue
+        signal = detect_rsi_rebound_signal(candles, cfg)
+        if not signal:
+            await log_reject(symbol, cfg.rsi_rebound_timeframe, "rsi_rebound", "nessun rimbalzo RSI confermato")
+            continue
+        await open_rsi_rebound_position(symbol, signal, cfg)
+        open_count += 1
+
+
+async def open_rsi_rebound_position(symbol: str, signal: dict[str, Any], cfg: Config) -> None:
+    wallet = await get_rsi_rebound_wallet()
+    cash = wallet.get("cash", 0.0)
+    if cash <= 1.0:
+        return
+    entry = signal["entry"]
+    notional = min(cash * cfg.rsi_rebound_risk_pct / 100, cash)
+    if notional < 1.0:
+        return
+    quantity = notional / entry
+
+    candles = await exchange.get_klines(symbol, cfg.rsi_rebound_timeframe)
+    highs = [c[3] for c in candles]
+    lows = [c[4] for c in candles]
+    closes = [c[2] for c in candles]
+    atr = atr_wilder(highs, lows, closes, cfg.rsi_rebound_period) or 0.0
+
+    doc = {
+        "id": str(uuid.uuid4()),
+        "symbol": symbol,
+        "side": "long",
+        "entry": entry,
+        "fill_price": entry,
+        "stop_loss": signal["stop"],
+        "take_profit": entry + cfg.rsi_rebound_tp_atr_mult * atr,
+        "quantity": quantity,
+        "notional": notional,
+        "atr": atr,
+        "rsi_at_entry": signal.get("rsi"),
+        "trailing_active": False,
+        "peak_price": None,
+        "status": "open",
+        "opened_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.rsi_rebound_positions.insert_one(dict(doc))
+    await db.rsi_rebound_wallet.update_one(
+        {"_id": RSI_REBOUND_WALLET_ID}, {"$inc": {"cash": -notional}}, upsert=True
+    )
+
+
+async def monitor_rsi_rebound_positions() -> None:
+    cfg = await get_config()
+    open_positions = await db.rsi_rebound_positions.find({"status": "open"}, {"_id": 0}).to_list(200)
+    for p in open_positions:
+        cur = price_feed.get(p["symbol"])
+        if not cur:
+            cur = await price_feed.price_or_rest(p["symbol"])
+        if not cur or cur <= 0:
+            continue
+
+        if p.get("trailing_active"):
+            atr = p.get("atr") or 0.0
+            peak = p.get("peak_price") or cur
+            new_peak = max(peak, cur)
+            trail_level = new_peak - cfg.rsi_rebound_trailing_atr_mult * atr
+            if new_peak != peak:
+                await db.rsi_rebound_positions.update_one(
+                    {"id": p["id"]}, {"$set": {"peak_price": new_peak}}
+                )
+            if cur > trail_level:
+                continue
+            hit = "trailing_stop"
+        else:
+            hit = None
+            if cur <= p["stop_loss"]:
+                hit = "stop_loss"
+            elif cur >= p["take_profit"]:
+                if (p.get("atr") or 0) > 0:
+                    await db.rsi_rebound_positions.update_one(
+                        {"id": p["id"]},
+                        {"$set": {"trailing_active": True, "peak_price": cur}},
+                    )
+                    continue
+                hit = "take_profit"
+            if not hit:
+                continue
+
+        gross_pnl = (cur - p["entry"]) * p["quantity"]
+        exit_notional = cur * p["quantity"]
+        fees = (p["notional"] + exit_notional) * RSI_REBOUND_FEE_PCT
+        pnl = gross_pnl - fees
+        await db.rsi_rebound_wallet.update_one(
+            {"_id": RSI_REBOUND_WALLET_ID},
+            {"$inc": {"cash": p["notional"] + pnl}},
+            upsert=True,
+        )
+        await db.rsi_rebound_positions.update_one(
+            {"id": p["id"]},
+            {"$set": {
+                "status": "closed", "close_price": cur, "close_reason": hit,
+                "pnl_usdt": round(pnl, 4),
+                "closed_at": datetime.now(timezone.utc).isoformat(),
+            }},
+        )
+
+
+class RsiReboundTransferRequest(BaseModel):
+    amount: float
+
+
+@api.post("/rsi-rebound/deposit")
+async def rsi_rebound_deposit(req: RsiReboundTransferRequest) -> dict[str, Any]:
+    amount = req.amount
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="L'importo deve essere positivo")
+    main_cash = await get_paper_cash()
+    if amount > main_cash:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Fondi insufficienti nel portafoglio principale (disponibili: {round(main_cash, 2)})",
+        )
+    await set_paper_cash(main_cash - amount)
+    updated = await db.rsi_rebound_wallet.find_one_and_update(
+        {"_id": RSI_REBOUND_WALLET_ID},
+        {"$inc": {"cash": amount, "total_transferred_in": amount}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return {"ok": True, "rsi_rebound_cash": updated.get("cash", amount), "main_cash": main_cash - amount}
+
+
+@api.post("/rsi-rebound/withdraw")
+async def rsi_rebound_withdraw(req: RsiReboundTransferRequest) -> dict[str, Any]:
+    amount = req.amount
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="L'importo deve essere positivo")
+    w = await get_rsi_rebound_wallet()
+    available = w.get("cash", 0.0)
+    if amount > available and (amount - available) <= 0.01:
+        amount = available
+    updated = await db.rsi_rebound_wallet.find_one_and_update(
+        {"_id": RSI_REBOUND_WALLET_ID, "cash": {"$gte": amount}},
+        {"$inc": {"cash": -amount}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not updated:
+        raise HTTPException(status_code=400, detail="Fondi insufficienti nel portafoglio RSI Rebound")
+    main_cash = await get_paper_cash()
+    await set_paper_cash(main_cash + amount)
+    return {"ok": True, "rsi_rebound_cash": updated.get("cash", 0.0), "main_cash": main_cash + amount}
+
+
+@api.get("/rsi-rebound/portfolio")
+async def rsi_rebound_portfolio() -> dict[str, Any]:
+    wallet = await get_rsi_rebound_wallet()
+    open_docs = await db.rsi_rebound_positions.find({"status": "open"}, {"_id": 0}).to_list(200)
+    closed_docs = await db.rsi_rebound_positions.find({"status": "closed"}, {"_id": 0}).sort("closed_at", -1).to_list(500)
+
+    unrealized = 0.0
+    open_out = []
+    open_value = 0.0
+    for p in open_docs:
+        cur = price_feed.get(p["symbol"]) or p["entry"]
+        upnl = (cur - p["entry"]) * p["quantity"]
+        unrealized += upnl
+        open_value += cur * p["quantity"]
+        open_out.append({**p, "current_price": cur, "unrealized_pnl": round(upnl, 4)})
+
+    realized = sum(c.get("pnl_usdt", 0.0) for c in closed_docs)
+    equity = wallet.get("cash", 0.0) + open_value
+    wins = sum(1 for c in closed_docs if c.get("pnl_usdt", 0.0) > 0)
+    losses = sum(1 for c in closed_docs if c.get("pnl_usdt", 0.0) <= 0)
+    return {
+        "cash": round(wallet.get("cash", 0.0), 4),
+        "equity": round(equity, 4),
+        "total_transferred_in": wallet.get("total_transferred_in", 0.0),
+        "unrealized_pnl": round(unrealized, 4),
+        "realized_pnl": round(realized, 4),
+        "open_positions": open_out,
+        "closed_positions": closed_docs[:100],
+        "open_count": len(open_docs),
+        "closed_count": len(closed_docs),
+        "win_rate": round(wins / (wins + losses) * 100, 1) if (wins + losses) else 0.0,
+    }
+
+
+@api.post("/rsi-rebound/reset")
+async def rsi_rebound_reset() -> dict[str, Any]:
+    await db.rsi_rebound_positions.delete_many({})
+    await db.rsi_rebound_wallet.update_one(
+        {"_id": RSI_REBOUND_WALLET_ID},
         {"$set": {"cash": 0.0, "total_transferred_in": 0.0}, "$inc": {"reset_seq": 1}},
         upsert=True,
     )

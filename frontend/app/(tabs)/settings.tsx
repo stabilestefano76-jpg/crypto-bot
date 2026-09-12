@@ -127,6 +127,7 @@ export default function SettingsScreen() {
                 if (val === "scalping") return cfg.scalping_enabled;
                 if (val === "grid") return cfg.grid_enabled;
                 if (val === "top10") return cfg.top10_enabled;
+                if (val === "rsi_rebound") return cfg.rsi_rebound_enabled;
                 return stratOn(val);
               };
               const toggle = (val: string) => {
@@ -140,6 +141,10 @@ export default function SettingsScreen() {
                 }
                 if (val === "top10") {
                   update({ top10_enabled: !cfg.top10_enabled });
+                  return;
+                }
+                if (val === "rsi_rebound") {
+                  update({ rsi_rebound_enabled: !cfg.rsi_rebound_enabled });
                   return;
                 }
                 const set = new Set(enabledStrategies);
@@ -156,6 +161,7 @@ export default function SettingsScreen() {
                     ["scalping", "Scalping"],
                     ["grid", "Grid Bot"],
                     ["top10", "Top 10 Long"],
+                    ["rsi_rebound", "RSI Rebound"],
                   ] as const).map(([val, label]) => {
                     const active = isActive(val);
                     return (
@@ -541,6 +547,67 @@ export default function SettingsScreen() {
                 Dopo {cfg.top10_max_daily_losses} perdite consecutive, o una
                 perdita giornaliera oltre il {cfg.top10_max_daily_loss_pct}%,
                 si ferma fino al giorno seguente.
+              </Text>
+            </Section>
+          )}
+
+          {cfg.rsi_rebound_enabled && (
+            <Section title="RSI Rebound">
+              <NumRow
+                label="Soglia ipervenduto RSI"
+                value={cfg.rsi_rebound_oversold}
+                onChange={(v) => update({ rsi_rebound_oversold: v })}
+                testID="input-rsi-rebound-oversold"
+              />
+              <NumRow
+                label="Finestra ricerca ipervenduto (candele)"
+                value={cfg.rsi_rebound_lookback}
+                onChange={(v) => update({ rsi_rebound_lookback: v })}
+                testID="input-rsi-rebound-lookback"
+              />
+              <NumRow
+                label="Candele per il minimo strutturale (stop)"
+                value={cfg.rsi_rebound_stop_lookback}
+                onChange={(v) => update({ rsi_rebound_stop_lookback: v })}
+                testID="input-rsi-rebound-stop-lookback"
+              />
+              <NumRow
+                label="Rischio per operazione (% portafoglio)"
+                value={cfg.rsi_rebound_risk_pct}
+                onChange={(v) => update({ rsi_rebound_risk_pct: v })}
+                step={0.5}
+                testID="input-rsi-rebound-risk"
+              />
+              <NumRow
+                label="Target iniziale (×ATR)"
+                value={cfg.rsi_rebound_tp_atr_mult}
+                onChange={(v) => update({ rsi_rebound_tp_atr_mult: v })}
+                step={0.1}
+                testID="input-rsi-rebound-tp"
+              />
+              <NumRow
+                label="Trailing dopo il target (×ATR)"
+                value={cfg.rsi_rebound_trailing_atr_mult}
+                onChange={(v) => update({ rsi_rebound_trailing_atr_mult: v })}
+                step={0.1}
+                testID="input-rsi-rebound-trailing"
+              />
+              <NumRow
+                label="Massimo posizioni aperte"
+                value={cfg.rsi_rebound_max_open_positions}
+                onChange={(v) => update({ rsi_rebound_max_open_positions: v })}
+                testID="input-rsi-rebound-max-positions"
+              />
+              <Text style={styles.scoreHintText}>
+                Su timeframe {cfg.rsi_rebound_timeframe}: cerca un RSI che è
+                sceso sotto {cfg.rsi_rebound_oversold} in una delle ultime{" "}
+                {cfg.rsi_rebound_lookback} candele e che ora, sulla candela
+                appena chiusa, è tornato sopra quella soglia con una chiusura
+                rialzista — quella è la candela di conferma per l&apos;ingresso
+                long. Stop sotto il minimo delle ultime{" "}
+                {cfg.rsi_rebound_stop_lookback} candele; target iniziale a{" "}
+                {cfg.rsi_rebound_tp_atr_mult}×ATR, poi trailing una volta
+                raggiunto.
               </Text>
             </Section>
           )}

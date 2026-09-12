@@ -97,6 +97,7 @@ export type Config = {
   grid_enabled: boolean;
   grid_num_levels: number;
   grid_atr_spacing_mult: number;
+  grid_extension_spacing_mult: number;
   top10_enabled: boolean;
   top10_universe_size: number;
   top10_risk_pct: number;
@@ -115,6 +116,16 @@ export type Config = {
   top10_ema_slow: number;
   top10_rsi_period: number;
   top10_atr_period: number;
+  rsi_rebound_enabled: boolean;
+  rsi_rebound_timeframe: string;
+  rsi_rebound_period: number;
+  rsi_rebound_oversold: number;
+  rsi_rebound_lookback: number;
+  rsi_rebound_stop_lookback: number;
+  rsi_rebound_risk_pct: number;
+  rsi_rebound_tp_atr_mult: number;
+  rsi_rebound_trailing_atr_mult: number;
+  rsi_rebound_max_open_positions: number;
 };
 
 export type ScanState = {
@@ -610,4 +621,56 @@ export const top10Api = {
       { method: "POST", body: JSON.stringify({ amount }) }
     ),
   reset: () => req<{ ok: boolean }>("/top10/reset", { method: "POST" }),
+};
+
+// ---------------------------------------------------------------------------
+// RSI Rebound (RSI dips below deep-oversold, then closes back above it)
+// ---------------------------------------------------------------------------
+export type RsiReboundPosition = {
+  id: string;
+  symbol: string;
+  side: "long";
+  entry: number;
+  stop_loss: number;
+  take_profit: number;
+  quantity: number;
+  notional: number;
+  rsi_at_entry?: number;
+  trailing_active: boolean;
+  status: string;
+  opened_at: string;
+  current_price?: number;
+  unrealized_pnl?: number;
+  close_price?: number;
+  close_reason?: string;
+  pnl_usdt?: number;
+  closed_at?: string;
+};
+
+export type RsiReboundPortfolio = {
+  cash: number;
+  equity: number;
+  total_transferred_in: number;
+  unrealized_pnl: number;
+  realized_pnl: number;
+  open_positions: RsiReboundPosition[];
+  closed_positions: RsiReboundPosition[];
+  open_count: number;
+  closed_count: number;
+  win_rate: number;
+};
+
+export const rsiReboundApi = {
+  portfolio: () => req<RsiReboundPortfolio>("/rsi-rebound/portfolio"),
+  deposit: (amount: number) =>
+    req<{ ok: boolean; rsi_rebound_cash: number; main_cash: number }>(
+      "/rsi-rebound/deposit",
+      { method: "POST", body: JSON.stringify({ amount }) }
+    ),
+  withdraw: (amount: number) =>
+    req<{ ok: boolean; rsi_rebound_cash: number; main_cash: number }>(
+      "/rsi-rebound/withdraw",
+      { method: "POST", body: JSON.stringify({ amount }) }
+    ),
+  reset: () => req<{ ok: boolean }>("/rsi-rebound/reset", { method: "POST" }),
 };
