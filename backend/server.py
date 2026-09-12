@@ -2235,6 +2235,8 @@ async def run_scan() -> dict[str, Any]:
                 continue
             if vol_map.get(sym, 0) < cfg.min_24h_volume_usdt:
                 continue
+            if not await is_volume_stable(sym, cfg):
+                continue
             pairs.append(sym)
 
         # Sort by volume descending and cap
@@ -3531,6 +3533,8 @@ async def run_scalping_scan() -> dict[str, Any]:
             continue
         if vol_map.get(sym, 0) < cfg.min_24h_volume_usdt:
             continue
+        if not await is_volume_stable(sym, cfg):
+            continue
         pairs.append(sym)
     pairs.sort(key=lambda s: vol_map.get(s, 0), reverse=True)
     pairs = pairs[:20]
@@ -3782,6 +3786,21 @@ SCALPING_TP_PCT = 0.014   # fallback only, used when ATR is unavailable (0 or mi
 SCALPING_WALLET_RISK_PCT = 0.05  # % of scalping cash used per trade (was 0.20 — brought in line with the 1-2% industry norm, adapted for an already-isolated scalping sub-wallet)
 SCALPING_EXCLUDED_STABLE_BASES = {"USDC", "USDT", "EURC", "DAI", "BUSD", "TUSD", "FDUSD"}  # stablecoin-vs-stablecoin pairs move too little for fees to ever be worth it on a fast scalp
 SCALPING_FEE_PCT = 0.001  # 0.10% Bybit spot fee per side (open + close = 0.20% round trip)
+
+
+async def is_volume_stable(symbol: str, cfg: Config) -> bool:
+    """True if 24h volume has stayed above the configured minimum for each
+    of the last 10 days — guards against picking a coin whose current
+    volume is just a short-lived spike about to collapse, rather than
+    genuine sustained liquidity."""
+    try:
+        daily = await exchange.get_klines(symbol, "1d")
+    except Exception:  # noqa: BLE001
+        return True  # fail open on a transient API hiccup — don't block all trading over it
+    if len(daily) < 10:
+        return False  # too new to have proven itself yet
+    recent = daily[-10:]
+    return all((c[5] * c[2]) >= cfg.min_24h_volume_usdt for c in recent)
 
 
 async def check_scalping_invalidation(pos: dict[str, Any], cfg: Config) -> bool:
@@ -4368,6 +4387,8 @@ async def run_grid_scan() -> dict[str, Any]:
             continue
         if vol_map.get(sym, 0) < cfg.min_24h_volume_usdt:
             continue
+        if not await is_volume_stable(sym, cfg):
+            continue
         candidates.append(sym)
     candidates.sort(key=lambda s: vol_map.get(s, 0), reverse=True)
     candidates = candidates[:30]  # cap scan for performance
@@ -4833,6 +4854,8 @@ async def get_top10_universe(cfg: Config) -> list[str]:
             continue
         vol = vol_map.get(sym, 0)
         if vol < cfg.min_24h_volume_usdt:
+            continue
+        if not await is_volume_stable(sym, cfg):
             continue
         if base not in best_per_base or vol > best_per_base[base][1]:
             best_per_base[base] = (sym, vol)
