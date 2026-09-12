@@ -421,6 +421,13 @@ export default function SettingsScreen() {
                 step={0.1}
                 testID="input-grid-atr-spacing"
               />
+              <NumRow
+                label="Spaziatura livelli estesi (×normale)"
+                value={cfg.grid_extension_spacing_mult}
+                onChange={(v) => update({ grid_extension_spacing_mult: v })}
+                step={0.1}
+                testID="input-grid-extension-spacing"
+              />
               <Text style={styles.scoreHintText}>
                 Quante celle di acquisto crea ogni griglia, distribuite dal
                 fondo al bordo della propria zona FVG — più livelli
@@ -429,7 +436,13 @@ export default function SettingsScreen() {
                 proprio target di vendita, calcolato automaticamente sopra il
                 proprio prezzo di entrata (distanza in ATR): compra a scaglioni
                 scendendo, vende a scaglioni salendo — non più un unico
-                target lontano condiviso da tutte le celle.
+                target lontano condiviso da tutte le celle. Se il prezzo scende
+                oltre l&apos;ultimo livello, la griglia ne aggiunge fino a 4 in
+                più (mai oltre): prova prima ad agganciarsi a una FVG rialzista
+                ancora aperta più in basso (una zona lasciata indietro durante
+                la salita, mai riusata due volte sulla stessa griglia); se non
+                ce n&apos;è una disponibile, usa come riserva una distanza fissa
+                pari a &quot;×normale&quot; volte la spaziatura originale.
               </Text>
             </Section>
           )}

@@ -167,6 +167,7 @@ class Config(BaseModel):
     grid_range_break_atr_mult: float = 3.0  # unused since spot removed the forced emergency stop — kept only so old grid documents that still reference it don't break
     grid_max_pairs: int = 4  # max symbols with an active grid at once
     grid_replace_improvement_pct: float = 20.0  # candidate must be this much MORE lateral (lower bb_width+ema_gap) than the worst idle active grid to replace it
+    grid_extension_spacing_mult: float = 2.0  # extra levels (beyond the original 4) space out this many times wider than the normal ladder spacing — spreads coverage across a larger continued decline instead of bunching up entries close together
     # --- Top 10 Long (multi-setup: pullback / breakout-retest / momentum / mean-reversion) ---
     top10_enabled: bool = True
     top10_universe_size: int = 10  # how many coins to consider each scan, ranked by 24h volume (proxy for market cap)
@@ -4281,6 +4282,7 @@ async def create_grid_instance_from_plan(plan: dict[str, Any], cfg: Config) -> d
         "swing_high": plan["swing_high"],
         "target": plan["target"],
         "extension_count": 0,  # how many extra buy levels added below the original zone (capped at 4)
+        "extension_fvg_tops": [],  # tops of bullish FVGs already used for an extension level, so the same zone isn't reused
     }
     await db.grid_instances.insert_one(doc)
     return doc
@@ -4458,6 +4460,32 @@ async def run_grid_scan() -> dict[str, Any]:
     }
 
 
+async def find_grid_extension_fvg_target(symbol: str, below_price: float, used_tops: list[float], cfg: Config) -> Optional[float]:
+    """Among still-open bullish FVGs on the grid's own timeframe, find the
+    one closest below `below_price` that hasn't already been used for a
+    previous extension level on this grid. These are zones the price left
+    behind on its way up — a real continued decline revisiting one of them
+    is a more meaningful place to add a level than an arbitrary fixed
+    distance."""
+    candles = await exchange.get_klines(symbol, cfg.grid_timeframe)
+    if len(candles) < 10:
+        return None
+    highs = [c[3] for c in candles]
+    lows = [c[4] for c in candles]
+    closes = [c[2] for c in candles]
+    fvgs = detect_all_fvgs(highs, lows, closes, lookback=len(candles))
+    candidates = [
+        f for f in fvgs
+        if f["kind"] == "bullish"
+        and f["top"] < below_price
+        and not any(abs(f["top"] - used) < 1e-9 for used in used_tops)
+    ]
+    if not candidates:
+        return None
+    best = max(candidates, key=lambda f: f["top"])  # closest below the current lowest level
+    return best["top"]
+
+
 async def monitor_grid_instances() -> None:
     """Check every active grid's cells against the current price: fill armed
     cells that got dipped into, close holding cells that reached their sell
@@ -4492,14 +4520,24 @@ async def monitor_grid_instances() -> None:
         lowest_buy = min(c["buy_price"] for c in cells)
 
         # Extend the ladder downward (up to 4 extra levels total) when price
-        # has fallen meaningfully below the lowest existing buy — using the
-        # SAME spacing as the rest of the ladder, so it's a natural
-        # continuation rather than an arbitrary new distance. Gives the grid
-        # more room to keep averaging down in a real crash before the harder
-        # emergency stop below ever needs to fire. One new level per tick at
-        # most — a single sharp wick shouldn't instantly max out all 4.
-        if grid.get("extension_count", 0) < 4 and cur < lowest_buy - grid["spacing"]:
-            new_buy = lowest_buy - grid["spacing"]
+        # has fallen meaningfully below the lowest existing buy. Extension
+        # levels use a WIDER spacing than the original ladder (configurable
+        # multiple) — during a real extended decline, tightly-packed levels
+        # all fill in quick succession and cover little price ground; wider
+        # spacing spreads the remaining capital across more of the move.
+        # One new level per tick at most — a single sharp wick shouldn't
+        # instantly max out all 4.
+        extension_spacing = grid["spacing"] * cfg.grid_extension_spacing_mult
+        if grid.get("extension_count", 0) < 4 and cur < lowest_buy - extension_spacing:
+            fvg_target = await find_grid_extension_fvg_target(
+                grid["symbol"], lowest_buy, grid.get("extension_fvg_tops", []), cfg
+            )
+            used_fvg_top: Optional[float] = None
+            if fvg_target is not None and fvg_target < lowest_buy:
+                new_buy = fvg_target
+                used_fvg_top = fvg_target
+            else:
+                new_buy = lowest_buy - extension_spacing
             new_cell = {
                 "index": len(cells) + 1,
                 "buy_price": round(new_buy, 8),
@@ -4511,10 +4549,13 @@ async def monitor_grid_instances() -> None:
                 "low_confirmed": False,
             }
             cells = cells + [new_cell]
-            await db.grid_instances.update_one(
-                {"id": grid["id"]},
-                {"$set": {"cells": cells}, "$inc": {"extension_count": 1}},
-            )
+            update_ops: dict[str, Any] = {
+                "$set": {"cells": cells},
+                "$inc": {"extension_count": 1},
+            }
+            if used_fvg_top is not None:
+                update_ops["$push"] = {"extension_fvg_tops": used_fvg_top}
+            await db.grid_instances.update_one({"id": grid["id"]}, update_ops)
             grid["cells"] = cells
             lowest_buy = new_buy
 
