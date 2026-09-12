@@ -4815,10 +4815,19 @@ async def get_top10_universe(cfg: Config) -> list[str]:
         if not s.get("enableTrading"):
             continue
         sym = s.get("symbol")
-        base = s.get("baseCurrency")
-        if not sym or not base:
+        quote = s.get("quoteCurrency")
+        if not sym or not quote:
             continue
-        if quotes and s.get("quoteCurrency") not in quotes:
+        if quotes and quote not in quotes:
+            continue
+        # Derive the base coin from the symbol string itself (strip the
+        # quote suffix) rather than trusting the exchange's baseCurrency
+        # field — that field isn't reliably populated for every pair (the
+        # same issue that broke the stablecoin exclusion in Scalping).
+        if not sym.upper().endswith(quote.upper()):
+            continue
+        base = sym.upper()[: -len(quote)]
+        if not base:
             continue
         if base in SCALPING_EXCLUDED_STABLE_BASES or sym.upper().startswith(tuple(SCALPING_EXCLUDED_STABLE_BASES)):
             continue
