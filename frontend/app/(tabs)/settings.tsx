@@ -128,6 +128,7 @@ export default function SettingsScreen() {
                 if (val === "grid") return cfg.grid_enabled;
                 if (val === "top10") return cfg.top10_enabled;
                 if (val === "rsi_rebound") return cfg.rsi_rebound_enabled;
+                if (val === "wyckoff") return cfg.wyckoff_enabled;
                 return stratOn(val);
               };
               const toggle = (val: string) => {
@@ -147,6 +148,10 @@ export default function SettingsScreen() {
                   update({ rsi_rebound_enabled: !cfg.rsi_rebound_enabled });
                   return;
                 }
+                if (val === "wyckoff") {
+                  update({ wyckoff_enabled: !cfg.wyckoff_enabled });
+                  return;
+                }
                 const set = new Set(enabledStrategies);
                 if (set.has(val)) set.delete(val);
                 else set.add(val);
@@ -162,6 +167,7 @@ export default function SettingsScreen() {
                     ["grid", "Grid Bot"],
                     ["top10", "Top 10 Long"],
                     ["rsi_rebound", "RSI Rebound"],
+                    ["wyckoff", "Wyckoff Spring"],
                   ] as const).map(([val, label]) => {
                     const active = isActive(val);
                     return (
@@ -607,6 +613,71 @@ export default function SettingsScreen() {
                 long. Stop sotto il minimo delle ultime{" "}
                 {cfg.rsi_rebound_stop_lookback} candele; target iniziale a{" "}
                 {cfg.rsi_rebound_tp_atr_mult}×ATR, poi trailing una volta
+                raggiunto.
+              </Text>
+            </Section>
+          )}
+
+          {cfg.wyckoff_enabled && (
+            <Section title="Wyckoff Spring">
+              <NumRow
+                label="Candele per il range (supporto/resistenza)"
+                value={cfg.wyckoff_range_window}
+                onChange={(v) => update({ wyckoff_range_window: v })}
+                testID="input-wyckoff-range-window"
+              />
+              <NumRow
+                label="Finestra per l'intera sequenza (candele)"
+                value={cfg.wyckoff_search_span}
+                onChange={(v) => update({ wyckoff_search_span: v })}
+                testID="input-wyckoff-search-span"
+              />
+              <NumRow
+                label="Finestra per il Test dopo lo Spring (candele)"
+                value={cfg.wyckoff_test_window}
+                onChange={(v) => update({ wyckoff_test_window: v })}
+                testID="input-wyckoff-test-window"
+              />
+              <NumRow
+                label="Ampiezza massima range (×ATR)"
+                value={cfg.wyckoff_max_range_atr_mult}
+                onChange={(v) => update({ wyckoff_max_range_atr_mult: v })}
+                step={0.1}
+                testID="input-wyckoff-max-range"
+              />
+              <NumRow
+                label="Rischio per operazione (% portafoglio)"
+                value={cfg.wyckoff_risk_pct}
+                onChange={(v) => update({ wyckoff_risk_pct: v })}
+                step={0.5}
+                testID="input-wyckoff-risk"
+              />
+              <NumRow
+                label="Trailing dopo il target (×ATR)"
+                value={cfg.wyckoff_trailing_atr_mult}
+                onChange={(v) => update({ wyckoff_trailing_atr_mult: v })}
+                step={0.1}
+                testID="input-wyckoff-trailing"
+              />
+              <NumRow
+                label="Massimo posizioni aperte"
+                value={cfg.wyckoff_max_open_positions}
+                onChange={(v) => update({ wyckoff_max_open_positions: v })}
+                testID="input-wyckoff-max-positions"
+              />
+              <Text style={styles.scoreHintText}>
+                Segue lo schema classico di accumulazione Wyckoff per intero,
+                su timeframe {cfg.wyckoff_timeframe}: prima identifica un
+                range (supporto/resistenza sulle ultime{" "}
+                {cfg.wyckoff_range_window} candele), poi cerca in ordine —
+                Spring (rottura falsa sotto supporto con volume sotto la
+                media), Test (ritorno sul minimo con volume ancora più
+                basso), Sign of Strength (rottura sopra resistenza con
+                volume in aumento) — e infine entra sul Last Point of
+                Support: il ritorno che tiene sopra la resistenza appena
+                rotta, con volume più leggero del breakout. Stop sotto il
+                minimo tra Spring e LPS; target iniziale pari all&apos;altezza
+                del range proiettata dal breakout, poi trailing una volta
                 raggiunto.
               </Text>
             </Section>

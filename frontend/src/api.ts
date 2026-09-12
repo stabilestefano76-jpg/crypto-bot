@@ -126,6 +126,15 @@ export type Config = {
   rsi_rebound_tp_atr_mult: number;
   rsi_rebound_trailing_atr_mult: number;
   rsi_rebound_max_open_positions: number;
+  wyckoff_enabled: boolean;
+  wyckoff_timeframe: string;
+  wyckoff_range_window: number;
+  wyckoff_search_span: number;
+  wyckoff_test_window: number;
+  wyckoff_max_range_atr_mult: number;
+  wyckoff_risk_pct: number;
+  wyckoff_trailing_atr_mult: number;
+  wyckoff_max_open_positions: number;
 };
 
 export type ScanState = {
@@ -673,4 +682,56 @@ export const rsiReboundApi = {
       { method: "POST", body: JSON.stringify({ amount }) }
     ),
   reset: () => req<{ ok: boolean }>("/rsi-rebound/reset", { method: "POST" }),
+};
+
+// ---------------------------------------------------------------------------
+// Wyckoff Spring (Range -> Spring -> Test -> Sign of Strength -> Last Point
+// of Support — entry at the LPS)
+// ---------------------------------------------------------------------------
+export type WyckoffPosition = {
+  id: string;
+  symbol: string;
+  side: "long";
+  entry: number;
+  stop_loss: number;
+  take_profit: number;
+  quantity: number;
+  notional: number;
+  trailing_active: boolean;
+  status: string;
+  opened_at: string;
+  current_price?: number;
+  unrealized_pnl?: number;
+  close_price?: number;
+  close_reason?: string;
+  pnl_usdt?: number;
+  closed_at?: string;
+};
+
+export type WyckoffPortfolio = {
+  cash: number;
+  equity: number;
+  total_transferred_in: number;
+  unrealized_pnl: number;
+  realized_pnl: number;
+  open_positions: WyckoffPosition[];
+  closed_positions: WyckoffPosition[];
+  open_count: number;
+  closed_count: number;
+  win_rate: number;
+};
+
+export const wyckoffApi = {
+  portfolio: () => req<WyckoffPortfolio>("/wyckoff/portfolio"),
+  deposit: (amount: number) =>
+    req<{ ok: boolean; wyckoff_cash: number; main_cash: number }>(
+      "/wyckoff/deposit",
+      { method: "POST", body: JSON.stringify({ amount }) }
+    ),
+  withdraw: (amount: number) =>
+    req<{ ok: boolean; wyckoff_cash: number; main_cash: number }>(
+      "/wyckoff/withdraw",
+      { method: "POST", body: JSON.stringify({ amount }) }
+    ),
+  reset: () => req<{ ok: boolean }>("/wyckoff/reset", { method: "POST" }),
 };

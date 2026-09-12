@@ -200,6 +200,22 @@ class Config(BaseModel):
     rsi_rebound_tp_atr_mult: float = 2.0  # initial target — also the point where trailing activates
     rsi_rebound_trailing_atr_mult: float = 1.2
     rsi_rebound_max_open_positions: int = 5
+    # --- Wyckoff Spring: full classic accumulation sequence — Range, then
+    # Spring (false breakdown on light volume), Test (retest on even lighter
+    # volume), Sign of Strength (breakout above range resistance on rising
+    # volume), Last Point of Support (pullback holding above the broken
+    # resistance, on lighter volume) — entry at the LPS, the lowest-risk
+    # point in the classic schematic. ---
+    wyckoff_enabled: bool = True
+    wyckoff_timeframe: str = "4h"
+    wyckoff_range_window: int = 30  # candles used to establish support/resistance of the trading range
+    wyckoff_search_span: int = 20  # candles, after the range, in which the whole Spring->Test->SOS->LPS sequence must occur
+    wyckoff_test_window: int = 5  # candles after the Spring in which the Test must occur
+    wyckoff_max_range_atr_mult: float = 4.0  # range height must be no wider than this many ATR to count as genuine accumulation, not a trend
+    wyckoff_risk_pct: float = 5.0  # % of wallet cash used as position notional per trade
+    wyckoff_trailing_atr_mult: float = 1.5
+    wyckoff_max_open_positions: int = 5
+
 
 
 
@@ -2382,6 +2398,7 @@ async def scheduler_loop() -> None:
             await run_grid_scan()
             await run_top10_scan()
             await run_rsi_rebound_scan()
+            await run_wyckoff_scan()
         except Exception as e:  # noqa: BLE001
             logger.exception("Scan loop error: %s", e)
         await asyncio.sleep(max(60, cfg.scan_interval_minutes * 60))
@@ -2546,6 +2563,7 @@ async def lifespan(_app: FastAPI):
     grid_monitor_task = asyncio.create_task(grid_monitor_loop())
     top10_monitor_task = asyncio.create_task(top10_monitor_loop())
     rsi_rebound_monitor_task = asyncio.create_task(rsi_rebound_monitor_loop())
+    wyckoff_monitor_task = asyncio.create_task(wyckoff_monitor_loop())
     ws_task = asyncio.create_task(price_feed.run())
     premature_task = asyncio.create_task(premature_stop_loop())
     entry_timing_task = asyncio.create_task(entry_timing_loop())
@@ -4772,6 +4790,18 @@ async def rsi_rebound_monitor_loop() -> None:
         await asyncio.sleep(3)
 
 
+async def wyckoff_monitor_loop() -> None:
+    """Check Wyckoff Spring stop/trailing every 3s using the real-time WS
+    price cache — same reasoning as the other monitors."""
+    await asyncio.sleep(8)
+    while True:
+        try:
+            await monitor_wyckoff_positions()
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Wyckoff monitor error: %s", e)
+        await asyncio.sleep(3)
+
+
 class GridTransferRequest(BaseModel):
     amount: float
 
@@ -5705,6 +5735,365 @@ async def rsi_rebound_reset() -> dict[str, Any]:
     await db.rsi_rebound_positions.delete_many({})
     await db.rsi_rebound_wallet.update_one(
         {"_id": RSI_REBOUND_WALLET_ID},
+        {"$set": {"cash": 0.0, "total_transferred_in": 0.0}, "$inc": {"reset_seq": 1}},
+        upsert=True,
+    )
+    return {"ok": True}
+
+
+
+# ============================================================================
+# WYCKOFF SPRING — the classic accumulation schematic, followed in full:
+# Range -> Spring -> Test -> Sign of Strength -> Last Point of Support.
+# Entry at the LPS, long only. Own isolated wallet, own position lifecycle.
+# ============================================================================
+
+WYCKOFF_WALLET_ID = "wyckoff_wallet_singleton"
+WYCKOFF_FEE_PCT = 0.001
+
+
+async def get_wyckoff_wallet() -> dict[str, Any]:
+    doc = await db.wyckoff_wallet.find_one({"_id": WYCKOFF_WALLET_ID}, {"_id": 0})
+    if not doc:
+        doc = {"cash": 0.0, "total_transferred_in": 0.0, "reset_seq": 0}
+        await db.wyckoff_wallet.update_one(
+            {"_id": WYCKOFF_WALLET_ID}, {"$set": doc}, upsert=True
+        )
+    doc.setdefault("reset_seq", 0)
+    return doc
+
+
+def detect_wyckoff_spring_setup(candles: list[list[float]], cfg: Config) -> Optional[dict[str, Any]]:
+    """Scan the candle history in order for the full classic accumulation
+    sequence. The Last Point of Support (LPS) must be the MOST RECENT
+    candle for this to trigger an entry now — everything before it
+    (Range, Spring, Test, Sign of Strength) must already have happened."""
+    n = len(candles)
+    opens = [c[1] for c in candles]
+    closes = [c[2] for c in candles]
+    highs = [c[3] for c in candles]
+    lows = [c[4] for c in candles]
+    vols = [c[5] for c in candles]
+
+    range_window = cfg.wyckoff_range_window
+    search_span = cfg.wyckoff_search_span
+    min_total = range_window + search_span
+    if n < min_total:
+        return None
+
+    range_end = n - search_span
+    range_start = max(0, range_end - range_window)
+    if range_end - range_start < 10:
+        return None
+
+    range_highs = highs[range_start:range_end]
+    range_lows = lows[range_start:range_end]
+    range_vols = vols[range_start:range_end]
+    resistance = max(range_highs)
+    support = min(range_lows)
+    avg_range_vol = sum(range_vols) / len(range_vols)
+
+    atr = atr_wilder(highs, lows, closes, 14)
+    if not atr or atr <= 0:
+        return None
+    if (resistance - support) > cfg.wyckoff_max_range_atr_mult * atr:
+        return None  # too wide to be a genuine accumulation range, not a trend
+
+    # 1. Spring: undercuts support, closes back above it, on below-average volume.
+    spring_idx = None
+    for i in range(range_end, n):
+        if lows[i] < support and closes[i] > support and vols[i] < avg_range_vol:
+            spring_idx = i
+            break
+    if spring_idx is None:
+        return None
+
+    # 2. Test: within a few candles, holds near the spring low without
+    # breaking meaningfully lower, on even less volume than the Spring —
+    # confirms selling is exhausted, not just paused.
+    test_idx = None
+    for j in range(spring_idx + 1, min(spring_idx + 1 + cfg.wyckoff_test_window, n)):
+        if lows[j] >= support * 0.995 and vols[j] < vols[spring_idx]:
+            test_idx = j
+            break
+    if test_idx is None:
+        return None
+
+    # 3. Sign of Strength: closes above range resistance on above-average
+    # volume — buyers now visibly in control.
+    sos_idx = None
+    for k in range(test_idx + 1, n):
+        if closes[k] > resistance and vols[k] > avg_range_vol:
+            sos_idx = k
+            break
+    if sos_idx is None:
+        return None
+
+    # 4. Last Point of Support: the pullback that holds above the broken
+    # resistance (now acting as support), closing bullish, on lighter volume
+    # than the breakout — the classic lowest-risk entry point. Must be the
+    # LATEST candle for the setup to be actionable right now.
+    lps_idx = n - 1
+    if lps_idx <= sos_idx:
+        return None
+    if lows[lps_idx] < resistance:
+        return None  # broke back below the breakout level — invalidated
+    if closes[lps_idx] <= opens[lps_idx]:
+        return None
+    if vols[lps_idx] >= vols[sos_idx]:
+        return None
+
+    entry = closes[lps_idx]
+    stop = min(lows[spring_idx], lows[lps_idx]) * 0.998
+    if entry <= stop:
+        return None
+    target = entry + (resistance - support)  # measured-move target from range height
+    return {"entry": entry, "stop": stop, "target": target}
+
+
+async def run_wyckoff_scan() -> None:
+    cfg = await get_config()
+    if not cfg.wyckoff_enabled:
+        return
+
+    open_count = await db.wyckoff_positions.count_documents({"status": "open"})
+    if open_count >= cfg.wyckoff_max_open_positions:
+        return
+
+    wallet = await get_wyckoff_wallet()
+    cash = wallet.get("cash", 0.0)
+    if cash <= 1.0:
+        return
+
+    tickers = await exchange.get_tickers()
+    vol_map: dict[str, float] = {}
+    for t in tickers:
+        try:
+            vol_map[t["symbol"]] = float(t.get("volValue") or 0)
+        except (TypeError, ValueError):
+            continue
+    symbols = await exchange.get_symbols()
+    quotes = {q.strip() for q in (cfg.quote_filter or "").split(",") if q.strip()}
+    candidates: list[str] = []
+    for s in symbols:
+        if not s.get("enableTrading"):
+            continue
+        sym = s.get("symbol")
+        if not sym:
+            continue
+        if quotes and s.get("quoteCurrency") not in quotes:
+            continue
+        if any(sym.upper().startswith(base) for base in SCALPING_EXCLUDED_STABLE_BASES):
+            continue
+        if cfg.excluded_pairs and sym in cfg.excluded_pairs:
+            continue
+        if cfg.enabled_pairs and sym not in cfg.enabled_pairs:
+            continue
+        if vol_map.get(sym, 0) < cfg.min_24h_volume_usdt:
+            continue
+        if not await is_volume_stable(sym, cfg):
+            continue
+        candidates.append(sym)
+    candidates.sort(key=lambda s: vol_map.get(s, 0), reverse=True)
+    candidates = candidates[:30]
+
+    for symbol in candidates:
+        if open_count >= cfg.wyckoff_max_open_positions:
+            break
+        if await db.wyckoff_positions.find_one({"symbol": symbol, "status": "open"}):
+            continue
+        candles = await exchange.get_klines(symbol, cfg.wyckoff_timeframe)
+        if len(candles) < cfg.wyckoff_range_window + cfg.wyckoff_search_span:
+            await log_reject(symbol, cfg.wyckoff_timeframe, "wyckoff", "dati insufficienti")
+            continue
+        signal = detect_wyckoff_spring_setup(candles, cfg)
+        if not signal:
+            await log_reject(symbol, cfg.wyckoff_timeframe, "wyckoff", "sequenza Spring/Test/SOS/LPS non completa")
+            continue
+        await open_wyckoff_position(symbol, signal, cfg)
+        open_count += 1
+
+
+async def open_wyckoff_position(symbol: str, signal: dict[str, Any], cfg: Config) -> None:
+    wallet = await get_wyckoff_wallet()
+    cash = wallet.get("cash", 0.0)
+    if cash <= 1.0:
+        return
+    entry = signal["entry"]
+    notional = min(cash * cfg.wyckoff_risk_pct / 100, cash)
+    if notional < 1.0:
+        return
+    quantity = notional / entry
+
+    candles = await exchange.get_klines(symbol, cfg.wyckoff_timeframe)
+    highs = [c[3] for c in candles]
+    lows = [c[4] for c in candles]
+    closes = [c[2] for c in candles]
+    atr = atr_wilder(highs, lows, closes, 14) or 0.0
+
+    doc = {
+        "id": str(uuid.uuid4()),
+        "symbol": symbol,
+        "side": "long",
+        "entry": entry,
+        "fill_price": entry,
+        "stop_loss": signal["stop"],
+        "take_profit": signal["target"],
+        "quantity": quantity,
+        "notional": notional,
+        "atr": atr,
+        "trailing_active": False,
+        "peak_price": None,
+        "status": "open",
+        "opened_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.wyckoff_positions.insert_one(dict(doc))
+    await db.wyckoff_wallet.update_one(
+        {"_id": WYCKOFF_WALLET_ID}, {"$inc": {"cash": -notional}}, upsert=True
+    )
+
+
+async def monitor_wyckoff_positions() -> None:
+    cfg = await get_config()
+    open_positions = await db.wyckoff_positions.find({"status": "open"}, {"_id": 0}).to_list(200)
+    for p in open_positions:
+        cur = price_feed.get(p["symbol"])
+        if not cur:
+            cur = await price_feed.price_or_rest(p["symbol"])
+        if not cur or cur <= 0:
+            continue
+
+        if p.get("trailing_active"):
+            atr = p.get("atr") or 0.0
+            peak = p.get("peak_price") or cur
+            new_peak = max(peak, cur)
+            trail_level = new_peak - cfg.wyckoff_trailing_atr_mult * atr
+            if new_peak != peak:
+                await db.wyckoff_positions.update_one(
+                    {"id": p["id"]}, {"$set": {"peak_price": new_peak}}
+                )
+            if cur > trail_level:
+                continue
+            hit = "trailing_stop"
+        else:
+            hit = None
+            if cur <= p["stop_loss"]:
+                hit = "stop_loss"
+            elif cur >= p["take_profit"]:
+                if (p.get("atr") or 0) > 0:
+                    await db.wyckoff_positions.update_one(
+                        {"id": p["id"]},
+                        {"$set": {"trailing_active": True, "peak_price": cur}},
+                    )
+                    continue
+                hit = "take_profit"
+            if not hit:
+                continue
+
+        gross_pnl = (cur - p["entry"]) * p["quantity"]
+        exit_notional = cur * p["quantity"]
+        fees = (p["notional"] + exit_notional) * WYCKOFF_FEE_PCT
+        pnl = gross_pnl - fees
+        await db.wyckoff_wallet.update_one(
+            {"_id": WYCKOFF_WALLET_ID},
+            {"$inc": {"cash": p["notional"] + pnl}},
+            upsert=True,
+        )
+        await db.wyckoff_positions.update_one(
+            {"id": p["id"]},
+            {"$set": {
+                "status": "closed", "close_price": cur, "close_reason": hit,
+                "pnl_usdt": round(pnl, 4),
+                "closed_at": datetime.now(timezone.utc).isoformat(),
+            }},
+        )
+
+
+class WyckoffTransferRequest(BaseModel):
+    amount: float
+
+
+@api.post("/wyckoff/deposit")
+async def wyckoff_deposit(req: WyckoffTransferRequest) -> dict[str, Any]:
+    amount = req.amount
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="L'importo deve essere positivo")
+    main_cash = await get_paper_cash()
+    if amount > main_cash:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Fondi insufficienti nel portafoglio principale (disponibili: {round(main_cash, 2)})",
+        )
+    await set_paper_cash(main_cash - amount)
+    updated = await db.wyckoff_wallet.find_one_and_update(
+        {"_id": WYCKOFF_WALLET_ID},
+        {"$inc": {"cash": amount, "total_transferred_in": amount}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return {"ok": True, "wyckoff_cash": updated.get("cash", amount), "main_cash": main_cash - amount}
+
+
+@api.post("/wyckoff/withdraw")
+async def wyckoff_withdraw(req: WyckoffTransferRequest) -> dict[str, Any]:
+    amount = req.amount
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="L'importo deve essere positivo")
+    w = await get_wyckoff_wallet()
+    available = w.get("cash", 0.0)
+    if amount > available and (amount - available) <= 0.01:
+        amount = available
+    updated = await db.wyckoff_wallet.find_one_and_update(
+        {"_id": WYCKOFF_WALLET_ID, "cash": {"$gte": amount}},
+        {"$inc": {"cash": -amount}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not updated:
+        raise HTTPException(status_code=400, detail="Fondi insufficienti nel portafoglio Wyckoff")
+    main_cash = await get_paper_cash()
+    await set_paper_cash(main_cash + amount)
+    return {"ok": True, "wyckoff_cash": updated.get("cash", 0.0), "main_cash": main_cash + amount}
+
+
+@api.get("/wyckoff/portfolio")
+async def wyckoff_portfolio() -> dict[str, Any]:
+    wallet = await get_wyckoff_wallet()
+    open_docs = await db.wyckoff_positions.find({"status": "open"}, {"_id": 0}).to_list(200)
+    closed_docs = await db.wyckoff_positions.find({"status": "closed"}, {"_id": 0}).sort("closed_at", -1).to_list(500)
+
+    unrealized = 0.0
+    open_out = []
+    open_value = 0.0
+    for p in open_docs:
+        cur = price_feed.get(p["symbol"]) or p["entry"]
+        upnl = (cur - p["entry"]) * p["quantity"]
+        unrealized += upnl
+        open_value += cur * p["quantity"]
+        open_out.append({**p, "current_price": cur, "unrealized_pnl": round(upnl, 4)})
+
+    realized = sum(c.get("pnl_usdt", 0.0) for c in closed_docs)
+    equity = wallet.get("cash", 0.0) + open_value
+    wins = sum(1 for c in closed_docs if c.get("pnl_usdt", 0.0) > 0)
+    losses = sum(1 for c in closed_docs if c.get("pnl_usdt", 0.0) <= 0)
+    return {
+        "cash": round(wallet.get("cash", 0.0), 4),
+        "equity": round(equity, 4),
+        "total_transferred_in": wallet.get("total_transferred_in", 0.0),
+        "unrealized_pnl": round(unrealized, 4),
+        "realized_pnl": round(realized, 4),
+        "open_positions": open_out,
+        "closed_positions": closed_docs[:100],
+        "open_count": len(open_docs),
+        "closed_count": len(closed_docs),
+        "win_rate": round(wins / (wins + losses) * 100, 1) if (wins + losses) else 0.0,
+    }
+
+
+@api.post("/wyckoff/reset")
+async def wyckoff_reset() -> dict[str, Any]:
+    await db.wyckoff_positions.delete_many({})
+    await db.wyckoff_wallet.update_one(
+        {"_id": WYCKOFF_WALLET_ID},
         {"$set": {"cash": 0.0, "total_transferred_in": 0.0}, "$inc": {"reset_seq": 1}},
         upsert=True,
     )

@@ -179,6 +179,17 @@ export default function SignalsScreen() {
             <Ionicons name="pulse" size={16} color={colors.brand} />
           </Pressable>
           <Pressable
+            onPress={() => router.push("/wyckoff")}
+            style={({ pressed }) => [
+              styles.scanBtn,
+              { backgroundColor: colors.surfaceTertiary },
+              pressed && { opacity: 0.6 },
+            ]}
+            testID="wyckoff-button"
+          >
+            <Ionicons name="layers" size={16} color={colors.brand} />
+          </Pressable>
+          <Pressable
             onPress={() => router.push("/strategies")}
             style={({ pressed }) => [
               styles.scanBtn,
