@@ -2266,13 +2266,17 @@ async def run_scan() -> dict[str, Any]:
                 continue
             if vol_map.get(sym, 0) < cfg.min_24h_volume_usdt:
                 continue
-            if not await is_volume_stable(sym, cfg):
-                continue
             pairs.append(sym)
 
-        # Sort by volume descending and cap
+        # Sort by volume descending and cap — THEN check stability, only on
+        # the already-capped shortlist. Checking stability before capping
+        # meant a full daily-candle fetch for every symbol that merely
+        # passed the basic volume filter (potentially 100+ pairs) instead
+        # of just the handful actually being considered — this alone could
+        # stall an entire scan cycle for minutes.
         pairs.sort(key=lambda s: vol_map.get(s, 0), reverse=True)
         pairs = pairs[: cfg.max_pairs_per_scan]
+        pairs = [p for p in pairs if await is_volume_stable(p, cfg)]
 
         logger.info("Scanning %d pairs across %s", len(pairs), cfg.timeframes)
         signals_found: list[Signal] = []
@@ -3568,11 +3572,10 @@ async def run_scalping_scan() -> dict[str, Any]:
             continue
         if vol_map.get(sym, 0) < cfg.min_24h_volume_usdt:
             continue
-        if not await is_volume_stable(sym, cfg):
-            continue
         pairs.append(sym)
     pairs.sort(key=lambda s: vol_map.get(s, 0), reverse=True)
     pairs = pairs[:20]
+    pairs = [p for p in pairs if await is_volume_stable(p, cfg)]
 
     tf = cfg.scalping_timeframe
     signals_found: list[dict[str, Any]] = []
@@ -4423,11 +4426,10 @@ async def run_grid_scan() -> dict[str, Any]:
             continue
         if vol_map.get(sym, 0) < cfg.min_24h_volume_usdt:
             continue
-        if not await is_volume_stable(sym, cfg):
-            continue
         candidates.append(sym)
     candidates.sort(key=lambda s: vol_map.get(s, 0), reverse=True)
     candidates = candidates[:30]  # cap scan for performance
+    candidates = [c for c in candidates if await is_volume_stable(c, cfg)]
 
     # Score EVERY candidate up front (one pass) — so slot-filling can pick
     # the best live setup, not just the fastest-found-in-volume-order.
@@ -4954,12 +4956,18 @@ async def get_top10_universe(cfg: Config) -> list[str]:
         vol = vol_map.get(sym, 0)
         if vol < cfg.min_24h_volume_usdt:
             continue
-        if not await is_volume_stable(sym, cfg):
-            continue
         if base not in best_per_base or vol > best_per_base[base][1]:
             best_per_base[base] = (sym, vol)
     ranked = sorted(best_per_base.values(), key=lambda x: x[1], reverse=True)
-    return [sym for sym, _ in ranked[: cfg.top10_universe_size]]
+    # Stability check runs only while walking the ranked list, stopping once
+    # we have enough — not on every deduped coin up front.
+    out: list[str] = []
+    for sym, _ in ranked:
+        if len(out) >= cfg.top10_universe_size:
+            break
+        if await is_volume_stable(sym, cfg):
+            out.append(sym)
+    return out
 
 
 async def compute_top10_trend_score(symbol: str, cfg: Config) -> tuple[float, dict[str, Any]]:
@@ -5531,11 +5539,10 @@ async def run_rsi_rebound_scan() -> None:
             continue
         if vol_map.get(sym, 0) < cfg.min_24h_volume_usdt:
             continue
-        if not await is_volume_stable(sym, cfg):
-            continue
         candidates.append(sym)
     candidates.sort(key=lambda s: vol_map.get(s, 0), reverse=True)
     candidates = candidates[:30]
+    candidates = [c for c in candidates if await is_volume_stable(c, cfg)]
 
     for symbol in candidates:
         if open_count >= cfg.rsi_rebound_max_open_positions:
@@ -5891,11 +5898,10 @@ async def run_wyckoff_scan() -> None:
             continue
         if vol_map.get(sym, 0) < cfg.min_24h_volume_usdt:
             continue
-        if not await is_volume_stable(sym, cfg):
-            continue
         candidates.append(sym)
     candidates.sort(key=lambda s: vol_map.get(s, 0), reverse=True)
     candidates = candidates[:30]
+    candidates = [c for c in candidates if await is_volume_stable(c, cfg)]
 
     for symbol in candidates:
         if open_count >= cfg.wyckoff_max_open_positions:
