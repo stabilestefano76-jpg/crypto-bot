@@ -110,7 +110,6 @@ class Config(BaseModel):
     breakeven_safety_pct: float = 0.05  # % safety margin added to breakeven
     default_fee_rate: float = 0.001  # fallback maker/taker if API unavailable
     trailing_activation_r: float = 1.0  # activate trailing when profit_in_R >= this
-    trailing_atr_mult: float = 1.2
     partial_close_enabled: bool = True
     partial_close_r: float = 1.0
     partial_close_pct: float = 35.0  # % of position closed at partial_close_r
@@ -142,7 +141,7 @@ class Config(BaseModel):
     exhaustion_min_score: float = 1.0  # was 2.0 — lowered so it stops being an extra hard gate; raise back to 2.0 (or more) in Settings any time
     trend_structure_strict: bool = False  # False = only ONE of higher-high/higher-low (or the "down" mirror) is needed to call a trend, not both — set True in Settings to go back to the strict textbook definition
     trailing_enabled: bool = True  # shared by Scalping and Grid: once price reaches the original target, arm a trailing stop instead of closing immediately, to let a strong run continue
-    trailing_atr_mult: float = 1.0  # how far (in ATR multiples) price may pull back from its post-target peak before the trailing stop closes the trade
+    trailing_atr_mult: float = 0.5  # how far (in ATR multiples) price may pull back from its post-target peak before the trailing stop closes the trade — was 1.2 (and briefly duplicated as a dead 1.0 default elsewhere in this same class), which gave back up to 60% of a Scalping trade's target profit before locking anything in
     # --- RSI Reversion strategy (independent, simple): RSI extreme -> confirmed
     # reentry -> target back near RSI-50 (proxied by price returning to its own
     # N-period average). Deliberately no tight stop, only a wide catastrophic
