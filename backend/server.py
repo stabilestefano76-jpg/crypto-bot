@@ -5471,32 +5471,33 @@ async def get_rsi_rebound_wallet() -> dict[str, Any]:
     return doc
 
 
-def detect_rsi_rebound_signal(candles: list[list[float]], cfg: Config) -> Optional[dict[str, Any]]:
+def detect_rsi_rebound_signal(candles: list[list[float]], cfg: Config) -> tuple[Optional[dict[str, Any]], str]:
     """RSI dipped below `rsi_rebound_oversold` at some point in the last
     `rsi_rebound_lookback` candles, and the latest CLOSED candle has RSI
     back above that threshold with a bullish (green) close — the recovery
-    confirmation candle."""
+    confirmation candle. Returns (signal_or_None, reason) so the caller can
+    log exactly which stage failed, instead of one catch-all message."""
     closes = [c[2] for c in candles]
     opens = [c[1] for c in candles]
     lows = [c[4] for c in candles]
     if len(closes) < cfg.rsi_rebound_period + cfg.rsi_rebound_lookback + 2:
-        return None
+        return None, "dati insufficienti"
     rsis = rsi_wilder(closes, cfg.rsi_rebound_period)
     if rsis[-1] is None:
-        return None
+        return None, "RSI non calcolabile"
     if rsis[-1] < cfg.rsi_rebound_oversold:
-        return None  # not back above yet
+        return None, "RSI ancora sotto soglia, non ancora rientrato"
     lookback_window = rsis[-(cfg.rsi_rebound_lookback + 1):-1]
     was_oversold = any(r is not None and r < cfg.rsi_rebound_oversold for r in lookback_window)
     if not was_oversold:
-        return None
+        return None, "nessun ipervenduto recente sotto soglia"
     if closes[-1] <= opens[-1]:
-        return None  # confirmation candle must be bullish
+        return None, "candela di conferma non rialzista"
     stop = min(lows[-cfg.rsi_rebound_stop_lookback:]) * 0.998
     entry = closes[-1]
     if entry <= stop:
-        return None
-    return {"entry": entry, "stop": stop, "rsi": rsis[-1]}
+        return None, "stop non valido rispetto all'entrata"
+    return {"entry": entry, "stop": stop, "rsi": rsis[-1]}, "ok"
 
 
 async def run_rsi_rebound_scan() -> None:
@@ -5553,9 +5554,9 @@ async def run_rsi_rebound_scan() -> None:
         if len(candles) < cfg.rsi_rebound_period + cfg.rsi_rebound_lookback + 2:
             await log_reject(symbol, cfg.rsi_rebound_timeframe, "rsi_rebound", "dati insufficienti")
             continue
-        signal = detect_rsi_rebound_signal(candles, cfg)
+        signal, reason = detect_rsi_rebound_signal(candles, cfg)
         if not signal:
-            await log_reject(symbol, cfg.rsi_rebound_timeframe, "rsi_rebound", "nessun rimbalzo RSI confermato")
+            await log_reject(symbol, cfg.rsi_rebound_timeframe, "rsi_rebound", reason)
             continue
         await open_rsi_rebound_position(symbol, signal, cfg)
         open_count += 1
@@ -5770,11 +5771,13 @@ async def get_wyckoff_wallet() -> dict[str, Any]:
     return doc
 
 
-def detect_wyckoff_spring_setup(candles: list[list[float]], cfg: Config) -> Optional[dict[str, Any]]:
+def detect_wyckoff_spring_setup(candles: list[list[float]], cfg: Config) -> tuple[Optional[dict[str, Any]], str]:
     """Scan the candle history in order for the full classic accumulation
     sequence. The Last Point of Support (LPS) must be the MOST RECENT
     candle for this to trigger an entry now — everything before it
-    (Range, Spring, Test, Sign of Strength) must already have happened."""
+    (Range, Spring, Test, Sign of Strength) must already have happened.
+    Returns (signal_or_None, reason) so the caller can log exactly which
+    stage of the sequence failed, instead of one catch-all message."""
     n = len(candles)
     opens = [c[1] for c in candles]
     closes = [c[2] for c in candles]
@@ -5786,12 +5789,12 @@ def detect_wyckoff_spring_setup(candles: list[list[float]], cfg: Config) -> Opti
     search_span = cfg.wyckoff_search_span
     min_total = range_window + search_span
     if n < min_total:
-        return None
+        return None, "dati insufficienti"
 
     range_end = n - search_span
     range_start = max(0, range_end - range_window)
     if range_end - range_start < 10:
-        return None
+        return None, "dati insufficienti"
 
     range_highs = highs[range_start:range_end]
     range_lows = lows[range_start:range_end]
@@ -5802,9 +5805,9 @@ def detect_wyckoff_spring_setup(candles: list[list[float]], cfg: Config) -> Opti
 
     atr = atr_wilder(highs, lows, closes, 14)
     if not atr or atr <= 0:
-        return None
+        return None, "ATR non calcolabile"
     if (resistance - support) > cfg.wyckoff_max_range_atr_mult * atr:
-        return None  # too wide to be a genuine accumulation range, not a trend
+        return None, "range troppo ampio, non è accumulazione"
 
     # 1. Spring: undercuts support, closes back above it, on below-average volume.
     spring_idx = None
@@ -5813,7 +5816,7 @@ def detect_wyckoff_spring_setup(candles: list[list[float]], cfg: Config) -> Opti
             spring_idx = i
             break
     if spring_idx is None:
-        return None
+        return None, "nessuno Spring rilevato"
 
     # 2. Test: within a few candles, holds near the spring low without
     # breaking meaningfully lower, on even less volume than the Spring —
@@ -5824,7 +5827,7 @@ def detect_wyckoff_spring_setup(candles: list[list[float]], cfg: Config) -> Opti
             test_idx = j
             break
     if test_idx is None:
-        return None
+        return None, "Spring trovato ma nessun Test di conferma"
 
     # 3. Sign of Strength: closes above range resistance on above-average
     # volume — buyers now visibly in control.
@@ -5834,7 +5837,7 @@ def detect_wyckoff_spring_setup(candles: list[list[float]], cfg: Config) -> Opti
             sos_idx = k
             break
     if sos_idx is None:
-        return None
+        return None, "Test confermato ma nessun Sign of Strength"
 
     # 4. Last Point of Support: the pullback that holds above the broken
     # resistance (now acting as support), closing bullish, on lighter volume
@@ -5842,20 +5845,20 @@ def detect_wyckoff_spring_setup(candles: list[list[float]], cfg: Config) -> Opti
     # LATEST candle for the setup to be actionable right now.
     lps_idx = n - 1
     if lps_idx <= sos_idx:
-        return None
+        return None, "SOS trovato ma nessuna candela dopo per l'LPS"
     if lows[lps_idx] < resistance:
-        return None  # broke back below the breakout level — invalidated
+        return None, "ritorno sotto la resistenza rotta, sequenza invalidata"
     if closes[lps_idx] <= opens[lps_idx]:
-        return None
+        return None, "ultima candela non rialzista, LPS non confermato"
     if vols[lps_idx] >= vols[sos_idx]:
-        return None
+        return None, "volume dell'ultima candela non più leggero del SOS"
 
     entry = closes[lps_idx]
     stop = min(lows[spring_idx], lows[lps_idx]) * 0.998
     if entry <= stop:
-        return None
+        return None, "stop non valido rispetto all'entrata"
     target = entry + (resistance - support)  # measured-move target from range height
-    return {"entry": entry, "stop": stop, "target": target}
+    return {"entry": entry, "stop": stop, "target": target}, "ok"
 
 
 async def run_wyckoff_scan() -> None:
@@ -5912,9 +5915,9 @@ async def run_wyckoff_scan() -> None:
         if len(candles) < cfg.wyckoff_range_window + cfg.wyckoff_search_span:
             await log_reject(symbol, cfg.wyckoff_timeframe, "wyckoff", "dati insufficienti")
             continue
-        signal = detect_wyckoff_spring_setup(candles, cfg)
+        signal, reason = detect_wyckoff_spring_setup(candles, cfg)
         if not signal:
-            await log_reject(symbol, cfg.wyckoff_timeframe, "wyckoff", "sequenza Spring/Test/SOS/LPS non completa")
+            await log_reject(symbol, cfg.wyckoff_timeframe, "wyckoff", reason)
             continue
         await open_wyckoff_position(symbol, signal, cfg)
         open_count += 1
