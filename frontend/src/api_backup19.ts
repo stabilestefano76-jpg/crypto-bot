@@ -86,7 +86,6 @@ export type Config = {
   rsi_rev_oversold: number;
   rsi_rev_min_extreme_candles: number;
   rsi_rev_catastrophic_atr_mult: number;
-  rsi_rev_structural_lookback: number;
   rsi_rev_trailing_atr_mult: number;
   scalping_max_open_positions: number;
   scalping_sl_atr_mult: number;
@@ -98,7 +97,6 @@ export type Config = {
   grid_enabled: boolean;
   grid_num_levels: number;
   grid_atr_spacing_mult: number;
-  grid_max_pairs: number;
   grid_extension_spacing_mult: number;
   top10_enabled: boolean;
   top10_universe_size: number;
@@ -128,16 +126,6 @@ export type Config = {
   rsi_rebound_tp_atr_mult: number;
   rsi_rebound_trailing_atr_mult: number;
   rsi_rebound_max_open_positions: number;
-  wyckoff_enabled: boolean;
-  wyckoff_timeframe: string;
-  wyckoff_range_window: number;
-  wyckoff_search_span: number;
-  wyckoff_test_window: number;
-  wyckoff_max_range_atr_mult: number;
-  wyckoff_risk_pct: number;
-  wyckoff_trailing_atr_mult: number;
-  wyckoff_max_open_positions: number;
-  regime_risk_reduction_pct: number;
 };
 
 export type ScanState = {
@@ -685,122 +673,4 @@ export const rsiReboundApi = {
       { method: "POST", body: JSON.stringify({ amount }) }
     ),
   reset: () => req<{ ok: boolean }>("/rsi-rebound/reset", { method: "POST" }),
-};
-
-// ---------------------------------------------------------------------------
-// Wyckoff Spring (Range -> Spring -> Test -> Sign of Strength -> Last Point
-// of Support — entry at the LPS)
-// ---------------------------------------------------------------------------
-export type WyckoffPosition = {
-  id: string;
-  symbol: string;
-  side: "long";
-  entry: number;
-  stop_loss: number;
-  take_profit: number;
-  quantity: number;
-  notional: number;
-  trailing_active: boolean;
-  status: string;
-  opened_at: string;
-  current_price?: number;
-  unrealized_pnl?: number;
-  close_price?: number;
-  close_reason?: string;
-  pnl_usdt?: number;
-  closed_at?: string;
-};
-
-export type WyckoffPortfolio = {
-  cash: number;
-  equity: number;
-  total_transferred_in: number;
-  unrealized_pnl: number;
-  realized_pnl: number;
-  open_positions: WyckoffPosition[];
-  closed_positions: WyckoffPosition[];
-  open_count: number;
-  closed_count: number;
-  win_rate: number;
-};
-
-export const wyckoffApi = {
-  portfolio: () => req<WyckoffPortfolio>("/wyckoff/portfolio"),
-  deposit: (amount: number) =>
-    req<{ ok: boolean; wyckoff_cash: number; main_cash: number }>(
-      "/wyckoff/deposit",
-      { method: "POST", body: JSON.stringify({ amount }) }
-    ),
-  withdraw: (amount: number) =>
-    req<{ ok: boolean; wyckoff_cash: number; main_cash: number }>(
-      "/wyckoff/withdraw",
-      { method: "POST", body: JSON.stringify({ amount }) }
-    ),
-  reset: () => req<{ ok: boolean }>("/wyckoff/reset", { method: "POST" }),
-};
-
-// ---------------------------------------------------------------------------
-// RSI Reversion — one of the 3 traditional strategies, but with its own
-// isolated wallet already supported backend-side (STRATEGY_WALLET_NAMES).
-// Uses the generic /strategy/{name}/... endpoints shared with Rev Pre-FVG
-// and FVG Reversal, scoped to "rsi_reversion".
-// ---------------------------------------------------------------------------
-const RSI_REVERSION_STRATEGY = "rsi_reversion";
-
-export type StrategyPosition = {
-  id: string;
-  signal_id?: string;
-  symbol: string;
-  side: "long" | "short";
-  entry: number;
-  stop_loss: number;
-  take_profit: number;
-  quantity: number;
-  timeframe?: string;
-  status: string;
-  opened_at: string;
-  current_price?: number;
-  unrealized_pnl?: number;
-  unrealized_pnl_pct?: number;
-  close_price?: number;
-  close_reason?: string;
-  outcome?: string;
-  pnl_usdt?: number;
-  closed_at?: string;
-};
-
-export type StrategyPortfolio = {
-  strategy: string;
-  wallet_type: "isolated" | "shared";
-  cash: number;
-  equity: number;
-  unrealized_pnl: number;
-  realized_pnl: number;
-  open_positions: StrategyPosition[];
-  closed_trades: StrategyPosition[];
-  open_count: number;
-  closed_count: number;
-  win_rate: number;
-};
-
-export const rsiReversionApi = {
-  portfolio: () =>
-    req<StrategyPortfolio>(`/strategy/${RSI_REVERSION_STRATEGY}/portfolio`),
-  // "Deposit" = move funds from the shared main wallet into this strategy's
-  // own isolated wallet (creating it on first use).
-  deposit: (amount: number) =>
-    req<{ ok: boolean; strategy: string; cash: number; main_cash: number }>(
-      `/strategy-wallets/${RSI_REVERSION_STRATEGY}/allocate`,
-      { method: "POST", body: JSON.stringify({ amount }) }
-    ),
-  withdraw: (amount: number) =>
-    req<{ ok: boolean; strategy: string; cash: number; main_cash: number }>(
-      `/strategy-wallets/${RSI_REVERSION_STRATEGY}/withdraw`,
-      { method: "POST", body: JSON.stringify({ amount }) }
-    ),
-  reset: () =>
-    req<{ ok: boolean; strategy: string }>(
-      `/strategy/${RSI_REVERSION_STRATEGY}/reset`,
-      { method: "POST" }
-    ),
 };

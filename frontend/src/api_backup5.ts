@@ -70,11 +70,6 @@ export type Config = {
   consolidation_max_atr: number;
   tp1_pct: number;
   post_tp1_advance_pct: number;
-  exhaustion_min_score: number;
-  exhaustion_lookback: number;
-  trend_structure_strict: boolean;
-  trailing_enabled: boolean;
-  trailing_atr_mult: number;
   enabled_strategies?: string[];
   fvgr_tp1_pct: number;
   fvgr_tp2_pct: number;
@@ -86,58 +81,9 @@ export type Config = {
   rsi_rev_oversold: number;
   rsi_rev_min_extreme_candles: number;
   rsi_rev_catastrophic_atr_mult: number;
-  rsi_rev_structural_lookback: number;
-  rsi_rev_trailing_atr_mult: number;
-  scalping_max_open_positions: number;
-  scalping_sl_atr_mult: number;
-  scalping_tp_atr_mult: number;
   max_pairs_per_scan: number;
   enabled_pairs: string[];
   excluded_pairs: string[];
-  scalping_enabled: boolean;
-  grid_enabled: boolean;
-  grid_num_levels: number;
-  grid_atr_spacing_mult: number;
-  grid_max_pairs: number;
-  grid_extension_spacing_mult: number;
-  top10_enabled: boolean;
-  top10_universe_size: number;
-  top10_risk_pct: number;
-  top10_min_setup_score: number;
-  top10_min_rr: number;
-  top10_tp1_pct: number;
-  top10_tp1_close_pct: number;
-  top10_tp2_pct: number;
-  top10_tp2_close_pct: number;
-  top10_runner_trailing_atr_mult: number;
-  top10_max_daily_losses: number;
-  top10_max_daily_loss_pct: number;
-  top10_max_total_risk_pct: number;
-  top10_ema_fast: number;
-  top10_ema_medium: number;
-  top10_ema_slow: number;
-  top10_rsi_period: number;
-  top10_atr_period: number;
-  rsi_rebound_enabled: boolean;
-  rsi_rebound_timeframe: string;
-  rsi_rebound_period: number;
-  rsi_rebound_oversold: number;
-  rsi_rebound_lookback: number;
-  rsi_rebound_stop_lookback: number;
-  rsi_rebound_risk_pct: number;
-  rsi_rebound_tp_atr_mult: number;
-  rsi_rebound_trailing_atr_mult: number;
-  rsi_rebound_max_open_positions: number;
-  wyckoff_enabled: boolean;
-  wyckoff_timeframe: string;
-  wyckoff_range_window: number;
-  wyckoff_search_span: number;
-  wyckoff_test_window: number;
-  wyckoff_max_range_atr_mult: number;
-  wyckoff_risk_pct: number;
-  wyckoff_trailing_atr_mult: number;
-  wyckoff_max_open_positions: number;
-  regime_risk_reduction_pct: number;
 };
 
 export type ScanState = {
@@ -255,11 +201,6 @@ export const api = {
     req<{ ok: boolean; initial_capital: number; cash: number }>("/paper/set-capital", {
       method: "POST",
       body: JSON.stringify({ initial_capital: amount }),
-    }),
-  addFunds: (amount: number) =>
-    req<{ ok: boolean; cash: number; initial_capital: number }>("/paper/add-funds", {
-      method: "POST",
-      body: JSON.stringify({ amount }),
     }),
   setMode: (mode: "manual" | "auto") =>
     req<{ ok: boolean; mode: string; auto_execute: boolean }>("/paper/mode", {
@@ -538,11 +479,6 @@ export const strategyWalletApi = {
       `/strategy-wallets/${strategy}/allocate`,
       { method: "POST", body: JSON.stringify({ amount }) }
     ),
-  withdraw: (strategy: StrategyName, amount: number) =>
-    req<{ ok: boolean; strategy: string; cash: number; main_cash: number }>(
-      `/strategy-wallets/${strategy}/withdraw`,
-      { method: "POST", body: JSON.stringify({ amount }) }
-    ),
   deallocate: (strategy: StrategyName) =>
     req<{ ok: boolean; strategy: string; main_cash: number }>(
       `/strategy-wallets/${strategy}/deallocate`,
@@ -553,254 +489,4 @@ export const strategyWalletApi = {
 export const strategyApi = {
   portfolio: (strategy: StrategyName) =>
     req<StrategyPortfolio>(`/strategy/${strategy}/portfolio`),
-  reset: (strategy: StrategyName) =>
-    req<{ ok: boolean; strategy: string }>(`/strategy/${strategy}/reset`, {
-      method: "POST",
-    }),
-};
-
-// ---------------------------------------------------------------------------
-// Unified events feed (all 5 sections, chronological) — powers the Eventi tab
-// ---------------------------------------------------------------------------
-export type BotEvent = {
-  id: string;
-  type: "open" | "close";
-  section: "counter_trend" | "fvg_reversal" | "rsi_reversion" | "scalping" | "grid";
-  symbol: string;
-  side?: "long" | "short";
-  pnl_usdt?: number | null;
-  at: string;
-};
-
-export const eventsApi = {
-  list: (limit: number = 100) =>
-    req<{ events: BotEvent[]; count: number }>(`/events?limit=${limit}`),
-};
-
-// ---------------------------------------------------------------------------
-// Top 10 Long (multi-setup: pullback / breakout-retest / momentum / mean-reversion)
-// ---------------------------------------------------------------------------
-export type Top10Position = {
-  id: string;
-  symbol: string;
-  side: "long";
-  setup_type: "PULLBACK" | "BREAKOUT_RETEST" | "MOMENTUM" | "MEAN_REVERSION";
-  entry: number;
-  stop_loss: number;
-  current_stop: number;
-  tp1: number;
-  tp2: number;
-  quantity: number;
-  notional: number;
-  risk_usdt: number;
-  score: number;
-  tp1_hit: boolean;
-  tp2_hit: boolean;
-  runner_active: boolean;
-  status: string;
-  opened_at: string;
-  current_price?: number;
-  unrealized_pnl?: number;
-  close_price?: number;
-  close_reason?: string;
-  pnl_usdt?: number;
-  closed_at?: string;
-};
-
-export type Top10Portfolio = {
-  cash: number;
-  equity: number;
-  total_transferred_in: number;
-  unrealized_pnl: number;
-  realized_pnl: number;
-  open_positions: Top10Position[];
-  closed_positions: Top10Position[];
-  open_count: number;
-  closed_count: number;
-  win_rate: number;
-};
-
-export const top10Api = {
-  portfolio: () => req<Top10Portfolio>("/top10/portfolio"),
-  deposit: (amount: number) =>
-    req<{ ok: boolean; top10_cash: number; main_cash: number }>(
-      "/top10/deposit",
-      { method: "POST", body: JSON.stringify({ amount }) }
-    ),
-  withdraw: (amount: number) =>
-    req<{ ok: boolean; top10_cash: number; main_cash: number }>(
-      "/top10/withdraw",
-      { method: "POST", body: JSON.stringify({ amount }) }
-    ),
-  reset: () => req<{ ok: boolean }>("/top10/reset", { method: "POST" }),
-};
-
-// ---------------------------------------------------------------------------
-// RSI Rebound (RSI dips below deep-oversold, then closes back above it)
-// ---------------------------------------------------------------------------
-export type RsiReboundPosition = {
-  id: string;
-  symbol: string;
-  side: "long";
-  entry: number;
-  stop_loss: number;
-  take_profit: number;
-  quantity: number;
-  notional: number;
-  rsi_at_entry?: number;
-  trailing_active: boolean;
-  status: string;
-  opened_at: string;
-  current_price?: number;
-  unrealized_pnl?: number;
-  close_price?: number;
-  close_reason?: string;
-  pnl_usdt?: number;
-  closed_at?: string;
-};
-
-export type RsiReboundPortfolio = {
-  cash: number;
-  equity: number;
-  total_transferred_in: number;
-  unrealized_pnl: number;
-  realized_pnl: number;
-  open_positions: RsiReboundPosition[];
-  closed_positions: RsiReboundPosition[];
-  open_count: number;
-  closed_count: number;
-  win_rate: number;
-};
-
-export const rsiReboundApi = {
-  portfolio: () => req<RsiReboundPortfolio>("/rsi-rebound/portfolio"),
-  deposit: (amount: number) =>
-    req<{ ok: boolean; rsi_rebound_cash: number; main_cash: number }>(
-      "/rsi-rebound/deposit",
-      { method: "POST", body: JSON.stringify({ amount }) }
-    ),
-  withdraw: (amount: number) =>
-    req<{ ok: boolean; rsi_rebound_cash: number; main_cash: number }>(
-      "/rsi-rebound/withdraw",
-      { method: "POST", body: JSON.stringify({ amount }) }
-    ),
-  reset: () => req<{ ok: boolean }>("/rsi-rebound/reset", { method: "POST" }),
-};
-
-// ---------------------------------------------------------------------------
-// Wyckoff Spring (Range -> Spring -> Test -> Sign of Strength -> Last Point
-// of Support — entry at the LPS)
-// ---------------------------------------------------------------------------
-export type WyckoffPosition = {
-  id: string;
-  symbol: string;
-  side: "long";
-  entry: number;
-  stop_loss: number;
-  take_profit: number;
-  quantity: number;
-  notional: number;
-  trailing_active: boolean;
-  status: string;
-  opened_at: string;
-  current_price?: number;
-  unrealized_pnl?: number;
-  close_price?: number;
-  close_reason?: string;
-  pnl_usdt?: number;
-  closed_at?: string;
-};
-
-export type WyckoffPortfolio = {
-  cash: number;
-  equity: number;
-  total_transferred_in: number;
-  unrealized_pnl: number;
-  realized_pnl: number;
-  open_positions: WyckoffPosition[];
-  closed_positions: WyckoffPosition[];
-  open_count: number;
-  closed_count: number;
-  win_rate: number;
-};
-
-export const wyckoffApi = {
-  portfolio: () => req<WyckoffPortfolio>("/wyckoff/portfolio"),
-  deposit: (amount: number) =>
-    req<{ ok: boolean; wyckoff_cash: number; main_cash: number }>(
-      "/wyckoff/deposit",
-      { method: "POST", body: JSON.stringify({ amount }) }
-    ),
-  withdraw: (amount: number) =>
-    req<{ ok: boolean; wyckoff_cash: number; main_cash: number }>(
-      "/wyckoff/withdraw",
-      { method: "POST", body: JSON.stringify({ amount }) }
-    ),
-  reset: () => req<{ ok: boolean }>("/wyckoff/reset", { method: "POST" }),
-};
-
-// ---------------------------------------------------------------------------
-// RSI Reversion — one of the 3 traditional strategies, but with its own
-// isolated wallet already supported backend-side (STRATEGY_WALLET_NAMES).
-// Uses the generic /strategy/{name}/... endpoints shared with Rev Pre-FVG
-// and FVG Reversal, scoped to "rsi_reversion".
-// ---------------------------------------------------------------------------
-const RSI_REVERSION_STRATEGY = "rsi_reversion";
-
-export type StrategyPosition = {
-  id: string;
-  signal_id?: string;
-  symbol: string;
-  side: "long" | "short";
-  entry: number;
-  stop_loss: number;
-  take_profit: number;
-  quantity: number;
-  timeframe?: string;
-  status: string;
-  opened_at: string;
-  current_price?: number;
-  unrealized_pnl?: number;
-  unrealized_pnl_pct?: number;
-  close_price?: number;
-  close_reason?: string;
-  outcome?: string;
-  pnl_usdt?: number;
-  closed_at?: string;
-};
-
-export type StrategyPortfolio = {
-  strategy: string;
-  wallet_type: "isolated" | "shared";
-  cash: number;
-  equity: number;
-  unrealized_pnl: number;
-  realized_pnl: number;
-  open_positions: StrategyPosition[];
-  closed_trades: StrategyPosition[];
-  open_count: number;
-  closed_count: number;
-  win_rate: number;
-};
-
-export const rsiReversionApi = {
-  portfolio: () =>
-    req<StrategyPortfolio>(`/strategy/${RSI_REVERSION_STRATEGY}/portfolio`),
-  // "Deposit" = move funds from the shared main wallet into this strategy's
-  // own isolated wallet (creating it on first use).
-  deposit: (amount: number) =>
-    req<{ ok: boolean; strategy: string; cash: number; main_cash: number }>(
-      `/strategy-wallets/${RSI_REVERSION_STRATEGY}/allocate`,
-      { method: "POST", body: JSON.stringify({ amount }) }
-    ),
-  withdraw: (amount: number) =>
-    req<{ ok: boolean; strategy: string; cash: number; main_cash: number }>(
-      `/strategy-wallets/${RSI_REVERSION_STRATEGY}/withdraw`,
-      { method: "POST", body: JSON.stringify({ amount }) }
-    ),
-  reset: () =>
-    req<{ ok: boolean; strategy: string }>(
-      `/strategy/${RSI_REVERSION_STRATEGY}/reset`,
-      { method: "POST" }
-    ),
 };

@@ -190,17 +190,6 @@ export default function SignalsScreen() {
             <Ionicons name="layers" size={16} color={colors.brand} />
           </Pressable>
           <Pressable
-            onPress={() => router.push("/rsi-reversion")}
-            style={({ pressed }) => [
-              styles.scanBtn,
-              { backgroundColor: colors.surfaceTertiary },
-              pressed && { opacity: 0.6 },
-            ]}
-            testID="rsi-reversion-button"
-          >
-            <Ionicons name="repeat" size={16} color={colors.brand} />
-          </Pressable>
-          <Pressable
             onPress={() => router.push("/strategies")}
             style={({ pressed }) => [
               styles.scanBtn,

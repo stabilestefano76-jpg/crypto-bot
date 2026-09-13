@@ -89,45 +89,38 @@ export default function SignalsScreen() {
     <View style={[styles.root, { paddingTop: insets.top }]}>
       {/* Sticky header */}
       <View style={styles.header}>
-        <View style={styles.headerTitleRow}>
-          <Text style={styles.title} testID="app-title">
-            BitSignal Bot
-          </Text>
-          <View style={styles.statusRow}>
-            <View
-              style={[
-                styles.dot,
-                {
-                  backgroundColor: status?.is_scanning
-                    ? colors.brand
-                    : colors.success,
-                },
-              ]}
-            />
-            <Text style={styles.statusText} testID="scan-status">
-              {status?.is_scanning
-                ? "Scanning..."
-                : status?.last_scan_at
-                ? `Last scan ${timeAgo(status.last_scan_at)} · ${
-                    status.last_signals_found
-                  } signals`
-                : "Awaiting first scan"}
+        <View style={styles.headerRow}>
+          <View>
+            <Text style={styles.title} testID="app-title">
+              BitSignal Bot
             </Text>
+            <View style={styles.statusRow}>
+              <View
+                style={[
+                  styles.dot,
+                  {
+                    backgroundColor: status?.is_scanning
+                      ? colors.brand
+                      : colors.success,
+                  },
+                ]}
+              />
+              <Text style={styles.statusText} testID="scan-status">
+                {status?.is_scanning
+                  ? "Scanning..."
+                  : status?.last_scan_at
+                  ? `Last scan ${timeAgo(status.last_scan_at)} · ${
+                      status.last_signals_found
+                    } signals`
+                  : "Awaiting first scan"}
+              </Text>
+            </View>
           </View>
-        </View>
-
-        <ScrollView
-          horizontal
-          showsHorizontalScrollIndicator={false}
-          contentContainerStyle={styles.actionsRow}
-          style={styles.actionsScroll}
-          testID="header-actions"
-        >
           <Pressable
             onPress={() => router.push("/academy")}
             style={({ pressed }) => [
               styles.scanBtn,
-              { backgroundColor: colors.surfaceTertiary },
+              { backgroundColor: colors.surfaceTertiary, marginRight: 8 },
               pressed && { opacity: 0.6 },
             ]}
             testID="academy-button"
@@ -138,7 +131,7 @@ export default function SignalsScreen() {
             onPress={() => router.push("/scalping")}
             style={({ pressed }) => [
               styles.scanBtn,
-              { backgroundColor: colors.surfaceTertiary },
+              { backgroundColor: colors.surfaceTertiary, marginRight: 8 },
               pressed && { opacity: 0.6 },
             ]}
             testID="scalping-button"
@@ -149,7 +142,7 @@ export default function SignalsScreen() {
             onPress={() => router.push("/grid")}
             style={({ pressed }) => [
               styles.scanBtn,
-              { backgroundColor: colors.surfaceTertiary },
+              { backgroundColor: colors.surfaceTertiary, marginRight: 8 },
               pressed && { opacity: 0.6 },
             ]}
             testID="grid-button"
@@ -157,54 +150,10 @@ export default function SignalsScreen() {
             <Ionicons name="grid" size={16} color={colors.brand} />
           </Pressable>
           <Pressable
-            onPress={() => router.push("/top10")}
-            style={({ pressed }) => [
-              styles.scanBtn,
-              { backgroundColor: colors.surfaceTertiary },
-              pressed && { opacity: 0.6 },
-            ]}
-            testID="top10-button"
-          >
-            <Ionicons name="trophy" size={16} color={colors.brand} />
-          </Pressable>
-          <Pressable
-            onPress={() => router.push("/rsi-rebound")}
-            style={({ pressed }) => [
-              styles.scanBtn,
-              { backgroundColor: colors.surfaceTertiary },
-              pressed && { opacity: 0.6 },
-            ]}
-            testID="rsi-rebound-button"
-          >
-            <Ionicons name="pulse" size={16} color={colors.brand} />
-          </Pressable>
-          <Pressable
-            onPress={() => router.push("/wyckoff")}
-            style={({ pressed }) => [
-              styles.scanBtn,
-              { backgroundColor: colors.surfaceTertiary },
-              pressed && { opacity: 0.6 },
-            ]}
-            testID="wyckoff-button"
-          >
-            <Ionicons name="layers" size={16} color={colors.brand} />
-          </Pressable>
-          <Pressable
-            onPress={() => router.push("/rsi-reversion")}
-            style={({ pressed }) => [
-              styles.scanBtn,
-              { backgroundColor: colors.surfaceTertiary },
-              pressed && { opacity: 0.6 },
-            ]}
-            testID="rsi-reversion-button"
-          >
-            <Ionicons name="repeat" size={16} color={colors.brand} />
-          </Pressable>
-          <Pressable
             onPress={() => router.push("/strategies")}
             style={({ pressed }) => [
               styles.scanBtn,
-              { backgroundColor: colors.surfaceTertiary },
+              { backgroundColor: colors.surfaceTertiary, marginRight: 8 },
               pressed && { opacity: 0.6 },
             ]}
             testID="strategies-hub-button"
@@ -227,7 +176,7 @@ export default function SignalsScreen() {
             )}
             <Text style={styles.scanBtnText}>Scan</Text>
           </Pressable>
-        </ScrollView>
+        </View>
 
         {/* Side filter segmented */}
         <View style={styles.segmented} testID="side-filter">
@@ -512,12 +461,6 @@ const styles = StyleSheet.create({
     paddingTop: spacing.sm,
     paddingBottom: spacing.md,
   },
-  headerTitleRow: {
-    paddingTop: spacing.sm,
-    paddingBottom: spacing.sm,
-  },
-  actionsScroll: { maxHeight: 44, marginBottom: spacing.sm },
-  actionsRow: { flexDirection: "row", gap: 8, paddingRight: spacing.lg },
   title: { fontSize: 22, fontWeight: "800", color: colors.onSurface, letterSpacing: 0.5 },
   statusRow: {
     flexDirection: "row",
