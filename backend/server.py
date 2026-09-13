@@ -4253,8 +4253,10 @@ async def build_grid_plan(symbol: str, cfg: Config) -> Optional[dict[str, Any]]:
     leg (from the FVG's bottom back up toward the swing high that preceded
     it), a modest and more achievable level, shared by every cell in this
     grid. Long-only, matching spot (no shorts)."""
-    candles = await exchange.get_klines(symbol, cfg.grid_timeframe)
+    tf = cfg.grid_timeframe
+    candles = await exchange.get_klines(symbol, tf)
     if len(candles) < 60:
+        await log_reject(symbol, tf, "grid", "dati insufficienti")
         return None
     closes = [c[2] for c in candles]
     highs = [c[3] for c in candles]
@@ -4263,17 +4265,21 @@ async def build_grid_plan(symbol: str, cfg: Config) -> Optional[dict[str, Any]]:
     htf = _higher_tf(cfg.grid_timeframe)
     hcandles = await exchange.get_klines(symbol, htf)
     if len(hcandles) < 20:
+        await log_reject(symbol, tf, "grid", "dati insufficienti (timeframe superiore)")
         return None
     if detect_market_structure(hcandles, cfg.pivot_window) != "up":
+        await log_reject(symbol, tf, "grid", "trend non rialzista")
         return None  # long-only: needs a genuinely confirmed uptrend
 
     atr = atr_wilder(highs, lows, closes, cfg.grid_atr_period)
     if not atr or atr <= 0:
+        await log_reject(symbol, tf, "grid", "ATR non calcolabile")
         return None
 
     fvgs = detect_all_fvgs(highs, lows, closes, cfg.fvg_lookback)
     bullish_fvgs = [f for f in fvgs if f["kind"] == "bullish"]
     if not bullish_fvgs:
+        await log_reject(symbol, tf, "grid", "nessuna FVG rialzista trovata")
         return None
     origin = max(bullish_fvgs, key=lambda f: f["gap"])  # most significant impulse
     fvg_top, fvg_bottom = origin["top"], origin["bottom"]
@@ -4284,18 +4290,21 @@ async def build_grid_plan(symbol: str, cfg: Config) -> Optional[dict[str, Any]]:
     # repeating every few seconds forever. Require genuine room relative
     # to volatility before treating this as a usable setup.
     if (fvg_top - fvg_bottom) < 0.1 * atr:
+        await log_reject(symbol, tf, "grid", "FVG troppo stretta")
         return None
 
     current = closes[-1]
     # Only relevant if price is actually retracing at/near the zone right
     # now — not still far above it, and not already broken well below it.
     if current > fvg_top * 1.02 or current < fvg_bottom * 0.97:
+        await log_reject(symbol, tf, "grid", "prezzo troppo lontano dalla zona FVG")
         return None
 
     i = origin["index"]
     lookback_start = max(0, i - 15)
     swing_high = max(highs[lookback_start:i + 1]) if i > lookback_start else fvg_top
     if swing_high <= fvg_top:
+        await log_reject(symbol, tf, "grid", "nessun impulso reale sopra la FVG")
         return None  # no real impulse leg above the gap — not a usable setup
 
     target = fvg_bottom + 0.5 * (swing_high - fvg_bottom)
@@ -4304,6 +4313,7 @@ async def build_grid_plan(symbol: str, cfg: Config) -> Optional[dict[str, Any]]:
     # fvg_top (which is exactly what produced the instant-flip fee-bleed
     # loop: buy_price == sell_price for every cell).
     if (target - fvg_top) < 0.1 * atr:
+        await log_reject(symbol, tf, "grid", "target troppo vicino al livello più alto")
         return None
 
     n = cfg.grid_num_levels
