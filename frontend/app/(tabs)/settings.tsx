@@ -312,6 +312,12 @@ export default function SettingsScreen() {
                 testID="input-rsirev-extreme"
               />
               <NumRow
+                label="Candele per il livello strutturale (stop)"
+                value={cfg.rsi_rev_structural_lookback}
+                onChange={(v) => update({ rsi_rev_structural_lookback: v })}
+                testID="input-rsirev-structural-lookback"
+              />
+              <NumRow
                 label="Stop catastrofico (×ATR)"
                 value={cfg.rsi_rev_catastrophic_atr_mult}
                 onChange={(v) => update({ rsi_rev_catastrophic_atr_mult: v })}
@@ -330,14 +336,18 @@ export default function SettingsScreen() {
                 {cfg.rsi_rev_min_extreme_candles} candele oltre soglia) con
                 divergenza confermata. Target = prezzo torna sulla propria
                 media a {cfg.rsi_period} periodi (proxy di &quot;RSI torna a
-                50&quot;). Nessuno stop stretto: quando il prezzo è già in
-                guadagno, un trailing largo ({cfg.rsi_rev_trailing_atr_mult}
-                ×ATR) protegge da un crollo improvviso senza tagliare le
-                normali oscillazioni. Lo stop catastrofico a{" "}
-                {cfg.rsi_rev_catastrophic_atr_mult}×ATR resta comunque attivo
-                come ultima rete di sicurezza. Usa l&apos;interruttore
-                &quot;Trailing stop attivo&quot; più sotto per
-                disattivare/riattivare anche questo.
+                50&quot;). Lo stop è ora legato a un livello strutturale — il
+                massimo/minimo delle ultime {cfg.rsi_rev_structural_lookback}{" "}
+                candele, il livello la cui rottura invalida davvero la tesi di
+                inversione — non più solo una distanza ATR fissa. Lo stop
+                catastrofico a {cfg.rsi_rev_catastrophic_atr_mult}×ATR resta
+                come margine di sicurezza minimo, usato solo se il livello
+                strutturale fosse troppo vicino all&apos;entrata. Quando il
+                prezzo è già in guadagno, un trailing largo (
+                {cfg.rsi_rev_trailing_atr_mult}×ATR) protegge da un crollo
+                improvviso senza tagliare le normali oscillazioni. Usa
+                l&apos;interruttore &quot;Trailing stop attivo&quot; più sotto
+                per disattivare/riattivare anche questo.
               </Text>
             </Section>
           )}
@@ -439,6 +449,12 @@ export default function SettingsScreen() {
                 onChange={(v) => update({ grid_extension_spacing_mult: v })}
                 step={0.1}
                 testID="input-grid-extension-spacing"
+              />
+              <NumRow
+                label="Numero massimo di griglie in contemporanea"
+                value={cfg.grid_max_pairs}
+                onChange={(v) => update({ grid_max_pairs: v })}
+                testID="input-grid-max-pairs"
               />
               <Text style={styles.scoreHintText}>
                 Quante celle di acquisto crea ogni griglia, distribuite dal
@@ -682,6 +698,25 @@ export default function SettingsScreen() {
               </Text>
             </Section>
           )}
+
+          <Section title="Regime di mercato condiviso">
+            <NumRow
+              label="Riduzione taglia fuori da regime rialzista (%)"
+              value={cfg.regime_risk_reduction_pct}
+              onChange={(v) => update({ regime_risk_reduction_pct: v })}
+              step={5}
+              testID="input-regime-reduction"
+            />
+            <Text style={styles.scoreHintText}>
+              Guarda il regime di BTC su 1h (lo stesso calcolo già usato da Top
+              10 Long): se non è chiaramente rialzista (fase laterale o
+              ribassista), la taglia delle nuove operazioni di Scalping, RSI
+              Reversion e RSI Rebound viene ridotta del{" "}
+              {cfg.regime_risk_reduction_pct}% — meno esposizione quando il
+              mercato è incerto, piena taglia solo quando il quadro è
+              chiaramente favorevole.
+            </Text>
+          </Section>
 
           <Section title="Trailing Stop (Scalping + Grid)">
             <ToggleRow

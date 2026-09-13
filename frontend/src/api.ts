@@ -86,6 +86,7 @@ export type Config = {
   rsi_rev_oversold: number;
   rsi_rev_min_extreme_candles: number;
   rsi_rev_catastrophic_atr_mult: number;
+  rsi_rev_structural_lookback: number;
   rsi_rev_trailing_atr_mult: number;
   scalping_max_open_positions: number;
   scalping_sl_atr_mult: number;
@@ -97,6 +98,7 @@ export type Config = {
   grid_enabled: boolean;
   grid_num_levels: number;
   grid_atr_spacing_mult: number;
+  grid_max_pairs: number;
   grid_extension_spacing_mult: number;
   top10_enabled: boolean;
   top10_universe_size: number;
@@ -135,6 +137,7 @@ export type Config = {
   wyckoff_risk_pct: number;
   wyckoff_trailing_atr_mult: number;
   wyckoff_max_open_positions: number;
+  regime_risk_reduction_pct: number;
 };
 
 export type ScanState = {

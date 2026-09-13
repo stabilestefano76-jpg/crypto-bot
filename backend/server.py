@@ -151,6 +151,7 @@ class Config(BaseModel):
     rsi_rev_oversold: float = 20.0
     rsi_rev_min_extreme_candles: int = 3  # min candles RSI must stay beyond 80/20 before reentry counts
     rsi_rev_catastrophic_atr_mult: float = 6.0  # wide safety stop, only for extreme/structural cases
+    rsi_rev_structural_lookback: int = 10  # candles used to find the recent swing high/low that now anchors the stop, with the ATR buffer above only as a minimum safety margin
     rsi_rev_trailing_atr_mult: float = 3.0  # wide trailing once in profit — only to catch a genuine sudden reversal, not to lock in small moves
     # --- Grid Bot (independent strategy: range/laterale trading) ---
     grid_enabled: bool = True
@@ -165,7 +166,7 @@ class Config(BaseModel):
     grid_num_levels: int = 4  # wide/sparse grid: few levels below the center price
     grid_atr_spacing_mult: float = 1.8  # distance between grid levels = this * ATR
     grid_range_break_atr_mult: float = 3.0  # unused since spot removed the forced emergency stop — kept only so old grid documents that still reference it don't break
-    grid_max_pairs: int = 4  # max symbols with an active grid at once
+    grid_max_pairs: int = 6  # max symbols with an active grid at once — raised from 4 given the current range-bound market phase suits Grid Bot well
     grid_replace_improvement_pct: float = 20.0  # candidate must be this much MORE lateral (lower bb_width+ema_gap) than the worst idle active grid to replace it
     grid_extension_spacing_mult: float = 2.0  # extra levels (beyond the original 4) space out this many times wider than the normal ladder spacing — spreads coverage across a larger continued decline instead of bunching up entries close together
     # --- Top 10 Long (multi-setup: pullback / breakout-retest / momentum / mean-reversion) ---
@@ -215,6 +216,8 @@ class Config(BaseModel):
     wyckoff_risk_pct: float = 5.0  # % of wallet cash used as position notional per trade
     wyckoff_trailing_atr_mult: float = 1.5
     wyckoff_max_open_positions: int = 5
+    regime_risk_reduction_pct: float = 50.0  # position size cut applied to Scalping/RSI Reversion/RSI Rebound whenever BTC's regime isn't clearly bullish (range or bearish) — trims risk during an uncertain/consolidating phase instead of sizing every trade the same
+
 
 
 
@@ -960,6 +963,9 @@ async def open_paper_position(signal: dict[str, Any]) -> Optional[PaperPosition]
             return None
 
     risk_usdt = max(1.0, cash * pcfg.risk_per_trade_pct / 100)
+    if strategy == "rsi_reversion":
+        cfg = await get_config()
+        risk_usdt *= await get_regime_size_multiplier(cfg)
     risk_per_unit = abs(signal["entry"] - signal["stop_loss"])
     if risk_per_unit <= 0:
         return None
@@ -2180,19 +2186,26 @@ async def analyze_pair_rsi_reversion(symbol: str, tf: str, cfg: Config) -> Optio
     entry = closes[-1]
     sma = sum(closes[-cfg.rsi_period:]) / cfg.rsi_period  # proxy for "RSI back to 50"
     catastrophic_buffer = cfg.rsi_rev_catastrophic_atr_mult * atr
+    lookback_n = min(cfg.rsi_rev_structural_lookback, len(closes) - 1)
 
     if side == "short":
         if sma >= entry:
             await log_reject(symbol, tf, STRAT, "nessun margine di rientro (prezzo già sulla media)")
             return None  # price already at/below its average, no reversion left to capture
         take_profit = sma
-        stop_loss = entry + catastrophic_buffer
+        # Structural stop: above the recent swing high (the level whose
+        # break genuinely invalidates the reversal thesis), with the old
+        # ATR buffer only as a minimum safety margin if that level sits
+        # implausibly close to entry.
+        structural_level = max(highs[-lookback_n:]) * 1.002
+        stop_loss = max(structural_level, entry + catastrophic_buffer)
     else:
         if sma <= entry:
             await log_reject(symbol, tf, STRAT, "nessun margine di rientro (prezzo già sulla media)")
             return None
         take_profit = sma
-        stop_loss = entry - catastrophic_buffer
+        structural_level = min(lows[-lookback_n:]) * 0.998
+        stop_loss = min(structural_level, entry - catastrophic_buffer)
 
     risk = abs(entry - stop_loss)
     reward = abs(take_profit - entry)
@@ -3841,6 +3854,49 @@ async def is_volume_stable(symbol: str, cfg: Config) -> bool:
     return all((c[5] * c[2]) >= cfg.min_24h_volume_usdt for c in recent)
 
 
+_shared_regime_cache: dict[str, Any] = {"regime": None, "at": 0.0}
+
+
+async def get_shared_market_regime(cfg: Config) -> str:
+    """BTC's regime (bullish/range/bearish) on 1h — shared across Scalping,
+    RSI Reversion and RSI Rebound so position sizing can be trimmed during
+    an uncertain/consolidating phase, not just an outright downtrend.
+    Reuses the same trend-score computation Top10 already relies on.
+    Cached for 5 minutes so every position-open across every strategy
+    doesn't each trigger a fresh BTC candle fetch."""
+    now = time.time()
+    if _shared_regime_cache["regime"] is not None and (now - _shared_regime_cache["at"]) < 300:
+        return _shared_regime_cache["regime"]
+    regime = "range"
+    try:
+        universe = await get_top10_universe(cfg)
+        btc_symbol = next((s for s in universe if s.startswith("BTC")), None)
+        if btc_symbol:
+            trend_score, _ = await compute_top10_trend_score(btc_symbol, cfg)
+            if trend_score >= 65:
+                regime = "bullish"
+            elif trend_score < 40:
+                regime = "bearish"
+            else:
+                regime = "range"
+    except Exception:  # noqa: BLE001
+        regime = "range"  # fail safe to cautious sizing rather than crash
+    _shared_regime_cache["regime"] = regime
+    _shared_regime_cache["at"] = now
+    return regime
+
+
+async def get_regime_size_multiplier(cfg: Config) -> float:
+    """1.0 in a clearly bullish regime; reduced (by
+    `regime_risk_reduction_pct`) otherwise — trims position size during a
+    consolidating or bearish phase instead of sizing every trade the same
+    regardless of how uncertain conditions currently are."""
+    regime = await get_shared_market_regime(cfg)
+    if regime == "bullish":
+        return 1.0
+    return max(0.0, 1.0 - cfg.regime_risk_reduction_pct / 100)
+
+
 async def check_scalping_invalidation(pos: dict[str, Any], cfg: Config) -> bool:
     """Invalidation check (additive, Scalping Bot only): closes a trade EARLY,
     before SL/TP, if the reasons that generated the signal no longer hold —
@@ -3912,7 +3968,7 @@ async def open_scalping_position(doc: dict[str, Any], cfg: Config) -> None:
     if open_count >= cfg.scalping_max_open_positions:
         return  # cap on concurrent Scalping trades — prevents a correlated pile-up
 
-    notional = cash * SCALPING_WALLET_RISK_PCT
+    notional = cash * SCALPING_WALLET_RISK_PCT * await get_regime_size_multiplier(cfg)
     if notional < 1.0:
         notional = min(cash, 1.0)
 
@@ -5568,7 +5624,7 @@ async def open_rsi_rebound_position(symbol: str, signal: dict[str, Any], cfg: Co
     if cash <= 1.0:
         return
     entry = signal["entry"]
-    notional = min(cash * cfg.rsi_rebound_risk_pct / 100, cash)
+    notional = min(cash * cfg.rsi_rebound_risk_pct / 100 * await get_regime_size_multiplier(cfg), cash)
     if notional < 1.0:
         return
     quantity = notional / entry
