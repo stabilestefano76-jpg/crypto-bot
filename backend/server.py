@@ -3621,6 +3621,11 @@ async def run_scalping_scan() -> dict[str, Any]:
                 continue
             if result["side"] == "short" and structure == "up":
                 continue
+        # Spot mode restriction: no shorts (spot cannot short natively) —
+        # same rule the traditional 3 strategies already enforce.
+        pcfg = await get_paper_config()
+        if pcfg.trading_mode == "spot" and result["side"] == "short":
+            continue
         # Use the freshest price available for the fill — NOT the last closed
         # candle's close, which can be up to a full timeframe old (5 min) and
         # was letting positions open already past their own tight SL/TP: (1)
