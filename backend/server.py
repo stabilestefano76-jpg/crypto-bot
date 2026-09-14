@@ -3838,7 +3838,7 @@ async def scalping_portfolio() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 SCALPING_SL_PCT = 0.004   # fallback only, used when ATR is unavailable (0 or missing)
 SCALPING_TP_PCT = 0.014   # fallback only, used when ATR is unavailable (0 or missing)
-SCALPING_WALLET_RISK_PCT = 0.05  # % of scalping cash used per trade (was 0.20 — brought in line with the 1-2% industry norm, adapted for an already-isolated scalping sub-wallet)
+SCALPING_WALLET_RISK_PCT = 0.08  # % of scalping cash used per trade — raised from 0.05: at ATR-based targets this small, the round-trip fee was eating most of the gross profit on a winning trade, so bigger absolute size helps even though the fee-to-target RATIO itself is unchanged by size (see the min-edge-over-fees check below, which addresses the ratio directly)
 SCALPING_EXCLUDED_STABLE_BASES = {"USDC", "USDT", "EURC", "DAI", "BUSD", "TUSD", "FDUSD"}  # stablecoin-vs-stablecoin pairs move too little for fees to ever be worth it on a fast scalp
 SCALPING_FEE_PCT = 0.001  # 0.10% Bybit spot fee per side (open + close = 0.20% round trip)
 
@@ -3998,6 +3998,22 @@ async def open_scalping_position(doc: dict[str, Any], cfg: Config) -> None:
     else:
         stop_loss = fill_price * (1 + SCALPING_SL_PCT)
         take_profit = fill_price * (1 - SCALPING_TP_PCT)
+
+    # Minimum edge over fees: at these small ATR-based targets, the fixed
+    # round-trip fee could swallow most or all of a winning trade's gross
+    # profit even when the read was correct. Require the expected gross
+    # profit at target to clear the round-trip fee by a healthy multiple
+    # before bothering to open — otherwise skip it outright rather than
+    # taking a trade with no real edge left after costs.
+    MIN_EDGE_OVER_FEES_MULT = 3.0
+    round_trip_fee = notional * SCALPING_FEE_PCT * 2
+    expected_gross_profit = abs(take_profit - fill_price) * quantity
+    if expected_gross_profit < round_trip_fee * MIN_EDGE_OVER_FEES_MULT:
+        await log_reject(
+            doc["symbol"], cfg.scalping_timeframe, "scalping",
+            "margine atteso troppo vicino alle commissioni",
+        )
+        return
 
     # Debit the cash atomically (an $inc, not a computed $set — immune to any
     # concurrent change to "cash" no matter the timing), guarded on the reset
