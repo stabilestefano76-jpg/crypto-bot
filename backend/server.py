@@ -2958,15 +2958,20 @@ async def entry_timing_log(limit: int = 300) -> dict[str, Any]:
 
 
 @api.get("/strategy-debug/log")
-async def strategy_debug_log(limit: int = 1000, minutes: int = 180) -> dict[str, Any]:
+async def strategy_debug_log(
+    limit: int = 1000, minutes: int = 180, symbol: Optional[str] = None
+) -> dict[str, Any]:
     """Bottleneck analysis for the 3 traditional strategies: which specific
     check rejects the most candidates, broken down per strategy. Looks at
     the last `minutes` of scans (default 3h) so it reflects current market
-    conditions rather than the whole history."""
+    conditions rather than the whole history. Pass `symbol` (e.g. HYPEUSDT)
+    to see exactly why one specific pair was rejected across every strategy
+    that scanned it, instead of only the aggregate counts."""
     since = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
-    cursor = db.strategy_debug_log.find(
-        {"at": {"$gte": since}}, {"_id": 0}
-    ).sort("at", -1).limit(limit)
+    query: dict[str, Any] = {"at": {"$gte": since}}
+    if symbol:
+        query["symbol"] = symbol.upper()
+    cursor = db.strategy_debug_log.find(query, {"_id": 0}).sort("at", -1).limit(limit)
     logs = await cursor.to_list(length=limit)
 
     by_strategy: dict[str, dict[str, int]] = {}
@@ -2981,12 +2986,16 @@ async def strategy_debug_log(limit: int = 1000, minutes: int = 180) -> dict[str,
         for strat, reasons in by_strategy.items()
     }
 
-    return {
+    result: dict[str, Any] = {
         "window_minutes": minutes,
         "count": len(logs),
         "reason_counts_by_strategy": by_strategy,
         "bottleneck_by_strategy": bottleneck_by_strategy,
     }
+    if symbol:
+        result["symbol"] = symbol.upper()
+        result["entries"] = logs  # raw, timestamped entries for this one pair
+    return result
 
 
 @api.post("/paper/execute/{signal_id}")
