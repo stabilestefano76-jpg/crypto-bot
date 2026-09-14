@@ -1791,6 +1791,9 @@ async def analyze_pair_counter(symbol: str, tf: str, cfg: Config) -> Optional[Si
         return None
     trend = structure  # 'up' or 'down'
     side = "short" if trend == "up" else "long"  # AGAINST the trend
+    if side == "short" and (await get_paper_config()).trading_mode == "spot":
+        await log_reject(symbol, tf, STRAT, "short non eseguibile in modalità spot")
+        return None
 
     # Step 1: consolidation box = the last K candles (tightness context).
     k = cfg.consolidation_min_candles
@@ -2006,6 +2009,9 @@ async def analyze_pair_fvg_reversal(symbol: str, tf: str, cfg: Config) -> Option
         return None
     trend = structure  # 'up' or 'down'
     entry_side = "short" if trend == "up" else "long"  # AGAINST the trend
+    if entry_side == "short" and (await get_paper_config()).trading_mode == "spot":
+        await log_reject(symbol, tf, STRAT, "short non eseguibile in modalità spot")
+        return None
 
     atr = atr_wilder(highs, lows, closes, cfg.atr_period)
     if not atr or atr <= 0:
@@ -2165,6 +2171,9 @@ async def analyze_pair_rsi_reversion(symbol: str, tf: str, cfg: Config) -> Optio
         side = "long"
     if side is None:
         await log_reject(symbol, tf, STRAT, "nessun rientro da zona estrema")
+        return None
+    if side == "short" and (await get_paper_config()).trading_mode == "spot":
+        await log_reject(symbol, tf, STRAT, "short non eseguibile in modalità spot")
         return None
 
     # Filter 2: genuine RSI/price divergence, not just a brief dip back inside
