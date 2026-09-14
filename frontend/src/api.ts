@@ -71,6 +71,9 @@ export type Config = {
   tp1_pct: number;
   post_tp1_advance_pct: number;
   exhaustion_min_score: number;
+  rsi_divergence_check_enabled: boolean;
+  trend_htf_check_enabled: boolean;
+  exhaustion_check_enabled: boolean;
   exhaustion_lookback: number;
   trend_structure_strict: boolean;
   trailing_enabled: boolean;
@@ -740,67 +743,16 @@ export const wyckoffApi = {
 };
 
 // ---------------------------------------------------------------------------
-// RSI Reversion — one of the 3 traditional strategies, but with its own
-// isolated wallet already supported backend-side (STRATEGY_WALLET_NAMES).
-// Uses the generic /strategy/{name}/... endpoints shared with Rev Pre-FVG
-// and FVG Reversal, scoped to "rsi_reversion".
+// RSI Reversion — one of the 3 traditional strategies. Its isolated wallet
+// was already fully supported by the generic strategyWalletApi above (built
+// in an earlier session) — this is just a thin, fixed-strategy convenience
+// wrapper for the dedicated RSI Reversion screen, not new infrastructure.
 // ---------------------------------------------------------------------------
-const RSI_REVERSION_STRATEGY = "rsi_reversion";
-
-export type StrategyPosition = {
-  id: string;
-  signal_id?: string;
-  symbol: string;
-  side: "long" | "short";
-  entry: number;
-  stop_loss: number;
-  take_profit: number;
-  quantity: number;
-  timeframe?: string;
-  status: string;
-  opened_at: string;
-  current_price?: number;
-  unrealized_pnl?: number;
-  unrealized_pnl_pct?: number;
-  close_price?: number;
-  close_reason?: string;
-  outcome?: string;
-  pnl_usdt?: number;
-  closed_at?: string;
-};
-
-export type StrategyPortfolio = {
-  strategy: string;
-  wallet_type: "isolated" | "shared";
-  cash: number;
-  equity: number;
-  unrealized_pnl: number;
-  realized_pnl: number;
-  open_positions: StrategyPosition[];
-  closed_trades: StrategyPosition[];
-  open_count: number;
-  closed_count: number;
-  win_rate: number;
-};
+const RSI_REVERSION_STRATEGY: StrategyName = "rsi_reversion";
 
 export const rsiReversionApi = {
-  portfolio: () =>
-    req<StrategyPortfolio>(`/strategy/${RSI_REVERSION_STRATEGY}/portfolio`),
-  // "Deposit" = move funds from the shared main wallet into this strategy's
-  // own isolated wallet (creating it on first use).
-  deposit: (amount: number) =>
-    req<{ ok: boolean; strategy: string; cash: number; main_cash: number }>(
-      `/strategy-wallets/${RSI_REVERSION_STRATEGY}/allocate`,
-      { method: "POST", body: JSON.stringify({ amount }) }
-    ),
-  withdraw: (amount: number) =>
-    req<{ ok: boolean; strategy: string; cash: number; main_cash: number }>(
-      `/strategy-wallets/${RSI_REVERSION_STRATEGY}/withdraw`,
-      { method: "POST", body: JSON.stringify({ amount }) }
-    ),
-  reset: () =>
-    req<{ ok: boolean; strategy: string }>(
-      `/strategy/${RSI_REVERSION_STRATEGY}/reset`,
-      { method: "POST" }
-    ),
+  portfolio: () => strategyApi.portfolio(RSI_REVERSION_STRATEGY),
+  deposit: (amount: number) => strategyWalletApi.allocate(RSI_REVERSION_STRATEGY, amount),
+  withdraw: (amount: number) => strategyWalletApi.withdraw(RSI_REVERSION_STRATEGY, amount),
+  reset: () => strategyApi.reset(RSI_REVERSION_STRATEGY),
 };

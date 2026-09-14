@@ -139,6 +139,9 @@ class Config(BaseModel):
     # used by "scoring" or "impulse_fvg". ---
     exhaustion_lookback: int = 20  # was 10 — too small a window left condition #3 (needs 2 confirmed RSI pivots) almost no room to ever find them
     exhaustion_min_score: float = 1.0  # was 2.0 — lowered so it stops being an extra hard gate; raise back to 2.0 (or more) in Settings any time
+    rsi_divergence_check_enabled: bool = True  # Rev Pre-FVG, FVG Reversal, RSI Reversion: require RSI/price divergence coherent with the trade direction
+    trend_htf_check_enabled: bool = True  # Rev Pre-FVG, FVG Reversal: require a genuine (non-range) trend on the higher timeframe before considering a setup
+    exhaustion_check_enabled: bool = True  # Rev Pre-FVG, FVG Reversal: require the trend-exhaustion score to clear exhaustion_min_score
     trend_structure_strict: bool = False  # False = only ONE of higher-high/higher-low (or the "down" mirror) is needed to call a trend, not both — set True in Settings to go back to the strict textbook definition
     trailing_enabled: bool = True  # shared by Scalping and Grid: once price reaches the original target, arm a trailing stop instead of closing immediately, to let a strong run continue
     trailing_atr_mult: float = 0.5  # how far (in ATR multiples) price may pull back from its post-target peak before the trailing stop closes the trade — was 1.2 (and briefly duplicated as a dead 1.0 default elsewhere in this same class), which gave back up to 60% of a Scalping trade's target profit before locking anything in
@@ -1786,7 +1789,7 @@ async def analyze_pair_counter(symbol: str, tf: str, cfg: Config) -> Optional[Si
         await log_reject(symbol, tf, STRAT, "dati insufficienti sul timeframe alto")
         return None
     structure = detect_market_structure(hcandles, cfg.pivot_window, strict=cfg.trend_structure_strict)
-    if structure == "range":
+    if cfg.trend_htf_check_enabled and structure == "range":
         await log_reject(symbol, tf, STRAT, "trend non definito (mercato laterale)")
         return None
     trend = structure  # 'up' or 'down'
@@ -1812,7 +1815,7 @@ async def analyze_pair_counter(symbol: str, tf: str, cfg: Config) -> Optional[Si
     exhaustion = detect_trend_exhaustion(
         opens, highs, lows, closes, vols, rsis, trend, cfg
     )
-    if not exhaustion["confirmed"]:
+    if cfg.exhaustion_check_enabled and not exhaustion["confirmed"]:
         await log_reject(symbol, tf, STRAT, "esaurimento trend non confermato")
         return None
 
@@ -1898,7 +1901,9 @@ async def analyze_pair_counter(symbol: str, tf: str, cfg: Config) -> Optional[Si
         return None
     # (c) divergence coherent with the trade direction
     div = detect_rsi_divergence(closes, rsis, cfg.pivot_window)
-    if (side == "long" and div != "bullish") or (side == "short" and div != "bearish"):
+    if cfg.rsi_divergence_check_enabled and (
+        (side == "long" and div != "bullish") or (side == "short" and div != "bearish")
+    ):
         await log_reject(symbol, tf, STRAT, "divergenza RSI non coerente")
         return None
 
@@ -2004,7 +2009,7 @@ async def analyze_pair_fvg_reversal(symbol: str, tf: str, cfg: Config) -> Option
         return None
 
     structure = detect_market_structure(hcandles, cfg.pivot_window, strict=cfg.trend_structure_strict)
-    if structure == "range":
+    if cfg.trend_htf_check_enabled and structure == "range":
         await log_reject(symbol, tf, STRAT, "trend non definito (mercato laterale)")
         return None
     trend = structure  # 'up' or 'down'
@@ -2032,7 +2037,7 @@ async def analyze_pair_fvg_reversal(symbol: str, tf: str, cfg: Config) -> Option
     exhaustion = detect_trend_exhaustion(
         opens, highs, lows, closes, [c[5] for c in candles], rsis, trend, cfg
     )
-    if not exhaustion["confirmed"]:
+    if cfg.exhaustion_check_enabled and not exhaustion["confirmed"]:
         await log_reject(symbol, tf, STRAT, "esaurimento trend non confermato")
         return None
 
@@ -2061,7 +2066,9 @@ async def analyze_pair_fvg_reversal(symbol: str, tf: str, cfg: Config) -> Option
         await log_reject(symbol, tf, STRAT, "RSI non in inversione di momentum")
         return None
     div = detect_rsi_divergence(closes, rsis, cfg.pivot_window)
-    if (entry_side == "long" and div != "bullish") or (entry_side == "short" and div != "bearish"):
+    if cfg.rsi_divergence_check_enabled and (
+        (entry_side == "long" and div != "bullish") or (entry_side == "short" and div != "bearish")
+    ):
         await log_reject(symbol, tf, STRAT, "divergenza RSI non coerente")
         return None
 
@@ -2179,10 +2186,10 @@ async def analyze_pair_rsi_reversion(symbol: str, tf: str, cfg: Config) -> Optio
     # Filter 2: genuine RSI/price divergence, not just a brief dip back inside
     # the bands (reuses the same detector as the other strategies).
     divergence = detect_rsi_divergence(closes, rsis, cfg.pivot_window)
-    if side == "short" and divergence != "bearish":
+    if cfg.rsi_divergence_check_enabled and side == "short" and divergence != "bearish":
         await log_reject(symbol, tf, STRAT, "divergenza RSI non coerente")
         return None
-    if side == "long" and divergence != "bullish":
+    if cfg.rsi_divergence_check_enabled and side == "long" and divergence != "bullish":
         await log_reject(symbol, tf, STRAT, "divergenza RSI non coerente")
         return None
 

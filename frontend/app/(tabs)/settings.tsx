@@ -352,7 +352,7 @@ export default function SettingsScreen() {
             </Section>
           )}
 
-          {(stratOn("counter_trend") || stratOn("fvg_reversal")) && (
+          {(stratOn("counter_trend") || stratOn("fvg_reversal") || stratOn("rsi_reversion")) && (
             <Section title="Rilevamento Trend & Esaurimento (condiviso)">
               <ToggleRow
                 label="Rilevamento trend rigido"
@@ -373,6 +373,24 @@ export default function SettingsScreen() {
                 onChange={(v) => update({ exhaustion_lookback: v })}
                 testID="input-exhaustion-lookback"
               />
+              <ToggleRow
+                label="Controllo trend timeframe superiore attivo"
+                value={cfg.trend_htf_check_enabled}
+                onChange={(v) => update({ trend_htf_check_enabled: v })}
+                testID="toggle-trend-htf-check"
+              />
+              <ToggleRow
+                label="Controllo esaurimento trend attivo"
+                value={cfg.exhaustion_check_enabled}
+                onChange={(v) => update({ exhaustion_check_enabled: v })}
+                testID="toggle-exhaustion-check"
+              />
+              <ToggleRow
+                label="Ricerca divergenza RSI attiva"
+                value={cfg.rsi_divergence_check_enabled}
+                onChange={(v) => update({ rsi_divergence_check_enabled: v })}
+                testID="toggle-rsi-divergence-check"
+              />
               <Text style={styles.scoreHintText}>
                 Usati sia da Rev Pre-FVG che da FVG Reversal. Rigido spento
                 (default): basta massimi crescenti OPPURE minimi crescenti
@@ -385,8 +403,14 @@ export default function SettingsScreen() {
                 candele indietro vengono analizzate per queste 4 condizioni —
                 default 20 (una finestra troppo piccola lasciava pochissimo
                 spazio a trovare i due picchi RSI richiesti dalla condizione
-                RSI). Il Grid Bot non è toccato da questi parametri, resta
-                sempre rigoroso.
+                RSI). I tre interruttori sopra disattivano completamente
+                ciascun controllo (invece di solo allentarlo): trend
+                timeframe superiore (usato anche da RSI Reversion solo per
+                la divergenza, non per il trend), esaurimento trend, e
+                divergenza RSI — utile per capire quanto ciascun filtro
+                stia davvero limitando i segnali. Il Grid Bot non è
+                toccato da nessuno di questi parametri, resta sempre
+                rigoroso.
               </Text>
             </Section>
           )}
