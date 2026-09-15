@@ -202,6 +202,8 @@ export type PaperTrade = {
   opened_at: string;
   closed_at: string;
   strategy?: string;
+  stop_loss?: number;
+  take_profit?: number;
 };
 
 export type Portfolio = {

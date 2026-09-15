@@ -320,6 +320,8 @@ class PaperTrade(BaseModel):
     opened_at: str
     closed_at: str
     strategy: str = "counter_trend"
+    stop_loss: Optional[float] = None  # the ORIGINAL stop set on open — kept for the closed-trade record so screens don't have to fabricate a placeholder
+    take_profit: Optional[float] = None  # the ORIGINAL target set on open (may differ from the actual exit price if closed some other way, e.g. trailing)
 
 
 class ExchangeConnectRequest(BaseModel):
@@ -1061,6 +1063,8 @@ async def close_paper_position(pos: dict[str, Any], exit_price: float, outcome: 
         opened_at=pos["opened_at"],
         closed_at=datetime.now(timezone.utc).isoformat(),
         strategy=strategy,
+        stop_loss=pos.get("current_stop") or pos.get("stop_loss"),
+        take_profit=pos.get("tp2") or pos.get("tp1") or pos.get("take_profit"),
     )
     await db.paper_trades.insert_one(trade.model_dump())
     await db.paper_positions.delete_one({"id": pos["id"]})
@@ -1306,6 +1310,8 @@ async def _close_fraction(pos: dict[str, Any], price: float, frac: float,
         pnl_usdt=round(pnl, 2), pnl_pct=round(pnl_pct, 2), outcome=outcome,
         opened_at=pos["opened_at"], closed_at=datetime.now(timezone.utc).isoformat(),
         strategy=strategy,
+        stop_loss=pos.get("current_stop") or pos.get("stop_loss"),
+        take_profit=pos.get("tp2") or pos.get("tp1") or pos.get("take_profit"),
     )
     await db.paper_trades.insert_one(trade.model_dump())
     if pcfg.trading_mode == "spot" and pos["side"] == "long":

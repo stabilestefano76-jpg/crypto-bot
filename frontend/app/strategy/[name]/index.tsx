@@ -383,8 +383,11 @@ export default function StrategyScreen() {
                     timeframe: "",
                     side: t.side,
                     entry: t.entry,
-                    stop_loss: t.entry,
-                    take_profit: t.exit,
+                    // Real values now that the backend persists them on close —
+                    // fall back to entry/exit only for trades closed before
+                    // this fix shipped, so old history doesn't show "undefined".
+                    stop_loss: t.stop_loss ?? t.entry,
+                    take_profit: t.take_profit ?? t.exit,
                     quantity: t.quantity,
                     risk_usdt: 0,
                     opened_at: t.opened_at,
