@@ -152,8 +152,9 @@ class Config(BaseModel):
     rsi_rev_overbought: float = 80.0
     rsi_rev_oversold: float = 20.0
     rsi_rev_min_extreme_candles: int = 3  # min candles RSI must stay beyond 80/20 before reentry counts
-    rsi_rev_catastrophic_atr_mult: float = 6.0  # wide safety stop, only for extreme/structural cases
+    rsi_rev_catastrophic_atr_mult: float = 3.0  # wide safety stop, only for extreme/structural cases — lowered from 5-6: combined with the new min R:R gate below, an overly wide floor here was rejecting/mismatching too many otherwise-valid setups
     rsi_rev_structural_lookback: int = 10  # candles used to find the recent swing high/low that now anchors the stop, with the ATR buffer above only as a minimum safety margin
+    rsi_rev_min_rr_ratio: float = 3.0  # minimum natural reward:risk (target-to-mean distance vs stop distance) required to take the trade — rejects the setup outright rather than artificially tightening the stop to force a ratio the structure doesn't support
     rsi_rev_trailing_atr_mult: float = 3.0  # wide trailing once in profit — only to catch a genuine sudden reversal, not to lock in small moves
     # --- Grid Bot (independent strategy: range/laterale trading) ---
     grid_enabled: bool = True
@@ -2226,6 +2227,9 @@ async def analyze_pair_rsi_reversion(symbol: str, tf: str, cfg: Config) -> Optio
     reward = abs(take_profit - entry)
     if risk <= 0 or reward <= 0:
         await log_reject(symbol, tf, STRAT, "target/stop non validi")
+        return None
+    if (reward / risk) < cfg.rsi_rev_min_rr_ratio:
+        await log_reject(symbol, tf, STRAT, "R:R naturale insufficiente (sotto 1:3)")
         return None
 
     vol_ratio = volume_spike_ratio([c[5] for c in candles], cfg.volume_ma_period)

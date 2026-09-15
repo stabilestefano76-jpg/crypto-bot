@@ -325,6 +325,13 @@ export default function SettingsScreen() {
                 testID="input-rsirev-atr"
               />
               <NumRow
+                label="R:R minimo richiesto"
+                value={cfg.rsi_rev_min_rr_ratio}
+                onChange={(v) => update({ rsi_rev_min_rr_ratio: v })}
+                step={0.5}
+                testID="input-rsirev-min-rr"
+              />
+              <NumRow
                 label="Trailing profitto (×ATR)"
                 value={cfg.rsi_rev_trailing_atr_mult}
                 onChange={(v) => update({ rsi_rev_trailing_atr_mult: v })}
@@ -336,13 +343,18 @@ export default function SettingsScreen() {
                 {cfg.rsi_rev_min_extreme_candles} candele oltre soglia) con
                 divergenza confermata. Target = prezzo torna sulla propria
                 media a {cfg.rsi_period} periodi (proxy di &quot;RSI torna a
-                50&quot;). Lo stop è ora legato a un livello strutturale — il
+                50&quot;). Lo stop è legato a un livello strutturale — il
                 massimo/minimo delle ultime {cfg.rsi_rev_structural_lookback}{" "}
                 candele, il livello la cui rottura invalida davvero la tesi di
                 inversione — non più solo una distanza ATR fissa. Lo stop
                 catastrofico a {cfg.rsi_rev_catastrophic_atr_mult}×ATR resta
                 come margine di sicurezza minimo, usato solo se il livello
-                strutturale fosse troppo vicino all&apos;entrata. Quando il
+                strutturale fosse troppo vicino all&apos;entrata. Prima di
+                aprire, il rapporto naturale tra guadagno atteso (distanza dal
+                target) e rischio (distanza dallo stop) deve raggiungere
+                almeno {cfg.rsi_rev_min_rr_ratio}:1 — altrimenti l&apos;
+                operazione viene scartata invece di forzare uno stop più
+                stretto di quanto la struttura giustifichi. Quando il
                 prezzo è già in guadagno, un trailing largo (
                 {cfg.rsi_rev_trailing_atr_mult}×ATR) protegge da un crollo
                 improvviso senza tagliare le normali oscillazioni. Usa
