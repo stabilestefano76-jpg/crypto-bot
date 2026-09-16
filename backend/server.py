@@ -204,7 +204,6 @@ class Config(BaseModel):
     rsi_rebound_tp_atr_mult: float = 2.0  # initial target — also the point where trailing activates
     rsi_rebound_trailing_atr_mult: float = 1.2
     rsi_rebound_max_open_positions: int = 5
-    rsi_rebound_cooldown_minutes: int = 60  # pause on a symbol after ANY close (win or loss) — without this, the same stale 1h candle can re-trigger an identical entry every scan cycle the instant the previous position closes
 
     # --- Wyckoff Spring: full classic accumulation sequence — Range, then
     # Spring (false breakdown on light volume), Test (retest on even lighter
@@ -5620,10 +5619,10 @@ def detect_rsi_rebound_signal(candles: list[list[float]], cfg: Config) -> tuple[
     entry = closes[-1]
     if entry <= stop:
         return None, "stop non valido rispetto all'entrata"
-    return {"entry": entry, "stop": stop, "rsi": rsis[-1]}, "ok"
+    return {"entry": entry, "stop": stop, "rsi": rsis[-1], "candle_t": candles[-1][0]}, "ok"
 
 
-_rsi_rebound_cooldown: dict[str, float] = {}
+_rsi_rebound_last_candle: dict[str, float] = {}  # per-symbol: timestamp of the last candle a position was actually attempted on — blocks retrying the SAME candle every scan cycle, while still allowing a genuinely new candle to trigger a fresh attempt even minutes later
 
 
 async def run_rsi_rebound_scan() -> None:
@@ -5676,10 +5675,6 @@ async def run_rsi_rebound_scan() -> None:
             break
         if await db.rsi_rebound_positions.find_one({"symbol": symbol, "status": "open"}):
             continue
-        last_close = _rsi_rebound_cooldown.get(symbol)
-        if last_close and (time.time() - last_close) < cfg.rsi_rebound_cooldown_minutes * 60:
-            await log_reject(symbol, cfg.rsi_rebound_timeframe, "rsi_rebound", "in raffreddamento dopo la chiusura precedente")
-            continue
         candles = await exchange.get_klines(symbol, cfg.rsi_rebound_timeframe)
         if len(candles) < cfg.rsi_rebound_period + cfg.rsi_rebound_lookback + 2:
             await log_reject(symbol, cfg.rsi_rebound_timeframe, "rsi_rebound", "dati insufficienti")
@@ -5688,6 +5683,10 @@ async def run_rsi_rebound_scan() -> None:
         if not signal:
             await log_reject(symbol, cfg.rsi_rebound_timeframe, "rsi_rebound", reason)
             continue
+        if _rsi_rebound_last_candle.get(symbol) == signal["candle_t"]:
+            await log_reject(symbol, cfg.rsi_rebound_timeframe, "rsi_rebound", "stessa candela già tentata")
+            continue
+        _rsi_rebound_last_candle[symbol] = signal["candle_t"]
         await open_rsi_rebound_position(symbol, signal, cfg)
         open_count += 1
 
@@ -5797,7 +5796,6 @@ async def monitor_rsi_rebound_positions() -> None:
                 "closed_at": datetime.now(timezone.utc).isoformat(),
             }},
         )
-        _rsi_rebound_cooldown[p["symbol"]] = time.time()
 
 
 class RsiReboundTransferRequest(BaseModel):
