@@ -204,6 +204,8 @@ class Config(BaseModel):
     rsi_rebound_tp_atr_mult: float = 2.0  # initial target — also the point where trailing activates
     rsi_rebound_trailing_atr_mult: float = 1.2
     rsi_rebound_max_open_positions: int = 5
+    rsi_rebound_cooldown_minutes: int = 60  # pause on a symbol after ANY close (win or loss) — without this, the same stale 1h candle can re-trigger an identical entry every scan cycle the instant the previous position closes
+
     # --- Wyckoff Spring: full classic accumulation sequence — Range, then
     # Spring (false breakdown on light volume), Test (retest on even lighter
     # volume), Sign of Strength (breakout above range resistance on rising
@@ -5621,6 +5623,9 @@ def detect_rsi_rebound_signal(candles: list[list[float]], cfg: Config) -> tuple[
     return {"entry": entry, "stop": stop, "rsi": rsis[-1]}, "ok"
 
 
+_rsi_rebound_cooldown: dict[str, float] = {}
+
+
 async def run_rsi_rebound_scan() -> None:
     cfg = await get_config()
     if not cfg.rsi_rebound_enabled:
@@ -5671,6 +5676,10 @@ async def run_rsi_rebound_scan() -> None:
             break
         if await db.rsi_rebound_positions.find_one({"symbol": symbol, "status": "open"}):
             continue
+        last_close = _rsi_rebound_cooldown.get(symbol)
+        if last_close and (time.time() - last_close) < cfg.rsi_rebound_cooldown_minutes * 60:
+            await log_reject(symbol, cfg.rsi_rebound_timeframe, "rsi_rebound", "in raffreddamento dopo la chiusura precedente")
+            continue
         candles = await exchange.get_klines(symbol, cfg.rsi_rebound_timeframe)
         if len(candles) < cfg.rsi_rebound_period + cfg.rsi_rebound_lookback + 2:
             await log_reject(symbol, cfg.rsi_rebound_timeframe, "rsi_rebound", "dati insufficienti")
@@ -5689,10 +5698,21 @@ async def open_rsi_rebound_position(symbol: str, signal: dict[str, Any], cfg: Co
     if cash <= 1.0:
         return
     entry = signal["entry"]
+    # The signal is built from the last CLOSED candle — on a 1h timeframe,
+    # real price can already have moved well past the stop by the time we
+    # get here. Check the live price before committing: if it's already
+    # through the stop, the setup is stale and would just open a position
+    # doomed to close again within seconds (this is what caused the
+    # rapid-fire repeated entries on the same symbol).
+    live_price = price_feed.get(symbol) or await price_feed.price_or_rest(symbol)
+    if live_price and live_price <= signal["stop"]:
+        await log_reject(symbol, cfg.rsi_rebound_timeframe, "rsi_rebound", "prezzo già oltre lo stop, segnale scaduto")
+        return
+    fill_price = live_price or entry  # real execution price when available
     notional = min(cash * cfg.rsi_rebound_risk_pct / 100 * await get_regime_size_multiplier(cfg), cash)
     if notional < 1.0:
         return
-    quantity = notional / entry
+    quantity = notional / fill_price
 
     candles = await exchange.get_klines(symbol, cfg.rsi_rebound_timeframe)
     highs = [c[3] for c in candles]
@@ -5705,9 +5725,9 @@ async def open_rsi_rebound_position(symbol: str, signal: dict[str, Any], cfg: Co
         "symbol": symbol,
         "side": "long",
         "entry": entry,
-        "fill_price": entry,
+        "fill_price": fill_price,
         "stop_loss": signal["stop"],
-        "take_profit": entry + cfg.rsi_rebound_tp_atr_mult * atr,
+        "take_profit": fill_price + cfg.rsi_rebound_tp_atr_mult * atr,
         "quantity": quantity,
         "notional": notional,
         "atr": atr,
@@ -5760,7 +5780,7 @@ async def monitor_rsi_rebound_positions() -> None:
             if not hit:
                 continue
 
-        gross_pnl = (cur - p["entry"]) * p["quantity"]
+        gross_pnl = (cur - p.get("fill_price", p["entry"])) * p["quantity"]
         exit_notional = cur * p["quantity"]
         fees = (p["notional"] + exit_notional) * RSI_REBOUND_FEE_PCT
         pnl = gross_pnl - fees
@@ -5777,6 +5797,7 @@ async def monitor_rsi_rebound_positions() -> None:
                 "closed_at": datetime.now(timezone.utc).isoformat(),
             }},
         )
+        _rsi_rebound_cooldown[p["symbol"]] = time.time()
 
 
 class RsiReboundTransferRequest(BaseModel):
