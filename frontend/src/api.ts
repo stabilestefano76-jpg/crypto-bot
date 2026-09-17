@@ -49,6 +49,9 @@ export type Signal = {
 export type Config = {
   scan_interval_minutes: number;
   timeframes: string[];
+  counter_trend_timeframes: string[];
+  fvg_reversal_timeframes: string[];
+  rsi_reversion_timeframes: string[];
   quote_filter: string;
   min_24h_volume_usdt: number;
   rsi_period: number;
@@ -101,6 +104,7 @@ export type Config = {
   excluded_pairs: string[];
   scalping_enabled: boolean;
   grid_enabled: boolean;
+  grid_timeframe: string;
   grid_num_levels: number;
   grid_atr_spacing_mult: number;
   grid_cell_target_pct: number;
@@ -111,6 +115,7 @@ export type Config = {
   top10_risk_pct: number;
   top10_min_setup_score: number;
   top10_min_rr: number;
+  top10_timeframe: string;
   top10_tp1_pct: number;
   top10_tp1_close_pct: number;
   top10_tp2_pct: number;

@@ -75,12 +75,22 @@ export default function SettingsScreen() {
     }
   };
 
-  const toggleTimeframe = (t: string) => {
+  const toggleTimeframeFor = (
+    field: "counter_trend_timeframes" | "fvg_reversal_timeframes" | "rsi_reversion_timeframes",
+    t: string
+  ) => {
     if (!cfg) return;
-    const list = cfg.timeframes.includes(t)
-      ? cfg.timeframes.filter((x) => x !== t)
-      : [...cfg.timeframes, t];
-    update({ timeframes: list });
+    const current = cfg[field];
+    const list = current.includes(t) ? current.filter((x) => x !== t) : [...current, t];
+    update({ [field]: list } as Partial<Config>);
+  };
+
+  const selectTimeframeFor = (
+    field: "grid_timeframe" | "rsi_rebound_timeframe" | "wyckoff_timeframe" | "top10_timeframe",
+    t: string
+  ) => {
+    if (!cfg) return;
+    update({ [field]: t } as Partial<Config>);
   };
 
   if (loading || !cfg || !pcfg) {
@@ -480,6 +490,21 @@ export default function SettingsScreen() {
 
           {cfg.grid_enabled && (
             <Section title="Grid Bot">
+              <Text style={styles.fieldLabel}>Timeframe</Text>
+              <View style={styles.chipsRow}>
+                {TIMEFRAMES.map((t) => (
+                  <Pressable
+                    key={t}
+                    onPress={() => selectTimeframeFor("grid_timeframe", t)}
+                    style={[styles.chip, cfg.grid_timeframe === t && styles.chipActive]}
+                    testID={`tf-select-grid-${t}`}
+                  >
+                    <Text style={[styles.chipText, cfg.grid_timeframe === t && styles.chipTextActive]}>
+                      {t}
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
               <NumRow
                 label="Numero livelli di acquisto"
                 value={cfg.grid_num_levels}
@@ -528,6 +553,21 @@ export default function SettingsScreen() {
 
           {cfg.top10_enabled && (
             <Section title="Top 10 Long">
+              <Text style={styles.fieldLabel}>Timeframe</Text>
+              <View style={styles.chipsRow}>
+                {TIMEFRAMES.map((t) => (
+                  <Pressable
+                    key={t}
+                    onPress={() => selectTimeframeFor("top10_timeframe", t)}
+                    style={[styles.chip, cfg.top10_timeframe === t && styles.chipActive]}
+                    testID={`tf-select-top10-${t}`}
+                  >
+                    <Text style={[styles.chipText, cfg.top10_timeframe === t && styles.chipTextActive]}>
+                      {t}
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
               <NumRow
                 label="Numero coppie in universo"
                 value={cfg.top10_universe_size}
@@ -626,6 +666,21 @@ export default function SettingsScreen() {
 
           {cfg.rsi_rebound_enabled && (
             <Section title="RSI Rebound">
+              <Text style={styles.fieldLabel}>Timeframe</Text>
+              <View style={styles.chipsRow}>
+                {TIMEFRAMES.map((t) => (
+                  <Pressable
+                    key={t}
+                    onPress={() => selectTimeframeFor("rsi_rebound_timeframe", t)}
+                    style={[styles.chip, cfg.rsi_rebound_timeframe === t && styles.chipActive]}
+                    testID={`tf-select-rsi-rebound-${t}`}
+                  >
+                    <Text style={[styles.chipText, cfg.rsi_rebound_timeframe === t && styles.chipTextActive]}>
+                      {t}
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
               <NumRow
                 label="Soglia ipervenduto RSI"
                 value={cfg.rsi_rebound_oversold}
@@ -700,6 +755,21 @@ export default function SettingsScreen() {
 
           {cfg.wyckoff_enabled && (
             <Section title="Wyckoff Spring">
+              <Text style={styles.fieldLabel}>Timeframe</Text>
+              <View style={styles.chipsRow}>
+                {TIMEFRAMES.map((t) => (
+                  <Pressable
+                    key={t}
+                    onPress={() => selectTimeframeFor("wyckoff_timeframe", t)}
+                    style={[styles.chip, cfg.wyckoff_timeframe === t && styles.chipActive]}
+                    testID={`tf-select-wyckoff-${t}`}
+                  >
+                    <Text style={[styles.chipText, cfg.wyckoff_timeframe === t && styles.chipTextActive]}>
+                      {t}
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
               <NumRow
                 label="Candele per il range (supporto/resistenza)"
                 value={cfg.wyckoff_range_window}
@@ -846,27 +916,77 @@ export default function SettingsScreen() {
             />
           </Section>
 
-          <Section title="Timeframes">
-            <View style={styles.chipsRow}>
-              {TIMEFRAMES.map((t) => {
-                const active = cfg.timeframes.includes(t);
-                return (
-                  <Pressable
-                    key={t}
-                    onPress={() => toggleTimeframe(t)}
-                    style={[styles.chip, active && styles.chipActive]}
-                    testID={`tf-chip-${t}`}
-                  >
-                    <Text
-                      style={[styles.chipText, active && styles.chipTextActive]}
+          {stratOn("counter_trend") && (
+            <Section title="Timeframes — Rev Pre-FVG">
+              <View style={styles.chipsRow}>
+                {TIMEFRAMES.map((t) => {
+                  const active = cfg.counter_trend_timeframes.includes(t);
+                  return (
+                    <Pressable
+                      key={t}
+                      onPress={() => toggleTimeframeFor("counter_trend_timeframes", t)}
+                      style={[styles.chip, active && styles.chipActive]}
+                      testID={`tf-chip-counter-trend-${t}`}
                     >
-                      {t}
-                    </Text>
-                  </Pressable>
-                );
-              })}
-            </View>
-          </Section>
+                      <Text style={[styles.chipText, active && styles.chipTextActive]}>
+                        {t}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+            </Section>
+          )}
+
+          {stratOn("fvg_reversal") && (
+            <Section title="Timeframes — FVG Reversal">
+              <View style={styles.chipsRow}>
+                {TIMEFRAMES.map((t) => {
+                  const active = cfg.fvg_reversal_timeframes.includes(t);
+                  return (
+                    <Pressable
+                      key={t}
+                      onPress={() => toggleTimeframeFor("fvg_reversal_timeframes", t)}
+                      style={[styles.chip, active && styles.chipActive]}
+                      testID={`tf-chip-fvg-reversal-${t}`}
+                    >
+                      <Text style={[styles.chipText, active && styles.chipTextActive]}>
+                        {t}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+            </Section>
+          )}
+
+          {stratOn("rsi_reversion") && (
+            <Section title="Timeframes — RSI Reversion">
+              <View style={styles.chipsRow}>
+                {TIMEFRAMES.map((t) => {
+                  const active = cfg.rsi_reversion_timeframes.includes(t);
+                  return (
+                    <Pressable
+                      key={t}
+                      onPress={() => toggleTimeframeFor("rsi_reversion_timeframes", t)}
+                      style={[styles.chip, active && styles.chipActive]}
+                      testID={`tf-chip-rsi-reversion-${t}`}
+                    >
+                      <Text style={[styles.chipText, active && styles.chipTextActive]}>
+                        {t}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+              <Text style={styles.scoreHintText}>
+                Ognuna delle tre strategie tradizionali ha ora il proprio
+                timeframe indipendente — prima condividevano un unico
+                elenco. Più timeframe attivi significa più occasioni
+                controllate, ma anche più rumore su quelli più brevi.
+              </Text>
+            </Section>
+          )}
 
           <Section title="RSI (condiviso tra le strategie)">
             <NumRow
@@ -1237,6 +1357,7 @@ const styles = StyleSheet.create({
     marginBottom: 4,
   },
   scoreHintText: { color: colors.onSurface, flex: 1, fontSize: 11, lineHeight: 16 },
+  fieldLabel: { color: colors.onSurfaceSecondary, fontSize: font.sm, fontWeight: "600", marginBottom: spacing.xs },
   stratRow: { flexDirection: "row", flexWrap: "wrap", gap: spacing.sm, marginBottom: spacing.sm },
   stratChip: {
     flexGrow: 1,

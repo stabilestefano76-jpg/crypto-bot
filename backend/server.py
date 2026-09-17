@@ -64,7 +64,10 @@ CANDLE_LIMIT = 200  # candles fetched per pair/tf
 # ---------------------------------------------------------------------------
 class Config(BaseModel):
     scan_interval_minutes: int = 1
-    timeframes: list[str] = Field(default_factory=lambda: DEFAULT_TIMEFRAMES.copy())
+    timeframes: list[str] = Field(default_factory=lambda: DEFAULT_TIMEFRAMES.copy())  # kept for backward compatibility with old stored configs — no longer read directly by the scan loop, see the three per-strategy lists below
+    counter_trend_timeframes: list[str] = Field(default_factory=lambda: DEFAULT_TIMEFRAMES.copy())
+    fvg_reversal_timeframes: list[str] = Field(default_factory=lambda: DEFAULT_TIMEFRAMES.copy())
+    rsi_reversion_timeframes: list[str] = Field(default_factory=lambda: DEFAULT_TIMEFRAMES.copy())
     quote_filter: str = "USDC,EUR"  # Bybit EU spot quotes (comma-separated)
     min_24h_volume_usdt: float = 100_000.0
     rsi_period: int = 14
@@ -180,6 +183,7 @@ class Config(BaseModel):
     top10_risk_pct: float = 0.75  # % of wallet cash risked per trade (spec range: 0.5-1%)
     top10_min_setup_score: float = 75.0  # composite score (0-100) required to auto-open
     top10_min_rr: float = 2.0  # minimum reward:risk to TP1
+    top10_timeframe: str = "1h"
     top10_tp1_pct: float = 2.0  # first take-profit, % above entry
     top10_tp1_close_pct: float = 50.0  # % of position closed at TP1
     top10_tp2_pct: float = 3.0  # second take-profit, % above entry
@@ -2320,23 +2324,23 @@ async def run_scan() -> dict[str, Any]:
         pairs = pairs[: cfg.max_pairs_per_scan]
         pairs = [p for p in pairs if await is_volume_stable(p, cfg)]
 
-        logger.info("Scanning %d pairs across %s", len(pairs), cfg.timeframes)
+        active = active_strategies(cfg)
+        all_tfs = sorted(set(cfg.counter_trend_timeframes) | set(cfg.fvg_reversal_timeframes) | set(cfg.rsi_reversion_timeframes))
+        logger.info("Scanning %d pairs across %s", len(pairs), all_tfs)
         signals_found: list[Signal] = []
 
-        active = active_strategies(cfg)
-
         async def process(sym: str) -> None:
-            for tf in cfg.timeframes:
+            for tf in all_tfs:
                 try:
-                    if "counter_trend" in active:
+                    if "counter_trend" in active and tf in cfg.counter_trend_timeframes:
                         sig3 = await analyze_pair_counter(sym, tf, cfg)
                         if sig3:
                             signals_found.append(sig3)
-                    if "fvg_reversal" in active:
+                    if "fvg_reversal" in active and tf in cfg.fvg_reversal_timeframes:
                         sig4 = await analyze_pair_fvg_reversal(sym, tf, cfg)
                         if sig4:
                             signals_found.append(sig4)
-                    if "rsi_reversion" in active:
+                    if "rsi_reversion" in active and tf in cfg.rsi_reversion_timeframes:
                         sig5 = await analyze_pair_rsi_reversion(sym, tf, cfg)
                         if sig5:
                             signals_found.append(sig5)
@@ -5255,12 +5259,12 @@ async def run_top10_scan() -> dict[str, Any]:
             continue
         trend_score, trend_meta = await compute_top10_trend_score(symbol, cfg)
         if regime == "bearish" and trend_score < 50:
-            await log_reject(symbol, "1h", "top10", "regime ribassista su BTC, trend debole")
+            await log_reject(symbol, cfg.top10_timeframe, "top10", "regime ribassista su BTC, trend debole")
             continue
 
-        h1_candles = await exchange.get_klines(symbol, "1h")
+        h1_candles = await exchange.get_klines(symbol, cfg.top10_timeframe)
         if len(h1_candles) < 40:
-            await log_reject(symbol, "1h", "top10", "dati insufficienti")
+            await log_reject(symbol, cfg.top10_timeframe, "top10", "dati insufficienti")
             continue
 
         setup = None
@@ -5273,7 +5277,7 @@ async def run_top10_scan() -> dict[str, Any]:
         if not setup:
             setup = detect_top10_mean_reversion(cfg, h1_candles, trend_score)
         if not setup:
-            await log_reject(symbol, "1h", "top10", "nessun setup valido")
+            await log_reject(symbol, cfg.top10_timeframe, "top10", "nessun setup valido")
             continue
 
         entry = setup["entry"]
@@ -5283,7 +5287,7 @@ async def run_top10_scan() -> dict[str, Any]:
         tp1 = entry * (1 + cfg.top10_tp1_pct / 100)
         rr = (tp1 - entry) / (entry - stop)
         if rr < cfg.top10_min_rr:
-            await log_reject(symbol, "1h", "top10", "R:R insufficiente")
+            await log_reject(symbol, cfg.top10_timeframe, "top10", "R:R insufficiente")
             continue
 
         structure_component = 20 if trend_meta.get("structure") == "up" else (10 if trend_meta.get("structure") == "range" else 0)
@@ -5295,7 +5299,7 @@ async def run_top10_scan() -> dict[str, Any]:
         setup_score = min(100.0, trend_component + structure_component + volume_component + setup_component + momentum_component + rr_component)
 
         if setup_score < cfg.top10_min_setup_score:
-            await log_reject(symbol, "1h", "top10", f"punteggio insufficiente ({round(setup_score)}/100)")
+            await log_reject(symbol, cfg.top10_timeframe, "top10", f"punteggio insufficiente ({round(setup_score)}/100)")
             continue
 
         candidates.append({
@@ -5329,7 +5333,7 @@ async def open_top10_position(candidate: dict[str, Any], cfg: Config) -> None:
     quantity = notional / entry
 
     symbol = candidate["symbol"]
-    h1_candles = await exchange.get_klines(symbol, "1h")
+    h1_candles = await exchange.get_klines(symbol, cfg.top10_timeframe)
     highs = [c[3] for c in h1_candles]
     lows = [c[4] for c in h1_candles]
     closes = [c[2] for c in h1_candles]
