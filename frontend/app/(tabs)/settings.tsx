@@ -449,6 +449,13 @@ export default function SettingsScreen() {
                 step={0.1}
                 testID="input-scalping-tp-atr"
               />
+              <NumRow
+                label="Taglia per operazione (% cassa)"
+                value={cfg.scalping_risk_pct}
+                onChange={(v) => update({ scalping_risk_pct: v })}
+                step={1}
+                testID="input-scalping-risk-pct"
+              />
               <Text style={styles.scoreHintText}>
                 EMA9/21 + VWAP + Bollinger su 5m, con RSI(9) come conferma di
                 momentum (sopra 50 per i long, sotto 50 per gli short) e un
@@ -456,7 +463,14 @@ export default function SettingsScreen() {
                 un trend ribassista netto, e viceversa) — evita di aprire
                 operazioni che remano contro la corrente generale. Stop e
                 target si adattano all&apos;ATR di ogni coppia invece di una
-                percentuale fissa uguale per tutte. Massimo{" "}
+                percentuale fissa uguale per tutte — allargati di recente
+                (stop a {cfg.scalping_sl_atr_mult}×ATR, target a{" "}
+                {cfg.scalping_tp_atr_mult}×ATR) così il normale rumore di
+                prezzo non chiude l&apos;operazione prima che un movimento
+                vero si sviluppi. Taglia per operazione al{" "}
+                {cfg.scalping_risk_pct}% della cassa, così anche una vincita
+                modesta in percentuale genera un guadagno che si sente reale
+                in valore assoluto. Massimo{" "}
                 {cfg.scalping_max_open_positions} operazioni aperte insieme,
                 per non accumulare rischio correlato in un solo movimento di
                 mercato.

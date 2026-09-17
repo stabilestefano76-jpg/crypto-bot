@@ -95,6 +95,7 @@ export type Config = {
   scalping_max_open_positions: number;
   scalping_sl_atr_mult: number;
   scalping_tp_atr_mult: number;
+  scalping_risk_pct: number;
   max_pairs_per_scan: number;
   enabled_pairs: string[];
   excluded_pairs: string[];

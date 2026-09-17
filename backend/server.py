@@ -93,8 +93,9 @@ class Config(BaseModel):
     scalping_cooldown_minutes: int = 10  # pause on a symbol after a losing scalping trade
     scalping_invalidation_buffer_pct: float = 0.15  # min % beyond VWAP required, on top of the EMA cross, to count as invalidated
     scalping_max_open_positions: int = 5  # cap on concurrent Scalping trades — was unlimited, which let a correlated batch pile up during a broad market move
-    scalping_sl_atr_mult: float = 1.0  # stop distance in ATR multiples (falls back to the fixed % constants if ATR is 0/unavailable)
-    scalping_tp_atr_mult: float = 2.0  # target distance in ATR multiples
+    scalping_sl_atr_mult: float = 1.5  # was 1.0 — widened so normal noise doesn't trigger the stop before a real move develops
+    scalping_tp_atr_mult: float = 3.5  # was 2.0 — widened so a winning trade captures a genuinely bigger, more meaningful move before trailing even has a chance to activate
+    scalping_risk_pct: float = 12.0  # was a hardcoded 0.08 (fraction) constant — raised further, now adjustable here as a plain percentage (matching rsi_rebound_risk_pct's convention), used as cfg.scalping_risk_pct / 100
     signal_validity_candles: int = 5  # a condition counts if it happened within N bars
     fvg_lookback: int = 40  # how far back to look for an open FVG
     reversal_rejection_wick_ratio: float = 1.5  # wick/body ratio for rejection candle
@@ -3876,7 +3877,6 @@ async def scalping_portfolio() -> dict[str, Any]:
 # ---------------------------------------------------------------------------
 SCALPING_SL_PCT = 0.004   # fallback only, used when ATR is unavailable (0 or missing)
 SCALPING_TP_PCT = 0.014   # fallback only, used when ATR is unavailable (0 or missing)
-SCALPING_WALLET_RISK_PCT = 0.08  # % of scalping cash used per trade — raised from 0.05: at ATR-based targets this small, the round-trip fee was eating most of the gross profit on a winning trade, so bigger absolute size helps even though the fee-to-target RATIO itself is unchanged by size (see the min-edge-over-fees check below, which addresses the ratio directly)
 SCALPING_EXCLUDED_STABLE_BASES = {"USDC", "USDT", "EURC", "DAI", "BUSD", "TUSD", "FDUSD"}  # stablecoin-vs-stablecoin pairs move too little for fees to ever be worth it on a fast scalp
 SCALPING_FEE_PCT = 0.001  # 0.10% Bybit spot fee per side (open + close = 0.20% round trip)
 
@@ -4010,7 +4010,7 @@ async def open_scalping_position(doc: dict[str, Any], cfg: Config) -> None:
     if open_count >= cfg.scalping_max_open_positions:
         return  # cap on concurrent Scalping trades — prevents a correlated pile-up
 
-    notional = cash * SCALPING_WALLET_RISK_PCT * await get_regime_size_multiplier(cfg)
+    notional = cash * cfg.scalping_risk_pct / 100 * await get_regime_size_multiplier(cfg)
     if notional < 1.0:
         notional = min(cash, 1.0)
 
