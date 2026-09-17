@@ -168,6 +168,7 @@ class Config(BaseModel):
     grid_atr_period: int = 14
     grid_num_levels: int = 4  # wide/sparse grid: few levels below the center price
     grid_atr_spacing_mult: float = 1.8  # distance between grid levels = this * ATR
+    grid_cell_target_pct: float = 2.0  # each cell's own sell target = its buy price + this % — flat percentage instead of ATR-based spacing, so every cell's profit target is predictable regardless of volatility
     grid_range_break_atr_mult: float = 3.0  # unused since spot removed the forced emergency stop — kept only so old grid documents that still reference it don't break
     grid_max_pairs: int = 6  # max symbols with an active grid at once — raised from 4 given the current range-bound market phase suits Grid Bot well
     grid_replace_improvement_pct: float = 20.0  # candidate must be this much MORE lateral (lower bb_width+ema_gap) than the worst idle active grid to replace it
@@ -201,8 +202,9 @@ class Config(BaseModel):
     rsi_rebound_lookback: int = 10  # how many recent candles to check for the oversold dip
     rsi_rebound_stop_lookback: int = 5  # candles used to find the recent structural low for the stop
     rsi_rebound_risk_pct: float = 5.0  # % of wallet cash used as position notional per trade
-    rsi_rebound_tp_atr_mult: float = 2.0  # initial target — also the point where trailing activates
-    rsi_rebound_trailing_atr_mult: float = 1.2
+    rsi_rebound_tp_atr_mult: float = 2.0  # kept only as the informational "initial target" shown in the app — no longer a hard exit condition, see rsi_rebound_trailing_activation_margin_pct below
+    rsi_rebound_trailing_atr_mult: float = 0.6  # tightened from 1.2 — now protects the WHOLE trade from soon after entry, not just after a big move, so it needs to be tight
+    rsi_rebound_trailing_activation_margin_pct: float = 0.5  # trailing activates as soon as profit clears round-trip fees PLUS this extra %, instead of waiting for the full ATR-based target — lets a winning trade run uncapped once genuinely, safely in profit
     rsi_rebound_max_open_positions: int = 5
 
     # --- Wyckoff Spring: full classic accumulation sequence — Range, then
@@ -4376,17 +4378,16 @@ async def build_grid_plan(symbol: str, cfg: Config) -> Optional[dict[str, Any]]:
     n = cfg.grid_num_levels
     step = (fvg_top - fvg_bottom) / max(1, n - 1) if n > 1 else 0.0
     # Classic grid mechanic: each buy level gets its OWN sell target just
-    # above it (spaced by ATR), instead of every cell sharing one distant
+    # above it (a flat percentage), instead of every cell sharing one distant
     # target. Buys portions on the way down, sells portions on the way up —
     # many small round-trips instead of waiting for one big recovery.
-    spacing = cfg.grid_atr_spacing_mult * atr
     cells = []
     for idx in range(n):
         buy_price = fvg_top - idx * step
         cells.append({
             "index": idx + 1,
             "buy_price": round(buy_price, 8),
-            "sell_price": round(buy_price + spacing, 8),
+            "sell_price": round(buy_price * (1 + cfg.grid_cell_target_pct / 100), 8),
             "status": "armed",
             "trailing_active": False,
             "peak_price": None,
@@ -4699,7 +4700,7 @@ async def monitor_grid_instances() -> None:
             new_cell = {
                 "index": len(cells) + 1,
                 "buy_price": round(new_buy, 8),
-                "sell_price": round(new_buy + cfg.grid_atr_spacing_mult * grid["atr"], 8),
+                "sell_price": round(new_buy * (1 + cfg.grid_cell_target_pct / 100), 8),
                 "status": "armed",
                 "trailing_active": False,
                 "peak_price": None,
@@ -5768,15 +5769,21 @@ async def monitor_rsi_rebound_positions() -> None:
             hit = None
             if cur <= p["stop_loss"]:
                 hit = "stop_loss"
-            elif cur >= p["take_profit"]:
-                if (p.get("atr") or 0) > 0:
+            else:
+                # Activate the tight trailing stop as soon as profit clears
+                # round-trip fees plus a small safety margin — not at a
+                # fixed ATR-based target. From here the trade runs
+                # uncapped, protected only by the trailing distance below
+                # its peak, instead of being boxed in by a fixed target.
+                gross_pnl_so_far = (cur - p.get("fill_price", p["entry"])) * p["quantity"]
+                exit_notional_now = cur * p["quantity"]
+                fees_now = (p["notional"] + exit_notional_now) * RSI_REBOUND_FEE_PCT
+                margin_now = p["notional"] * cfg.rsi_rebound_trailing_activation_margin_pct / 100
+                if gross_pnl_so_far > fees_now + margin_now:
                     await db.rsi_rebound_positions.update_one(
                         {"id": p["id"]},
                         {"$set": {"trailing_active": True, "peak_price": cur}},
                     )
-                    continue
-                hit = "take_profit"
-            if not hit:
                 continue
 
         gross_pnl = (cur - p.get("fill_price", p["entry"])) * p["quantity"]

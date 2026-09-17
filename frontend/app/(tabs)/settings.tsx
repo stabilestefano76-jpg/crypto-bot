@@ -473,11 +473,11 @@ export default function SettingsScreen() {
                 testID="input-grid-num-levels"
               />
               <NumRow
-                label="Distanza target per livello (×ATR)"
-                value={cfg.grid_atr_spacing_mult}
-                onChange={(v) => update({ grid_atr_spacing_mult: v })}
-                step={0.1}
-                testID="input-grid-atr-spacing"
+                label="Target vendita per livello (% sopra l'acquisto)"
+                value={cfg.grid_cell_target_pct}
+                onChange={(v) => update({ grid_cell_target_pct: v })}
+                step={0.5}
+                testID="input-grid-cell-target-pct"
               />
               <NumRow
                 label="Spaziatura livelli estesi (×normale)"
@@ -498,7 +498,8 @@ export default function SettingsScreen() {
                 significa acquisti più ravvicinati (mediando più spesso), meno
                 livelli significa acquisti più distanziati. Ogni livello ha il
                 proprio target di vendita, calcolato automaticamente sopra il
-                proprio prezzo di entrata (distanza in ATR): compra a scaglioni
+                proprio prezzo di entrata (percentuale fissa, non più
+                distanza in ATR): compra a scaglioni
                 scendendo, vende a scaglioni salendo — non più un unico
                 target lontano condiviso da tutte le celle. Se il prezzo scende
                 oltre l&apos;ultimo livello, la griglia ne aggiunge fino a 4 in
@@ -637,14 +638,21 @@ export default function SettingsScreen() {
                 testID="input-rsi-rebound-risk"
               />
               <NumRow
-                label="Target iniziale (×ATR)"
+                label="Target iniziale (×ATR, solo informativo)"
                 value={cfg.rsi_rebound_tp_atr_mult}
                 onChange={(v) => update({ rsi_rebound_tp_atr_mult: v })}
                 step={0.1}
                 testID="input-rsi-rebound-tp"
               />
               <NumRow
-                label="Trailing dopo il target (×ATR)"
+                label="Margine attivazione trailing (% oltre le commissioni)"
+                value={cfg.rsi_rebound_trailing_activation_margin_pct}
+                onChange={(v) => update({ rsi_rebound_trailing_activation_margin_pct: v })}
+                step={0.1}
+                testID="input-rsi-rebound-trailing-margin"
+              />
+              <NumRow
+                label="Distanza trailing (×ATR)"
                 value={cfg.rsi_rebound_trailing_atr_mult}
                 onChange={(v) => update({ rsi_rebound_trailing_atr_mult: v })}
                 step={0.1}
@@ -663,9 +671,15 @@ export default function SettingsScreen() {
                 appena chiusa, è tornato sopra quella soglia con una chiusura
                 rialzista — quella è la candela di conferma per l&apos;ingresso
                 long. Stop sotto il minimo delle ultime{" "}
-                {cfg.rsi_rebound_stop_lookback} candele; target iniziale a{" "}
-                {cfg.rsi_rebound_tp_atr_mult}×ATR, poi trailing una volta
-                raggiunto.
+                {cfg.rsi_rebound_stop_lookback} candele. Il trailing si attiva
+                appena il guadagno supera le commissioni di andata e ritorno
+                più un margine di sicurezza del{" "}
+                {cfg.rsi_rebound_trailing_activation_margin_pct}% — non più a
+                un target fisso. Da quel momento l&apos;operazione corre senza
+                un tetto massimo, protetta solo dal trailing a{" "}
+                {cfg.rsi_rebound_trailing_atr_mult}×ATR dal massimo raggiunto.
+                Il target iniziale sopra resta solo informativo, mostrato
+                nell&apos;app.
               </Text>
             </Section>
           )}

@@ -102,6 +102,7 @@ export type Config = {
   grid_enabled: boolean;
   grid_num_levels: number;
   grid_atr_spacing_mult: number;
+  grid_cell_target_pct: number;
   grid_max_pairs: number;
   grid_extension_spacing_mult: number;
   top10_enabled: boolean;
@@ -131,6 +132,7 @@ export type Config = {
   rsi_rebound_risk_pct: number;
   rsi_rebound_tp_atr_mult: number;
   rsi_rebound_trailing_atr_mult: number;
+  rsi_rebound_trailing_activation_margin_pct: number;
   rsi_rebound_max_open_positions: number;
   wyckoff_enabled: boolean;
   wyckoff_timeframe: string;
