@@ -57,6 +57,7 @@ TF_MAP = {
 }
 TF_SECONDS = {"5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
 DEFAULT_TIMEFRAMES = ["1h", "4h"]
+PAPER_FEE_PCT = 0.001  # 0.10% Bybit spot fee per side (open + close = 0.20% round trip) — same real-world assumption as SCALPING_FEE_PCT/RSI_REBOUND_FEE_PCT, used here only to estimate a safe trailing-activation margin for the traditional strategies (their booked PnL itself doesn't model fees)
 CANDLE_LIMIT = 200  # candles fetched per pair/tf
 
 # ---------------------------------------------------------------------------
@@ -160,6 +161,7 @@ class Config(BaseModel):
     rsi_rev_structural_lookback: int = 10  # candles used to find the recent swing high/low that now anchors the stop, with the ATR buffer above only as a minimum safety margin
     rsi_rev_min_rr_ratio: float = 3.0  # minimum natural reward:risk (target-to-mean distance vs stop distance) required to take the trade — rejects the setup outright rather than artificially tightening the stop to force a ratio the structure doesn't support
     rsi_rev_trailing_atr_mult: float = 3.0  # wide trailing once in profit — only to catch a genuine sudden reversal, not to lock in small moves
+    rsi_rev_trailing_activation_margin_pct: float = 0.5  # trailing now activates only once profit clears an ESTIMATED round-trip fee cost plus this extra % — not at the very first cent of profit, which was too easy to trigger on pure noise
     # --- Grid Bot (independent strategy: range/laterale trading) ---
     grid_enabled: bool = True
     grid_timeframe: str = "1h"  # timeframe used for range detection, ATR and spacing
@@ -1465,9 +1467,10 @@ async def manage_rsi_reversion_position(pos: dict[str, Any], price: float, cfg: 
     """RSI Reversion: intentionally no partial close, no breakeven, no
     timeout-to-breakeven — the whole premise is to wait for the rebalance
     without being cut early by normal noise. The ONE addition here is a wide
-    ATR-based trailing stop, armed only once the trade is in profit — meant
-    purely to catch a genuine sudden reversal, not to lock in small moves.
-    Before this, only the far-away catastrophic stop (6×ATR by default)
+    ATR-based trailing stop, armed once profit clears an estimated round-trip
+    fee cost plus a small safety margin — meant purely to catch a genuine
+    sudden reversal once the trade has a real edge, not to lock in noise.
+    Before this, only the far-away catastrophic stop (3×ATR by default)
     protected a winning trade from giving everything back."""
     if not cfg.trailing_enabled:
         return pos
@@ -1480,6 +1483,17 @@ async def manage_rsi_reversion_position(pos: dict[str, Any], price: float, cfg: 
 
     if not pos.get("trailing_active"):
         if not in_profit:
+            return pos
+        # Activate only once profit clears an estimated round-trip fee cost
+        # plus a small safety margin — not at the very first cent of profit,
+        # which was too easy to trigger on pure market noise right after entry.
+        qty = float(pos.get("quantity") or 0)
+        notional = entry * qty
+        gross_pnl_so_far = (price - entry) * qty if long else (entry - price) * qty
+        exit_notional_now = price * qty
+        fees_now = (notional + exit_notional_now) * PAPER_FEE_PCT
+        margin_now = notional * cfg.rsi_rev_trailing_activation_margin_pct / 100
+        if gross_pnl_so_far <= fees_now + margin_now:
             return pos
         await db.paper_positions.update_one(
             {"id": pos["id"]},

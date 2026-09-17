@@ -17,7 +17,7 @@ import { Ionicons } from "@expo/vector-icons";
 import { api, Config, PaperConfig } from "@/src/api";
 import { colors, font, radius, spacing } from "@/src/theme";
 
-const TIMEFRAMES = ["15m", "1h", "4h", "1d"];
+const TIMEFRAMES = ["5m", "15m", "1h", "4h", "1d"];
 
 export default function SettingsScreen() {
   const insets = useSafeAreaInsets();
@@ -86,7 +86,7 @@ export default function SettingsScreen() {
   };
 
   const selectTimeframeFor = (
-    field: "grid_timeframe" | "rsi_rebound_timeframe" | "wyckoff_timeframe" | "top10_timeframe",
+    field: "grid_timeframe" | "rsi_rebound_timeframe" | "wyckoff_timeframe" | "top10_timeframe" | "scalping_timeframe",
     t: string
   ) => {
     if (!cfg) return;
@@ -342,6 +342,13 @@ export default function SettingsScreen() {
                 testID="input-rsirev-min-rr"
               />
               <NumRow
+                label="Margine attivazione trailing (% oltre le commissioni stimate)"
+                value={cfg.rsi_rev_trailing_activation_margin_pct}
+                onChange={(v) => update({ rsi_rev_trailing_activation_margin_pct: v })}
+                step={0.1}
+                testID="input-rsirev-trailing-margin"
+              />
+              <NumRow
                 label="Trailing profitto (×ATR)"
                 value={cfg.rsi_rev_trailing_atr_mult}
                 onChange={(v) => update({ rsi_rev_trailing_atr_mult: v })}
@@ -364,12 +371,18 @@ export default function SettingsScreen() {
                 target) e rischio (distanza dallo stop) deve raggiungere
                 almeno {cfg.rsi_rev_min_rr_ratio}:1 — altrimenti l&apos;
                 operazione viene scartata invece di forzare uno stop più
-                stretto di quanto la struttura giustifichi. Quando il
-                prezzo è già in guadagno, un trailing largo (
-                {cfg.rsi_rev_trailing_atr_mult}×ATR) protegge da un crollo
-                improvviso senza tagliare le normali oscillazioni. Usa
-                l&apos;interruttore &quot;Trailing stop attivo&quot; più sotto
-                per disattivare/riattivare anche questo.
+                stretto di quanto la struttura giustifichi. Il trailing si
+                attiva appena il guadagno supera le commissioni stimate di
+                andata/ritorno più un margine del{" "}
+                {cfg.rsi_rev_trailing_activation_margin_pct}% — non più al
+                primo centesimo di guadagno. Da quel momento l&apos;
+                operazione corre senza tetto massimo, protetta da un trailing
+                largo ({cfg.rsi_rev_trailing_atr_mult}×ATR) pensato per
+                catturare solo un&apos;inversione vera, non le normali
+                oscillazioni. Il target di ritorno alla media resta solo
+                informativo. Usa l&apos;interruttore &quot;Trailing stop
+                attivo&quot; più sotto per disattivare/riattivare tutto
+                questo.
               </Text>
             </Section>
           )}
@@ -439,6 +452,21 @@ export default function SettingsScreen() {
 
           {cfg.scalping_enabled && (
             <Section title="Scalping Strategy">
+              <Text style={styles.fieldLabel}>Timeframe</Text>
+              <View style={styles.chipsRow}>
+                {TIMEFRAMES.map((t) => (
+                  <Pressable
+                    key={t}
+                    onPress={() => selectTimeframeFor("scalping_timeframe", t)}
+                    style={[styles.chip, cfg.scalping_timeframe === t && styles.chipActive]}
+                    testID={`tf-select-scalping-${t}`}
+                  >
+                    <Text style={[styles.chipText, cfg.scalping_timeframe === t && styles.chipTextActive]}>
+                      {t}
+                    </Text>
+                  </Pressable>
+                ))}
+              </View>
               <NumRow
                 label="Max operazioni simultanee"
                 value={cfg.scalping_max_open_positions}

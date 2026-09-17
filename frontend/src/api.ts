@@ -95,7 +95,9 @@ export type Config = {
   rsi_rev_min_rr_ratio: number;
   rsi_rev_structural_lookback: number;
   rsi_rev_trailing_atr_mult: number;
+  rsi_rev_trailing_activation_margin_pct: number;
   scalping_max_open_positions: number;
+  scalping_timeframe: string;
   scalping_sl_atr_mult: number;
   scalping_tp_atr_mult: number;
   scalping_risk_pct: number;
