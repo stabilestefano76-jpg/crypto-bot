@@ -305,6 +305,12 @@ export default function GridScreen() {
                   ]}
                 >
                   {money(portfolio?.realized_pnl)}
+                  {portfolio?.total_transferred_in
+                    ? ` (${(portfolio.realized_pnl ?? 0) >= 0 ? "+" : ""}${(
+                        ((portfolio.realized_pnl ?? 0) / portfolio.total_transferred_in) *
+                        100
+                      ).toFixed(2)}%)`
+                    : ""}
                 </Text>
               </View>
             </View>
@@ -323,6 +329,12 @@ export default function GridScreen() {
                   ]}
                 >
                   {money(portfolio?.realized_pnl)}
+                  {portfolio?.total_transferred_in
+                    ? ` (${(portfolio.realized_pnl ?? 0) >= 0 ? "+" : ""}${(
+                        ((portfolio.realized_pnl ?? 0) / portfolio.total_transferred_in) *
+                        100
+                      ).toFixed(2)}%)`
+                    : ""}
                 </Text>
               </View>
               <View style={styles.walletStat}>
