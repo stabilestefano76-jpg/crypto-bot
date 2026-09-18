@@ -112,6 +112,7 @@ export type Config = {
   grid_num_levels: number;
   grid_atr_spacing_mult: number;
   grid_cell_target_pct: number;
+  grid_cascade_min_margin_pct: number;
   grid_max_pairs: number;
   grid_extension_spacing_mult: number;
   top10_enabled: boolean;

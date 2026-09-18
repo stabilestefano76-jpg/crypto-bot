@@ -177,6 +177,7 @@ class Config(BaseModel):
     grid_num_levels: int = 4  # wide/sparse grid: few levels below the center price
     grid_atr_spacing_mult: float = 1.8  # distance between grid levels = this * ATR
     grid_cell_target_pct: float = 2.0  # each cell's own sell target = its buy price + this % — flat percentage instead of ATR-based spacing, so every cell's profit target is predictable regardless of volatility
+    grid_cascade_min_margin_pct: float = 0.3  # a cell only closes early via cascade_recovery if its gain clears round-trip fees (0.20%) PLUS this extra % — otherwise it was closing at ~breakeven, covering only the commission and locking in nothing real
     grid_range_break_atr_mult: float = 3.0  # unused since spot removed the forced emergency stop — kept only so old grid documents that still reference it don't break
     grid_max_pairs: int = 6  # max symbols with an active grid at once — raised from 4 given the current range-bound market phase suits Grid Bot well
     grid_replace_improvement_pct: float = 20.0  # candidate must be this much MORE lateral (lower bb_width+ema_gap) than the worst idle active grid to replace it
@@ -4755,17 +4756,25 @@ async def monitor_grid_instances() -> None:
 
         # --- Cascade profit-lock: when price returns up to the entry of the
         # highest-priced (shallowest) currently-holding cell, close every
-        # OTHER holding cell that's already in profit at that price — rather
-        # than leaving them to wait for the shared far target, which can
-        # reverse before ever being reached. The trigger cell itself stays
-        # open (at that exact price it's only at breakeven, not yet ahead).
+        # OTHER holding cell whose gain at that price clears round-trip fees
+        # plus a real margin (grid_cascade_min_margin_pct) — rather than
+        # leaving them to wait for the shared far target, which can reverse
+        # before ever being reached. A cell whose gain would only just cover
+        # (or not even cover) the commission stays holding instead of closing
+        # at an effective breakeven that locks in nothing real. The trigger
+        # cell itself always stays open (at that exact price it's only at
+        # breakeven, not yet ahead).
         holding_cells = [c for c in cells if c["status"] == "holding"]
         if len(holding_cells) >= 2:
             highest_entry = max(c["buy_price"] for c in holding_cells)
             if cur >= highest_entry:
+                min_gain_pct = 2 * GRID_FEE_PCT * 100 + cfg.grid_cascade_min_margin_pct
                 for cell in holding_cells:
                     if cell["buy_price"] >= highest_entry:
                         continue  # this is the trigger cell itself — leave it open
+                    gain_pct = (cur - cell["buy_price"]) / cell["buy_price"] * 100
+                    if gain_pct < min_gain_pct:
+                        continue  # would only cover (or not even cover) the round-trip fee — leave it holding for its own real target instead
                     pos = await db.grid_positions.find_one(
                         {"grid_id": grid["id"], "cell_index": cell["index"], "status": "open"},
                         {"_id": 0},

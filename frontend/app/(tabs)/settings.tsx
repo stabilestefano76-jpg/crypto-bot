@@ -554,6 +554,13 @@ export default function SettingsScreen() {
                 testID="input-grid-cell-target-pct"
               />
               <NumRow
+                label="Margine minimo recupero anticipato (% oltre le commissioni)"
+                value={cfg.grid_cascade_min_margin_pct}
+                onChange={(v) => update({ grid_cascade_min_margin_pct: v })}
+                step={0.1}
+                testID="input-grid-cascade-margin"
+              />
+              <NumRow
                 label="Spaziatura livelli estesi (×normale)"
                 value={cfg.grid_extension_spacing_mult}
                 onChange={(v) => update({ grid_extension_spacing_mult: v })}
@@ -581,7 +588,13 @@ export default function SettingsScreen() {
                 ancora aperta più in basso (una zona lasciata indietro durante
                 la salita, mai riusata due volte sulla stessa griglia); se non
                 ce n&apos;è una disponibile, usa come riserva una distanza fissa
-                pari a &quot;×normale&quot; volte la spaziatura originale.
+                pari a &quot;×normale&quot; volte la spaziatura originale. Quando il
+                prezzo risale fino all&apos;entrata della cella meno profonda, il
+                recupero anticipato ("cascade") chiude anche le altre celle in
+                attesa — ma solo se il loro guadagno a quel prezzo supera le
+                commissioni di andata/ritorno (0,20%) più il margine impostato
+                sopra: altrimenti restano in attesa del proprio vero target,
+                invece di chiudersi a un pareggio che non lascia nulla in tasca.
               </Text>
             </Section>
           )}
