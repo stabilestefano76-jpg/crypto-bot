@@ -86,7 +86,8 @@ class Config(BaseModel):
 
     # --- Scalping Bot (independent strategy) ---
     scalping_enabled: bool = True
-    scalping_timeframe: str = "5m"
+    scalping_timeframe: str = "5m"  # kept for backward compatibility with old stored configs and the legacy /scalping/config endpoint — no longer read by the scan/monitor loop, see scalping_timeframes below
+    scalping_timeframes: list[str] = Field(default_factory=lambda: ["5m"])
     scalping_rsi_period: int = 9
     scalping_bb_period: int = 20
     scalping_bb_std: float = 2.0
@@ -164,7 +165,8 @@ class Config(BaseModel):
     rsi_rev_trailing_activation_margin_pct: float = 0.5  # trailing now activates only once profit clears an ESTIMATED round-trip fee cost plus this extra % — not at the very first cent of profit, which was too easy to trigger on pure noise
     # --- Grid Bot (independent strategy: range/laterale trading) ---
     grid_enabled: bool = True
-    grid_timeframe: str = "1h"  # timeframe used for range detection, ATR and spacing
+    grid_timeframe: str = "1h"  # kept for backward compatibility with old stored configs — no longer read directly, see grid_timeframes below
+    grid_timeframes: list[str] = Field(default_factory=lambda: ["1h"])
     grid_bb_period: int = 20
     grid_bb_std: float = 2.0
     grid_max_bb_width_pct: float = 3.0  # market considered "laterale" if BB width <= this % of price
@@ -185,7 +187,8 @@ class Config(BaseModel):
     top10_risk_pct: float = 0.75  # % of wallet cash risked per trade (spec range: 0.5-1%)
     top10_min_setup_score: float = 75.0  # composite score (0-100) required to auto-open
     top10_min_rr: float = 2.0  # minimum reward:risk to TP1
-    top10_timeframe: str = "1h"
+    top10_timeframe: str = "1h"  # kept for backward compatibility with old stored configs — no longer read directly, see top10_timeframes below
+    top10_timeframes: list[str] = Field(default_factory=lambda: ["1h"])
     top10_tp1_pct: float = 2.0  # first take-profit, % above entry
     top10_tp1_close_pct: float = 50.0  # % of position closed at TP1
     top10_tp2_pct: float = 3.0  # second take-profit, % above entry
@@ -203,7 +206,8 @@ class Config(BaseModel):
     # back above it — long entry, stop below the recent structural low,
     # trailing stop/target once in profit (same mechanic as Scalping/Grid). ---
     rsi_rebound_enabled: bool = True
-    rsi_rebound_timeframe: str = "1h"
+    rsi_rebound_timeframe: str = "1h"  # kept for backward compatibility with old stored configs — no longer read directly, see rsi_rebound_timeframes below
+    rsi_rebound_timeframes: list[str] = Field(default_factory=lambda: ["1h"])
     rsi_rebound_period: int = 14
     rsi_rebound_oversold: float = 20.0
     rsi_rebound_lookback: int = 10  # how many recent candles to check for the oversold dip
@@ -221,7 +225,8 @@ class Config(BaseModel):
     # resistance, on lighter volume) — entry at the LPS, the lowest-risk
     # point in the classic schematic. ---
     wyckoff_enabled: bool = True
-    wyckoff_timeframe: str = "4h"
+    wyckoff_timeframe: str = "4h"  # kept for backward compatibility with old stored configs — no longer read directly, see wyckoff_timeframes below
+    wyckoff_timeframes: list[str] = Field(default_factory=lambda: ["4h"])
     wyckoff_range_window: int = 30  # candles used to establish support/resistance of the trading range
     wyckoff_search_span: int = 20  # candles, after the range, in which the whole Spring->Test->SOS->LPS sequence must occur
     wyckoff_test_window: int = 5  # candles after the Spring in which the Test must occur
@@ -3646,9 +3651,9 @@ async def run_scalping_scan() -> dict[str, Any]:
     pairs = pairs[:20]
     pairs = [p for p in pairs if await is_volume_stable(p, cfg)]
 
-    tf = cfg.scalping_timeframe
     signals_found: list[dict[str, Any]] = []
     for symbol in pairs:
+      for tf in cfg.scalping_timeframes:
         try:
             candles = await exchange.get_klines(symbol, tf)
         except Exception:  # noqa: BLE001
@@ -3711,6 +3716,7 @@ async def run_scalping_scan() -> dict[str, Any]:
         }
         signals_found.append(doc)
         await open_scalping_position(doc, cfg)
+        break
 
     if signals_found:
         for doc in signals_found:
@@ -3979,7 +3985,7 @@ async def check_scalping_invalidation(pos: dict[str, Any], cfg: Config) -> bool:
     if (time.time() - opened) < cfg.scalping_min_hold_seconds:
         return False
 
-    candles = await exchange.get_klines(pos["symbol"], cfg.scalping_timeframe)
+    candles = await exchange.get_klines(pos["symbol"], pos.get("timeframe") or cfg.scalping_timeframes[0])
     min_len = max(cfg.scalping_bb_period, cfg.scalping_ema_slow) + 5
     if len(candles) < min_len:
         return False
@@ -4066,7 +4072,7 @@ async def open_scalping_position(doc: dict[str, Any], cfg: Config) -> None:
     expected_gross_profit = abs(take_profit - fill_price) * quantity
     if expected_gross_profit < round_trip_fee * MIN_EDGE_OVER_FEES_MULT:
         await log_reject(
-            doc["symbol"], cfg.scalping_timeframe, "scalping",
+            doc["symbol"], doc.get("timeframe") or cfg.scalping_timeframes[0], "scalping",
             "margine atteso troppo vicino alle commissioni",
         )
         return
@@ -4318,7 +4324,7 @@ def analyze_grid_eligibility(closes: list[float], cfg: Config) -> dict[str, Any]
     }
 
 
-async def build_grid_plan(symbol: str, cfg: Config) -> Optional[dict[str, Any]]:
+async def build_grid_plan(symbol: str, tf: str, cfg: Config) -> Optional[dict[str, Any]]:
     """Look for a live long-only setup: a confirmed UPTREND on the higher
     timeframe, currently retracing DOWN into the bullish FVG left by its own
     impulse — the same structural idea as Rev Pre-FVG / FVG Reversal, but
@@ -4330,7 +4336,6 @@ async def build_grid_plan(symbol: str, cfg: Config) -> Optional[dict[str, Any]]:
     leg (from the FVG's bottom back up toward the swing high that preceded
     it), a modest and more achievable level, shared by every cell in this
     grid. Long-only, matching spot (no shorts)."""
-    tf = cfg.grid_timeframe
     candles = await exchange.get_klines(symbol, tf)
     if len(candles) < 60:
         await log_reject(symbol, tf, "grid", "dati insufficienti")
@@ -4339,7 +4344,7 @@ async def build_grid_plan(symbol: str, cfg: Config) -> Optional[dict[str, Any]]:
     highs = [c[3] for c in candles]
     lows = [c[4] for c in candles]
 
-    htf = _higher_tf(cfg.grid_timeframe)
+    htf = _higher_tf(tf)
     hcandles = await exchange.get_klines(symbol, htf)
     if len(hcandles) < 20:
         await log_reject(symbol, tf, "grid", "dati insufficienti (timeframe superiore)")
@@ -4419,6 +4424,7 @@ async def build_grid_plan(symbol: str, cfg: Config) -> Optional[dict[str, Any]]:
 
     return {
         "symbol": symbol,
+        "timeframe": tf,
         "score": score,
         "center_price": round(current, 8),
         "atr": round(atr, 8),
@@ -4441,7 +4447,7 @@ async def create_grid_instance_from_plan(plan: dict[str, Any], cfg: Config) -> d
     doc = {
         "id": str(uuid.uuid4()),
         "symbol": plan["symbol"],
-        "timeframe": cfg.grid_timeframe,
+        "timeframe": plan["timeframe"],
         "center_price": plan["center_price"],
         "spacing": round(spacing, 8),
         "atr": plan["atr"],
@@ -4478,7 +4484,7 @@ async def check_grid_reversals(cfg: Config) -> int:
     active = await db.grid_instances.find({"status": "active"}, {"_id": 0}).to_list(100)
     stopped = 0
     for g in active:
-        hcandles = await exchange.get_klines(g["symbol"], _higher_tf(cfg.grid_timeframe))
+        hcandles = await exchange.get_klines(g["symbol"], _higher_tf(g.get("timeframe") or cfg.grid_timeframes[0]))
         if len(hcandles) < 20:
             continue
         if detect_market_structure(hcandles, cfg.pivot_window) != "down":
@@ -4576,9 +4582,13 @@ async def run_grid_scan() -> dict[str, Any]:
     # the best live setup, not just the fastest-found-in-volume-order.
     scored: list[tuple[float, dict[str, Any]]] = []  # (score, plan) — lower = better
     for sym in candidates:
-        plan = await build_grid_plan(sym, cfg)
-        if plan:
-            scored.append((plan["score"], plan))
+        best_plan: Optional[dict[str, Any]] = None
+        for tf in cfg.grid_timeframes:
+            plan = await build_grid_plan(sym, tf, cfg)
+            if plan and (best_plan is None or plan["score"] < best_plan["score"]):
+                best_plan = plan
+        if best_plan:
+            scored.append((best_plan["score"], best_plan))
     scored.sort(key=lambda x: x[0])  # best (most significant relative impulse) first
 
     created = 0
@@ -4607,7 +4617,7 @@ async def run_grid_scan() -> dict[str, Any]:
         # infinitely bad so any valid candidate can take its place.
         idle_scored: list[tuple[float, dict[str, Any]]] = []
         for g in idle_actives:
-            gplan = await build_grid_plan(g["symbol"], cfg)
+            gplan = await build_grid_plan(g["symbol"], g.get("timeframe") or cfg.grid_timeframes[0], cfg)
             score = gplan["score"] if gplan else float("inf")
             idle_scored.append((score, g))
         idle_scored.sort(key=lambda x: x[0], reverse=True)  # worst (highest/inf) first
@@ -4637,14 +4647,14 @@ async def run_grid_scan() -> dict[str, Any]:
     }
 
 
-async def find_grid_extension_fvg_target(symbol: str, below_price: float, used_tops: list[float], cfg: Config) -> Optional[float]:
+async def find_grid_extension_fvg_target(symbol: str, tf: str, below_price: float, used_tops: list[float], cfg: Config) -> Optional[float]:
     """Among still-open bullish FVGs on the grid's own timeframe, find the
     one closest below `below_price` that hasn't already been used for a
     previous extension level on this grid. These are zones the price left
     behind on its way up — a real continued decline revisiting one of them
     is a more meaningful place to add a level than an arbitrary fixed
     distance."""
-    candles = await exchange.get_klines(symbol, cfg.grid_timeframe)
+    candles = await exchange.get_klines(symbol, tf)
     if len(candles) < 10:
         return None
     highs = [c[3] for c in candles]
@@ -4707,7 +4717,7 @@ async def monitor_grid_instances() -> None:
         extension_spacing = grid["spacing"] * cfg.grid_extension_spacing_mult
         if grid.get("extension_count", 0) < 4 and cur < lowest_buy - extension_spacing:
             fvg_target = await find_grid_extension_fvg_target(
-                grid["symbol"], lowest_buy, grid.get("extension_fvg_tops", []), cfg
+                grid["symbol"], grid.get("timeframe") or cfg.grid_timeframes[0], lowest_buy, grid.get("extension_fvg_tops", []), cfg
             )
             used_fvg_top: Optional[float] = None
             if fvg_target is not None and fvg_target < lowest_buy:
@@ -5273,53 +5283,55 @@ async def run_top10_scan() -> dict[str, Any]:
             continue
         trend_score, trend_meta = await compute_top10_trend_score(symbol, cfg)
         if regime == "bearish" and trend_score < 50:
-            await log_reject(symbol, cfg.top10_timeframe, "top10", "regime ribassista su BTC, trend debole")
+            await log_reject(symbol, cfg.top10_timeframes[0], "top10", "regime ribassista su BTC, trend debole")
             continue
 
-        h1_candles = await exchange.get_klines(symbol, cfg.top10_timeframe)
-        if len(h1_candles) < 40:
-            await log_reject(symbol, cfg.top10_timeframe, "top10", "dati insufficienti")
-            continue
+        for tf in cfg.top10_timeframes:
+            h1_candles = await exchange.get_klines(symbol, tf)
+            if len(h1_candles) < 40:
+                await log_reject(symbol, tf, "top10", "dati insufficienti")
+                continue
 
-        setup = None
-        if trend_score >= 50:
-            setup = detect_top10_pullback(cfg, h1_candles)
+            setup = None
+            if trend_score >= 50:
+                setup = detect_top10_pullback(cfg, h1_candles)
+                if not setup:
+                    setup = detect_top10_breakout_retest(cfg, h1_candles)
+                if not setup:
+                    setup = detect_top10_momentum(cfg, h1_candles, btc_perf_24h)
             if not setup:
-                setup = detect_top10_breakout_retest(cfg, h1_candles)
+                setup = detect_top10_mean_reversion(cfg, h1_candles, trend_score)
             if not setup:
-                setup = detect_top10_momentum(cfg, h1_candles, btc_perf_24h)
-        if not setup:
-            setup = detect_top10_mean_reversion(cfg, h1_candles, trend_score)
-        if not setup:
-            await log_reject(symbol, cfg.top10_timeframe, "top10", "nessun setup valido")
-            continue
+                await log_reject(symbol, tf, "top10", "nessun setup valido")
+                continue
 
-        entry = setup["entry"]
-        stop = setup["stop"]
-        if entry <= stop:
-            continue
-        tp1 = entry * (1 + cfg.top10_tp1_pct / 100)
-        rr = (tp1 - entry) / (entry - stop)
-        if rr < cfg.top10_min_rr:
-            await log_reject(symbol, cfg.top10_timeframe, "top10", "R:R insufficiente")
-            continue
+            entry = setup["entry"]
+            stop = setup["stop"]
+            if entry <= stop:
+                continue
+            tp1 = entry * (1 + cfg.top10_tp1_pct / 100)
+            rr = (tp1 - entry) / (entry - stop)
+            if rr < cfg.top10_min_rr:
+                await log_reject(symbol, tf, "top10", "R:R insufficiente")
+                continue
 
-        structure_component = 20 if trend_meta.get("structure") == "up" else (10 if trend_meta.get("structure") == "range" else 0)
-        momentum_component = min(10, max(0, trend_meta.get("momentum_pct", 0.0)))
-        rr_component = min(10, (rr / cfg.top10_min_rr) * 5)
-        volume_component = 15 if setup.get("quality", 0) >= 15 else 8
-        setup_component = min(20, setup.get("quality", 10))
-        trend_component = trend_score / 100 * 25
-        setup_score = min(100.0, trend_component + structure_component + volume_component + setup_component + momentum_component + rr_component)
+            structure_component = 20 if trend_meta.get("structure") == "up" else (10 if trend_meta.get("structure") == "range" else 0)
+            momentum_component = min(10, max(0, trend_meta.get("momentum_pct", 0.0)))
+            rr_component = min(10, (rr / cfg.top10_min_rr) * 5)
+            volume_component = 15 if setup.get("quality", 0) >= 15 else 8
+            setup_component = min(20, setup.get("quality", 10))
+            trend_component = trend_score / 100 * 25
+            setup_score = min(100.0, trend_component + structure_component + volume_component + setup_component + momentum_component + rr_component)
 
-        if setup_score < cfg.top10_min_setup_score:
-            await log_reject(symbol, cfg.top10_timeframe, "top10", f"punteggio insufficiente ({round(setup_score)}/100)")
-            continue
+            if setup_score < cfg.top10_min_setup_score:
+                await log_reject(symbol, tf, "top10", f"punteggio insufficiente ({round(setup_score)}/100)")
+                continue
 
-        candidates.append({
-            "symbol": symbol, "setup": setup, "entry": entry, "stop": stop,
-            "tp1": tp1, "rr": rr, "score": setup_score,
-        })
+            candidates.append({
+                "symbol": symbol, "timeframe": tf, "setup": setup, "entry": entry, "stop": stop,
+                "tp1": tp1, "rr": rr, "score": setup_score,
+            })
+            break
 
     if not candidates:
         return {"opened": False, "reason": "no qualifying setup"}
@@ -5347,7 +5359,8 @@ async def open_top10_position(candidate: dict[str, Any], cfg: Config) -> None:
     quantity = notional / entry
 
     symbol = candidate["symbol"]
-    h1_candles = await exchange.get_klines(symbol, cfg.top10_timeframe)
+    tf = candidate.get("timeframe") or cfg.top10_timeframes[0]
+    h1_candles = await exchange.get_klines(symbol, tf)
     highs = [c[3] for c in h1_candles]
     lows = [c[4] for c in h1_candles]
     closes = [c[2] for c in h1_candles]
@@ -5356,6 +5369,7 @@ async def open_top10_position(candidate: dict[str, Any], cfg: Config) -> None:
     doc = {
         "id": str(uuid.uuid4()),
         "symbol": symbol,
+        "timeframe": tf,
         "side": "long",
         "setup_type": candidate["setup"]["type"],
         "entry": entry,
@@ -5641,7 +5655,7 @@ def detect_rsi_rebound_signal(candles: list[list[float]], cfg: Config) -> tuple[
     return {"entry": entry, "stop": stop, "rsi": rsis[-1], "candle_t": candles[-1][0]}, "ok"
 
 
-_rsi_rebound_last_candle: dict[str, float] = {}  # per-symbol: timestamp of the last candle a position was actually attempted on — blocks retrying the SAME candle every scan cycle, while still allowing a genuinely new candle to trigger a fresh attempt even minutes later
+_rsi_rebound_last_candle: dict[tuple[str, str], float] = {}  # per (symbol, timeframe): timestamp of the last candle a position was actually attempted on — blocks retrying the SAME candle every scan cycle, while still allowing a genuinely new candle to trigger a fresh attempt even minutes later
 
 
 async def run_rsi_rebound_scan() -> None:
@@ -5694,23 +5708,25 @@ async def run_rsi_rebound_scan() -> None:
             break
         if await db.rsi_rebound_positions.find_one({"symbol": symbol, "status": "open"}):
             continue
-        candles = await exchange.get_klines(symbol, cfg.rsi_rebound_timeframe)
-        if len(candles) < cfg.rsi_rebound_period + cfg.rsi_rebound_lookback + 2:
-            await log_reject(symbol, cfg.rsi_rebound_timeframe, "rsi_rebound", "dati insufficienti")
-            continue
-        signal, reason = detect_rsi_rebound_signal(candles, cfg)
-        if not signal:
-            await log_reject(symbol, cfg.rsi_rebound_timeframe, "rsi_rebound", reason)
-            continue
-        if _rsi_rebound_last_candle.get(symbol) == signal["candle_t"]:
-            await log_reject(symbol, cfg.rsi_rebound_timeframe, "rsi_rebound", "stessa candela già tentata")
-            continue
-        _rsi_rebound_last_candle[symbol] = signal["candle_t"]
-        await open_rsi_rebound_position(symbol, signal, cfg)
-        open_count += 1
+        for tf in cfg.rsi_rebound_timeframes:
+            candles = await exchange.get_klines(symbol, tf)
+            if len(candles) < cfg.rsi_rebound_period + cfg.rsi_rebound_lookback + 2:
+                await log_reject(symbol, tf, "rsi_rebound", "dati insufficienti")
+                continue
+            signal, reason = detect_rsi_rebound_signal(candles, cfg)
+            if not signal:
+                await log_reject(symbol, tf, "rsi_rebound", reason)
+                continue
+            if _rsi_rebound_last_candle.get((symbol, tf)) == signal["candle_t"]:
+                await log_reject(symbol, tf, "rsi_rebound", "stessa candela già tentata")
+                continue
+            _rsi_rebound_last_candle[(symbol, tf)] = signal["candle_t"]
+            await open_rsi_rebound_position(symbol, tf, signal, cfg)
+            open_count += 1
+            break
 
 
-async def open_rsi_rebound_position(symbol: str, signal: dict[str, Any], cfg: Config) -> None:
+async def open_rsi_rebound_position(symbol: str, tf: str, signal: dict[str, Any], cfg: Config) -> None:
     wallet = await get_rsi_rebound_wallet()
     cash = wallet.get("cash", 0.0)
     if cash <= 1.0:
@@ -5724,7 +5740,7 @@ async def open_rsi_rebound_position(symbol: str, signal: dict[str, Any], cfg: Co
     # rapid-fire repeated entries on the same symbol).
     live_price = price_feed.get(symbol) or await price_feed.price_or_rest(symbol)
     if live_price and live_price <= signal["stop"]:
-        await log_reject(symbol, cfg.rsi_rebound_timeframe, "rsi_rebound", "prezzo già oltre lo stop, segnale scaduto")
+        await log_reject(symbol, tf, "rsi_rebound", "prezzo già oltre lo stop, segnale scaduto")
         return
     fill_price = live_price or entry  # real execution price when available
     notional = min(cash * cfg.rsi_rebound_risk_pct / 100 * await get_regime_size_multiplier(cfg), cash)
@@ -5732,7 +5748,7 @@ async def open_rsi_rebound_position(symbol: str, signal: dict[str, Any], cfg: Co
         return
     quantity = notional / fill_price
 
-    candles = await exchange.get_klines(symbol, cfg.rsi_rebound_timeframe)
+    candles = await exchange.get_klines(symbol, tf)
     highs = [c[3] for c in candles]
     lows = [c[4] for c in candles]
     closes = [c[2] for c in candles]
@@ -5741,6 +5757,7 @@ async def open_rsi_rebound_position(symbol: str, signal: dict[str, Any], cfg: Co
     doc = {
         "id": str(uuid.uuid4()),
         "symbol": symbol,
+        "timeframe": tf,
         "side": "long",
         "entry": entry,
         "fill_price": fill_price,
@@ -6076,19 +6093,21 @@ async def run_wyckoff_scan() -> None:
             break
         if await db.wyckoff_positions.find_one({"symbol": symbol, "status": "open"}):
             continue
-        candles = await exchange.get_klines(symbol, cfg.wyckoff_timeframe)
-        if len(candles) < cfg.wyckoff_range_window + cfg.wyckoff_search_span:
-            await log_reject(symbol, cfg.wyckoff_timeframe, "wyckoff", "dati insufficienti")
-            continue
-        signal, reason = detect_wyckoff_spring_setup(candles, cfg)
-        if not signal:
-            await log_reject(symbol, cfg.wyckoff_timeframe, "wyckoff", reason)
-            continue
-        await open_wyckoff_position(symbol, signal, cfg)
-        open_count += 1
+        for tf in cfg.wyckoff_timeframes:
+            candles = await exchange.get_klines(symbol, tf)
+            if len(candles) < cfg.wyckoff_range_window + cfg.wyckoff_search_span:
+                await log_reject(symbol, tf, "wyckoff", "dati insufficienti")
+                continue
+            signal, reason = detect_wyckoff_spring_setup(candles, cfg)
+            if not signal:
+                await log_reject(symbol, tf, "wyckoff", reason)
+                continue
+            await open_wyckoff_position(symbol, tf, signal, cfg)
+            open_count += 1
+            break
 
 
-async def open_wyckoff_position(symbol: str, signal: dict[str, Any], cfg: Config) -> None:
+async def open_wyckoff_position(symbol: str, tf: str, signal: dict[str, Any], cfg: Config) -> None:
     wallet = await get_wyckoff_wallet()
     cash = wallet.get("cash", 0.0)
     if cash <= 1.0:
@@ -6099,7 +6118,7 @@ async def open_wyckoff_position(symbol: str, signal: dict[str, Any], cfg: Config
         return
     quantity = notional / entry
 
-    candles = await exchange.get_klines(symbol, cfg.wyckoff_timeframe)
+    candles = await exchange.get_klines(symbol, tf)
     highs = [c[3] for c in candles]
     lows = [c[4] for c in candles]
     closes = [c[2] for c in candles]

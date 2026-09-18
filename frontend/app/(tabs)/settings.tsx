@@ -76,21 +76,21 @@ export default function SettingsScreen() {
   };
 
   const toggleTimeframeFor = (
-    field: "counter_trend_timeframes" | "fvg_reversal_timeframes" | "rsi_reversion_timeframes",
+    field:
+      | "counter_trend_timeframes"
+      | "fvg_reversal_timeframes"
+      | "rsi_reversion_timeframes"
+      | "grid_timeframes"
+      | "rsi_rebound_timeframes"
+      | "wyckoff_timeframes"
+      | "top10_timeframes"
+      | "scalping_timeframes",
     t: string
   ) => {
     if (!cfg) return;
     const current = cfg[field];
     const list = current.includes(t) ? current.filter((x) => x !== t) : [...current, t];
     update({ [field]: list } as Partial<Config>);
-  };
-
-  const selectTimeframeFor = (
-    field: "grid_timeframe" | "rsi_rebound_timeframe" | "wyckoff_timeframe" | "top10_timeframe" | "scalping_timeframe",
-    t: string
-  ) => {
-    if (!cfg) return;
-    update({ [field]: t } as Partial<Config>);
   };
 
   if (loading || !cfg || !pcfg) {
@@ -454,18 +454,22 @@ export default function SettingsScreen() {
             <Section title="Scalping Strategy">
               <Text style={styles.fieldLabel}>Timeframe</Text>
               <View style={styles.chipsRow}>
-                {TIMEFRAMES.map((t) => (
-                  <Pressable
-                    key={t}
-                    onPress={() => selectTimeframeFor("scalping_timeframe", t)}
-                    style={[styles.chip, cfg.scalping_timeframe === t && styles.chipActive]}
-                    testID={`tf-select-scalping-${t}`}
-                  >
-                    <Text style={[styles.chipText, cfg.scalping_timeframe === t && styles.chipTextActive]}>
-                      {t}
-                    </Text>
-                  </Pressable>
-                ))}
+                {TIMEFRAMES.map((t) => {
+                  const active = cfg.scalping_timeframes.includes(t);
+                  return (
+                    <Pressable
+                      key={t}
+                      onPress={() => toggleTimeframeFor("scalping_timeframes", t)}
+                      style={[styles.chip, active && styles.chipActive]}
+                      testID={`tf-select-scalping-${t}`}
+                    >
+                      <Text style={[styles.chipText, active && styles.chipTextActive]}>
+                        {t}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+
               </View>
               <NumRow
                 label="Max operazioni simultanee"
@@ -520,18 +524,21 @@ export default function SettingsScreen() {
             <Section title="Grid Bot">
               <Text style={styles.fieldLabel}>Timeframe</Text>
               <View style={styles.chipsRow}>
-                {TIMEFRAMES.map((t) => (
-                  <Pressable
-                    key={t}
-                    onPress={() => selectTimeframeFor("grid_timeframe", t)}
-                    style={[styles.chip, cfg.grid_timeframe === t && styles.chipActive]}
-                    testID={`tf-select-grid-${t}`}
-                  >
-                    <Text style={[styles.chipText, cfg.grid_timeframe === t && styles.chipTextActive]}>
-                      {t}
-                    </Text>
-                  </Pressable>
-                ))}
+                {TIMEFRAMES.map((t) => {
+                  const active = cfg.grid_timeframes.includes(t);
+                  return (
+                    <Pressable
+                      key={t}
+                      onPress={() => toggleTimeframeFor("grid_timeframes", t)}
+                      style={[styles.chip, active && styles.chipActive]}
+                      testID={`tf-select-grid-${t}`}
+                    >
+                      <Text style={[styles.chipText, active && styles.chipTextActive]}>
+                        {t}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
               </View>
               <NumRow
                 label="Numero livelli di acquisto"
@@ -583,18 +590,21 @@ export default function SettingsScreen() {
             <Section title="Top 10 Long">
               <Text style={styles.fieldLabel}>Timeframe</Text>
               <View style={styles.chipsRow}>
-                {TIMEFRAMES.map((t) => (
-                  <Pressable
-                    key={t}
-                    onPress={() => selectTimeframeFor("top10_timeframe", t)}
-                    style={[styles.chip, cfg.top10_timeframe === t && styles.chipActive]}
-                    testID={`tf-select-top10-${t}`}
-                  >
-                    <Text style={[styles.chipText, cfg.top10_timeframe === t && styles.chipTextActive]}>
-                      {t}
-                    </Text>
-                  </Pressable>
-                ))}
+                {TIMEFRAMES.map((t) => {
+                  const active = cfg.top10_timeframes.includes(t);
+                  return (
+                    <Pressable
+                      key={t}
+                      onPress={() => toggleTimeframeFor("top10_timeframes", t)}
+                      style={[styles.chip, active && styles.chipActive]}
+                      testID={`tf-select-top10-${t}`}
+                    >
+                      <Text style={[styles.chipText, active && styles.chipTextActive]}>
+                        {t}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
               </View>
               <NumRow
                 label="Numero coppie in universo"
@@ -696,18 +706,21 @@ export default function SettingsScreen() {
             <Section title="RSI Rebound">
               <Text style={styles.fieldLabel}>Timeframe</Text>
               <View style={styles.chipsRow}>
-                {TIMEFRAMES.map((t) => (
-                  <Pressable
-                    key={t}
-                    onPress={() => selectTimeframeFor("rsi_rebound_timeframe", t)}
-                    style={[styles.chip, cfg.rsi_rebound_timeframe === t && styles.chipActive]}
-                    testID={`tf-select-rsi-rebound-${t}`}
-                  >
-                    <Text style={[styles.chipText, cfg.rsi_rebound_timeframe === t && styles.chipTextActive]}>
-                      {t}
-                    </Text>
-                  </Pressable>
-                ))}
+                {TIMEFRAMES.map((t) => {
+                  const active = cfg.rsi_rebound_timeframes.includes(t);
+                  return (
+                    <Pressable
+                      key={t}
+                      onPress={() => toggleTimeframeFor("rsi_rebound_timeframes", t)}
+                      style={[styles.chip, active && styles.chipActive]}
+                      testID={`tf-select-rsi-rebound-${t}`}
+                    >
+                      <Text style={[styles.chipText, active && styles.chipTextActive]}>
+                        {t}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
               </View>
               <NumRow
                 label="Soglia ipervenduto RSI"
@@ -785,18 +798,21 @@ export default function SettingsScreen() {
             <Section title="Wyckoff Spring">
               <Text style={styles.fieldLabel}>Timeframe</Text>
               <View style={styles.chipsRow}>
-                {TIMEFRAMES.map((t) => (
-                  <Pressable
-                    key={t}
-                    onPress={() => selectTimeframeFor("wyckoff_timeframe", t)}
-                    style={[styles.chip, cfg.wyckoff_timeframe === t && styles.chipActive]}
-                    testID={`tf-select-wyckoff-${t}`}
-                  >
-                    <Text style={[styles.chipText, cfg.wyckoff_timeframe === t && styles.chipTextActive]}>
-                      {t}
-                    </Text>
-                  </Pressable>
-                ))}
+                {TIMEFRAMES.map((t) => {
+                  const active = cfg.wyckoff_timeframes.includes(t);
+                  return (
+                    <Pressable
+                      key={t}
+                      onPress={() => toggleTimeframeFor("wyckoff_timeframes", t)}
+                      style={[styles.chip, active && styles.chipActive]}
+                      testID={`tf-select-wyckoff-${t}`}
+                    >
+                      <Text style={[styles.chipText, active && styles.chipTextActive]}>
+                        {t}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
               </View>
               <NumRow
                 label="Candele per il range (supporto/resistenza)"

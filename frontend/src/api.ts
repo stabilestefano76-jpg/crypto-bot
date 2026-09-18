@@ -98,6 +98,7 @@ export type Config = {
   rsi_rev_trailing_activation_margin_pct: number;
   scalping_max_open_positions: number;
   scalping_timeframe: string;
+  scalping_timeframes: string[];
   scalping_sl_atr_mult: number;
   scalping_tp_atr_mult: number;
   scalping_risk_pct: number;
@@ -107,6 +108,7 @@ export type Config = {
   scalping_enabled: boolean;
   grid_enabled: boolean;
   grid_timeframe: string;
+  grid_timeframes: string[];
   grid_num_levels: number;
   grid_atr_spacing_mult: number;
   grid_cell_target_pct: number;
@@ -118,6 +120,7 @@ export type Config = {
   top10_min_setup_score: number;
   top10_min_rr: number;
   top10_timeframe: string;
+  top10_timeframes: string[];
   top10_tp1_pct: number;
   top10_tp1_close_pct: number;
   top10_tp2_pct: number;
@@ -133,6 +136,7 @@ export type Config = {
   top10_atr_period: number;
   rsi_rebound_enabled: boolean;
   rsi_rebound_timeframe: string;
+  rsi_rebound_timeframes: string[];
   rsi_rebound_period: number;
   rsi_rebound_oversold: number;
   rsi_rebound_lookback: number;
@@ -144,6 +148,7 @@ export type Config = {
   rsi_rebound_max_open_positions: number;
   wyckoff_enabled: boolean;
   wyckoff_timeframe: string;
+  wyckoff_timeframes: string[];
   wyckoff_range_window: number;
   wyckoff_search_span: number;
   wyckoff_test_window: number;
