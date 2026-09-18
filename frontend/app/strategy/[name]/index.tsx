@@ -184,7 +184,7 @@ export default function StrategyScreen() {
     }
   };
 
-  const renderPosition = (p: PaperPosition, closed: boolean, pnlOverride?: number) => {
+  const renderPosition = (p: PaperPosition, closed: boolean, pnlOverride?: number, pctOverride?: number) => {
     const pnl = closed ? pnlOverride ?? 0 : p.unrealized_pnl ?? 0;
     const pnlColor = pnl >= 0 ? colors.success : colors.error;
     return (
@@ -212,6 +212,7 @@ export default function StrategyScreen() {
             {pnl >= 0 ? "+" : ""}
             {money(pnl)}
             {!closed && p.unrealized_pnl_pct !== undefined ? ` (${p.unrealized_pnl_pct.toFixed(2)}%)` : ""}
+            {closed && pctOverride !== undefined ? ` (${pctOverride >= 0 ? "+" : ""}${pctOverride.toFixed(2)}%)` : ""}
           </Text>
           <Text style={styles.posTime}>{timeAgo(p.opened_at)}</Text>
         </View>
@@ -396,7 +397,8 @@ export default function StrategyScreen() {
                     unrealized_pnl_pct: 0,
                   } as PaperPosition,
                   true,
-                  t.pnl_usdt
+                  t.pnl_usdt,
+                  t.pnl_pct
                 )
               )
           )}

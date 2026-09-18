@@ -15,6 +15,8 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { wyckoffApi, WyckoffPortfolio, WyckoffPosition } from "@/src/api";
 import { colors, font, radius, spacing } from "@/src/theme";
+import { useSwipeNavigation } from "@/src/useSwipeNavigation";
+import SwipeDots from "@/src/SwipeDots";
 
 function timeAgo(iso?: string): string {
   if (!iso) return "";
@@ -35,6 +37,7 @@ function money(n?: number): string {
 export default function WyckoffScreen() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
+  const { panHandlers, index, total } = useSwipeNavigation("/wyckoff");
   const [portfolio, setPortfolio] = useState<WyckoffPortfolio | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -127,6 +130,7 @@ export default function WyckoffScreen() {
           <Text style={[styles.posPnl, { color: pnlColor }]}>
             {pnl >= 0 ? "+" : ""}
             {money(pnl)}
+            {p.notional ? ` (${pnl >= 0 ? "+" : ""}${((pnl / p.notional) * 100).toFixed(2)}%)` : ""}
           </Text>
           <Text style={styles.posTime}>
             {closed ? p.close_reason : "aperta"} · {timeAgo(closed ? p.closed_at : p.opened_at)}
@@ -137,7 +141,7 @@ export default function WyckoffScreen() {
   };
 
   return (
-    <View style={[styles.root, { paddingTop: insets.top }]}>
+    <View style={[styles.root, { paddingTop: insets.top }]} {...panHandlers}>
       <View style={styles.header}>
         <Pressable onPress={() => router.back()} hitSlop={12}>
           <Ionicons name="chevron-back" size={26} color={colors.onSurface} />
@@ -148,6 +152,7 @@ export default function WyckoffScreen() {
       <Text style={styles.subtitle}>
         Range → Spring → Test → Sign of Strength → Last Point of Support
       </Text>
+      <SwipeDots index={index} total={total} />
 
       {loading && !portfolio ? (
         <ActivityIndicator style={{ marginTop: 40 }} color={colors.brand} />

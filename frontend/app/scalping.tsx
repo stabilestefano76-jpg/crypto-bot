@@ -21,6 +21,8 @@ import {
   ScalpingPosition,
 } from "@/src/api";
 import { colors, font, radius, spacing } from "@/src/theme";
+import { useSwipeNavigation } from "@/src/useSwipeNavigation";
+import SwipeDots from "@/src/SwipeDots";
 
 function timeAgo(iso?: string): string {
   if (!iso) return "";
@@ -41,6 +43,7 @@ function money(n?: number): string {
 export default function ScalpingScreen() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
+  const { panHandlers, index, total } = useSwipeNavigation("/scalping");
   const [portfolio, setPortfolio] = useState<ScalpingPortfolio | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -156,6 +159,9 @@ export default function ScalpingScreen() {
             {!closed && p.unrealized_pnl_pct !== undefined
               ? ` (${p.unrealized_pnl_pct.toFixed(2)}%)`
               : ""}
+            {closed && p.notional
+              ? ` (${pnl >= 0 ? "+" : ""}${((pnl / p.notional) * 100).toFixed(2)}%)`
+              : ""}
           </Text>
           <Text style={styles.posTime}>
             {closed ? timeAgo(p.closed_at) : timeAgo(p.opened_at)}
@@ -166,7 +172,7 @@ export default function ScalpingScreen() {
   };
 
   return (
-    <View style={[styles.root, { paddingTop: insets.top }]}>
+    <View style={[styles.root, { paddingTop: insets.top }]} {...panHandlers}>
       <View style={styles.header}>
         <Pressable onPress={() => router.back()} hitSlop={12}>
           <Ionicons name="chevron-back" size={26} color={colors.onSurface} />
@@ -181,6 +187,7 @@ export default function ScalpingScreen() {
         </Pressable>
       </View>
       <Text style={styles.subtitle}>VWAP + RSI(9) + Bollinger + EMA9/21 · 5m</Text>
+      <SwipeDots index={index} total={total} />
 
       {loading && !portfolio ? (
         <ActivityIndicator style={{ marginTop: 40 }} color={colors.brand} />

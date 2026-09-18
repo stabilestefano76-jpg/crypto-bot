@@ -26,6 +26,8 @@ import {
 } from "@/src/api";
 import { colors, font, radius, spacing } from "@/src/theme";
 import GridChart from "@/src/components/GridChart";
+import { useSwipeNavigation } from "@/src/useSwipeNavigation";
+import SwipeDots from "@/src/SwipeDots";
 
 function timeAgo(iso?: string): string {
   if (!iso) return "";
@@ -46,6 +48,7 @@ function money(n?: number): string {
 export default function GridScreen() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
+  const { panHandlers, index, total } = useSwipeNavigation("/grid");
   const [portfolio, setPortfolio] = useState<GridPortfolio | null>(null);
   const [instances, setInstances] = useState<GridInstance[]>([]);
   const [candles, setCandles] = useState<Candle[]>([]);
@@ -181,6 +184,9 @@ export default function GridScreen() {
             {!closed && p.unrealized_pnl_pct !== undefined
               ? ` (${p.unrealized_pnl_pct.toFixed(2)}%)`
               : ""}
+            {closed && p.notional
+              ? ` (${pnl >= 0 ? "+" : ""}${((pnl / p.notional) * 100).toFixed(2)}%)`
+              : ""}
           </Text>
           <Text style={styles.posTime}>
             {closed ? timeAgo(p.closed_at) : timeAgo(p.opened_at)}
@@ -191,7 +197,7 @@ export default function GridScreen() {
   };
 
   return (
-    <View style={[styles.root, { paddingTop: insets.top }]}>
+    <View style={[styles.root, { paddingTop: insets.top }]} {...panHandlers}>
       <View style={styles.header}>
         <Pressable onPress={() => router.back()} hitSlop={12}>
           <Ionicons name="chevron-back" size={26} color={colors.onSurface} />
@@ -206,6 +212,7 @@ export default function GridScreen() {
         </Pressable>
       </View>
       <Text style={styles.subtitle}>Griglia larga su ATR · mercati laterali</Text>
+      <SwipeDots index={index} total={total} />
 
       {loading && !portfolio ? (
         <ActivityIndicator style={{ marginTop: 40 }} color={colors.brand} />

@@ -13,7 +13,7 @@ import {
 import { useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
-import { rsiReversionApi, StrategyPortfolio, StrategyPosition } from "@/src/api";
+import { rsiReversionApi, StrategyPortfolio, PaperPosition, PaperTrade } from "@/src/api";
 import { colors, font, radius, spacing } from "@/src/theme";
 import { useSwipeNavigation } from "@/src/useSwipeNavigation";
 import SwipeDots from "@/src/SwipeDots";
@@ -107,8 +107,10 @@ export default function RsiReversionScreen() {
     }
   };
 
-  const renderPosition = (p: StrategyPosition, closed: boolean) => {
-    const pnl = closed ? p.pnl_usdt ?? 0 : p.unrealized_pnl ?? 0;
+  const renderPosition = (p: PaperPosition | PaperTrade, closed: boolean) => {
+    const open = p as PaperPosition;
+    const trade = p as PaperTrade;
+    const pnl = closed ? trade.pnl_usdt ?? 0 : open.unrealized_pnl ?? 0;
     const pnlColor = pnl >= 0 ? colors.success : colors.error;
     return (
       <View key={p.id} style={styles.posCard}>
@@ -125,19 +127,29 @@ export default function RsiReversionScreen() {
         </View>
         <Text style={styles.posMeta}>
           Entrata {p.entry.toFixed(4)}
-          {!closed && p.current_price ? `  ·  Attuale ${p.current_price.toFixed(4)}` : ""}
+          {!closed && open.current_price ? `  ·  Attuale ${open.current_price.toFixed(4)}` : ""}
+          {closed ? `  ·  Uscita ${trade.exit.toFixed(4)}` : ""}
         </Text>
-        <Text style={styles.posMeta}>
-          SL {p.stop_loss.toFixed(4)}  ·  TP {p.take_profit.toFixed(4)}
-          {!closed && p.trailing_active ? "  ·  trailing attivo" : ""}
-        </Text>
+        {!closed && (
+          <Text style={styles.posMeta}>
+            SL {open.stop_loss.toFixed(4)}  ·  TP {open.take_profit.toFixed(4)}
+            {open.trailing_active ? "  ·  trailing attivo" : ""}
+          </Text>
+        )}
         <View style={styles.posFooter}>
           <Text style={[styles.posPnl, { color: pnlColor }]}>
             {pnl >= 0 ? "+" : ""}
             {money(pnl)}
+            {closed && trade.pnl_pct !== undefined
+              ? ` (${trade.pnl_pct >= 0 ? "+" : ""}${trade.pnl_pct.toFixed(2)}%)`
+              : ""}
+            {!closed && open.unrealized_pnl_pct !== undefined
+              ? ` (${open.unrealized_pnl_pct >= 0 ? "+" : ""}${open.unrealized_pnl_pct.toFixed(2)}%)`
+              : ""}
           </Text>
           <Text style={styles.posTime}>
-            {closed ? p.close_reason : "aperta"} · {timeAgo(closed ? p.closed_at : p.opened_at)}
+            {closed ? (trade.outcome === "win" ? "vinta" : "persa") : "aperta"} ·{" "}
+            {timeAgo(closed ? trade.closed_at : open.opened_at)}
           </Text>
         </View>
       </View>

@@ -15,6 +15,8 @@ import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { top10Api, Top10Portfolio, Top10Position } from "@/src/api";
 import { colors, font, radius, spacing } from "@/src/theme";
+import { useSwipeNavigation } from "@/src/useSwipeNavigation";
+import SwipeDots from "@/src/SwipeDots";
 
 const SETUP_LABELS: Record<string, string> = {
   PULLBACK: "Pullback",
@@ -42,6 +44,7 @@ function money(n?: number): string {
 export default function Top10Screen() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
+  const { panHandlers, index, total } = useSwipeNavigation("/top10");
   const [portfolio, setPortfolio] = useState<Top10Portfolio | null>(null);
   const [loading, setLoading] = useState(true);
   const [refreshing, setRefreshing] = useState(false);
@@ -141,6 +144,7 @@ export default function Top10Screen() {
           <Text style={[styles.posPnl, { color: pnlColor }]}>
             {pnl >= 0 ? "+" : ""}
             {money(pnl)}
+            {p.notional ? ` (${pnl >= 0 ? "+" : ""}${((pnl / p.notional) * 100).toFixed(2)}%)` : ""}
           </Text>
           <Text style={styles.posTime}>
             {closed ? p.close_reason : `Punteggio ${Math.round(p.score)}/100`} · {timeAgo(closed ? p.closed_at : p.opened_at)}
@@ -151,7 +155,7 @@ export default function Top10Screen() {
   };
 
   return (
-    <View style={[styles.root, { paddingTop: insets.top }]}>
+    <View style={[styles.root, { paddingTop: insets.top }]} {...panHandlers}>
       <View style={styles.header}>
         <Pressable onPress={() => router.back()} hitSlop={12}>
           <Ionicons name="chevron-back" size={26} color={colors.onSurface} />
@@ -162,6 +166,7 @@ export default function Top10Screen() {
       <Text style={styles.subtitle}>
         Pullback · Breakout+Retest · Momentum · Mean Reversion
       </Text>
+      <SwipeDots index={index} total={total} />
 
       {loading && !portfolio ? (
         <ActivityIndicator style={{ marginTop: 40 }} color={colors.brand} />
