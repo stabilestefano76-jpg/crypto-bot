@@ -644,7 +644,7 @@ class BybitClient:
             })
         return out
 
-    async def get_klines(self, symbol: str, tf: str) -> list[list[float]]:
+    async def get_klines(self, symbol: str, tf: str, limit: int = CANDLE_LIMIT) -> list[list[float]]:
         bybit_tf = TF_MAP.get(tf)
         if not bybit_tf:
             return []
@@ -654,7 +654,7 @@ class BybitClient:
                 "category": self.category,
                 "symbol": symbol,
                 "interval": bybit_tf,
-                "limit": CANDLE_LIMIT + 1,
+                "limit": limit + 1,
             },
         )
         if not data or data.get("retCode") != 0:
@@ -667,7 +667,7 @@ class BybitClient:
         if len(raw) > 1:
             raw = raw[:-1]
         candles: list[list[float]] = []
-        for row in raw[-CANDLE_LIMIT:]:
+        for row in raw[-limit:]:
             try:
                 candles.append([
                     float(row[0]) / 1000.0,  # time (ms -> s)
@@ -2801,8 +2801,9 @@ async def get_signal(signal_id: str) -> dict[str, Any]:
 
 
 @api.get("/candles/{symbol}")
-async def get_candles(symbol: str, timeframe: str = "1h") -> dict[str, Any]:
-    candles = await exchange.get_klines(symbol, timeframe)
+async def get_candles(symbol: str, timeframe: str = "1h", limit: int = CANDLE_LIMIT) -> dict[str, Any]:
+    limit = max(1, min(limit, 1000))  # Bybit's own hard cap per request
+    candles = await exchange.get_klines(symbol, timeframe, limit=limit)
     closes = [c[2] for c in candles]
     cfg = await get_config()
     rsis = rsi_wilder(closes, cfg.rsi_period) if closes else []
