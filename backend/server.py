@@ -5991,27 +5991,7 @@ async def get_s3360_wallet() -> dict[str, Any]:
     return doc
 
 
-def detect_s3360_signal(candles: list[list[float]], cfg: Config) -> tuple[Optional[dict[str, Any]], str]:
-    """Entry fires the instant RSI crosses DOWN through the low threshold
-    (35 by default) — the first candle where this closed candle's RSI is at
-    or below the threshold and the previous one was still above it. No
-    confirmation candle, no minimum time spent below — this is the fast,
-    immediate-entry rule the backtest was built on."""
-    closes = [c[2] for c in candles]
-    lows = [c[4] for c in candles]
-    if len(closes) < cfg.s3360_rsi_period + 3:
-        return None, "dati insufficienti"
-    rsis = rsi_wilder(closes, cfg.s3360_rsi_period)
-    if rsis[-1] > cfg.s3360_low_threshold or rsis[-2] <= cfg.s3360_low_threshold:
-        return None, "nessun nuovo ingresso sotto soglia bassa"
-    entry = closes[-1]
-    stop = min(lows[-cfg.s3360_stop_lookback:]) * 0.998
-    if entry <= stop:
-        return None, "stop non valido rispetto all'entrata"
-    return {"entry": entry, "stop": stop, "rsi": rsis[-1], "candle_t": candles[-1][0]}, "ok"
-
-
-_s3360_last_candle: dict[tuple[str, str], float] = {}  # per (symbol, timeframe): timestamp of the last candle a position was actually attempted on
+_s3360_last_candle: dict[tuple[str, str], float] = {}  # per (symbol, timeframe): timestamp of the CURRENT still-forming candle a live-touch attempt was already made on — see run_s3360_scan
 
 
 async def run_s3360_scan() -> None:
@@ -6069,14 +6049,38 @@ async def run_s3360_scan() -> None:
             if len(candles) < cfg.s3360_rsi_period + 3:
                 await log_reject(symbol, tf, "s3360", "dati insufficienti")
                 continue
-            signal, reason = detect_s3360_signal(candles, cfg)
-            if not signal:
-                await log_reject(symbol, tf, "s3360", reason)
+            # Live entry: react to the RSI value AS IT IS RIGHT NOW, using the
+            # real-time price as a stand-in for the still-forming candle's
+            # close — same number the exchange's own live chart shows you
+            # ticking in real time. Waiting for that candle to actually
+            # close (the old behaviour) missed fast touches that recovered
+            # before the candle finished.
+            live_price = price_feed.get(symbol) or await price_feed.price_or_rest(symbol)
+            if not live_price:
+                await log_reject(symbol, tf, "s3360", "prezzo live non disponibile")
                 continue
-            if _s3360_last_candle.get((symbol, tf)) == signal["candle_t"]:
+            closes = [c[2] for c in candles]
+            live_rsis = rsi_wilder(closes + [live_price], cfg.s3360_rsi_period)
+            live_rsi = live_rsis[-1]
+            if live_rsi > cfg.s3360_low_threshold:
+                await log_reject(symbol, tf, "s3360", "nessun nuovo ingresso sotto soglia bassa")
+                continue
+            # Dedup against the CURRENT still-forming candle's start time —
+            # not the last closed one — so a live touch only attempts once
+            # per forming candle, no matter how many scans happen while
+            # price stays under the threshold within it.
+            tf_sec = TF_SECONDS.get(tf, 3600)
+            forming_candle_t = candles[-1][0] + tf_sec
+            if _s3360_last_candle.get((symbol, tf)) == forming_candle_t:
                 await log_reject(symbol, tf, "s3360", "stessa candela già tentata")
                 continue
-            _s3360_last_candle[(symbol, tf)] = signal["candle_t"]
+            lows = [c[4] for c in candles]
+            stop = min(lows[-cfg.s3360_stop_lookback:]) * 0.998
+            if live_price <= stop:
+                await log_reject(symbol, tf, "s3360", "stop non valido rispetto all'entrata")
+                continue
+            _s3360_last_candle[(symbol, tf)] = forming_candle_t
+            signal = {"entry": live_price, "stop": stop, "rsi": live_rsi, "candle_t": forming_candle_t}
             await open_s3360_position(symbol, tf, signal, cfg)
             open_count += 1
             break
@@ -6154,7 +6158,11 @@ async def monitor_s3360_positions() -> None:
         else:
             tf = p.get("timeframe", "1h")
             candles = await exchange.get_klines(p["symbol"], tf)
-            closes = [c[2] for c in candles]
+            # Live exit: same principle as entry — use the real-time price as
+            # the still-forming candle's close, so a touch of the target RSI
+            # closes the trade immediately instead of waiting for the candle
+            # to finish (which could let the touch reverse away unrealized).
+            closes = [c[2] for c in candles] + [cur]
             rsis = rsi_wilder(closes, cfg.s3360_rsi_period) if len(closes) > cfg.s3360_rsi_period else []
             if rsis and rsis[-1] >= cfg.s3360_high_threshold:
                 hit = "target_rsi_raggiunto"
