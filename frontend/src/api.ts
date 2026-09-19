@@ -143,7 +143,6 @@ export type Config = {
   s3360_high_threshold: number;
   s3360_stop_lookback: number;
   s3360_timeout_candles: number;
-  s3360_risk_pct: number;
   s3360_max_open_positions: number;
   rsi_rebound_timeframe: string;
   rsi_rebound_timeframes: string[];

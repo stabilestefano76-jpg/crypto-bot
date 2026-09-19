@@ -214,8 +214,7 @@ class Config(BaseModel):
     s3360_high_threshold: float = 60.0  # exit target: RSI reaching this closes the trade
     s3360_stop_lookback: int = 10  # candles used to find the structural stop (recent swing low)
     s3360_timeout_candles: int = 40  # matches the backtest window — if RSI never reaches the target within this many candles, close at market instead of holding indefinitely
-    s3360_risk_pct: float = 5.0  # % of this strategy's own cash used per trade
-    s3360_max_open_positions: int = 5
+    s3360_max_open_positions: int = 4  # ALSO doubles as the capital-sizing divisor: each trade gets equity/max_open_positions — e.g. 2 slots = 50% each, 4 slots = 25% each. Not just a cap on count.
     rsi_rebound_timeframe: str = "1h"  # kept for backward compatibility with old stored configs — no longer read directly, see rsi_rebound_timeframes below
     rsi_rebound_timeframes: list[str] = Field(default_factory=lambda: ["1h"])
     rsi_rebound_period: int = 14
@@ -6096,7 +6095,18 @@ async def open_s3360_position(symbol: str, tf: str, signal: dict[str, Any], cfg:
         await log_reject(symbol, tf, "s3360", "prezzo già oltre lo stop, segnale scaduto")
         return
     fill_price = live_price or entry
-    notional = min(cash * cfg.s3360_risk_pct / 100 * await get_regime_size_multiplier(cfg), cash)
+    # Size each trade as a fixed share of TOTAL equity (cash + value of
+    # currently open positions), not just the free cash — so "N slots"
+    # always means "1/N of total capital per trade" regardless of how many
+    # positions happen to be open right now. E.g. max_open_positions=2 means
+    # each trade gets 50% of equity, whether it's the 1st or 2nd slot filled.
+    open_positions = await db.s3360_positions.find({"status": "open"}, {"_id": 0}).to_list(200)
+    open_value = sum(
+        (price_feed.get(p["symbol"]) or p["entry"]) * p["quantity"] for p in open_positions
+    )
+    equity = cash + open_value
+    slots = max(1, cfg.s3360_max_open_positions)
+    notional = min((equity / slots) * await get_regime_size_multiplier(cfg), cash)
     if notional < 1.0:
         return
     quantity = notional / fill_price

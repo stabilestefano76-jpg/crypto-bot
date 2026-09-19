@@ -861,14 +861,7 @@ export default function SettingsScreen() {
                 testID="input-s3360-timeout"
               />
               <NumRow
-                label="Taglia per operazione (% cassa)"
-                value={cfg.s3360_risk_pct}
-                onChange={(v) => update({ s3360_risk_pct: v })}
-                step={1}
-                testID="input-s3360-risk-pct"
-              />
-              <NumRow
-                label="Massimo posizioni aperte"
+                label="Numero di operazioni contemporanee (1-4)"
                 value={cfg.s3360_max_open_positions}
                 onChange={(v) => update({ s3360_max_open_positions: v })}
                 testID="input-s3360-max-positions"
@@ -881,10 +874,15 @@ export default function SettingsScreen() {
                 stop (il minimo delle ultime {cfg.s3360_stop_lookback} candele),
                 oppure dopo {cfg.s3360_timeout_candles} candele se l&apos;RSI
                 non è mai arrivato alla soglia alta — per non restare in
-                posizione a tempo indeterminato. Backtest su ~41 giorni di
-                BTC 1h: 14 casi trovati, 10 arrivati alla soglia alta (71%),
-                guadagno medio +1,58% su quelli riusciti, nessuna perdita tra
-                i riusciti.
+                posizione a tempo indeterminato. La taglia di ogni operazione
+                non è più una percentuale fissa: si calcola dividendo il
+                capitale totale (cassa più valore delle posizioni aperte) per
+                il numero scelto sopra — con 1 operazione usa tutto il
+                capitale, con 2 metà ciascuna, con 4 un quarto ciascuna,
+                sempre riferito al totale e non a quanto resta libero in quel
+                momento. Backtest su ~41 giorni di BTC 1h: 14 casi trovati, 10
+                arrivati alla soglia alta (71%), guadagno medio +1,58% su
+                quelli riusciti, nessuna perdita tra i riusciti.
               </Text>
             </Section>
           )}
