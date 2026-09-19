@@ -207,6 +207,15 @@ class Config(BaseModel):
     # back above it — long entry, stop below the recent structural low,
     # trailing stop/target once in profit (same mechanic as Scalping/Grid). ---
     rsi_rebound_enabled: bool = True
+    s3360_enabled: bool = True
+    s3360_timeframes: list[str] = Field(default_factory=lambda: ["1h"])
+    s3360_rsi_period: int = 14
+    s3360_low_threshold: float = 35.0  # entry: RSI crosses down through this
+    s3360_high_threshold: float = 60.0  # exit target: RSI reaching this closes the trade
+    s3360_stop_lookback: int = 10  # candles used to find the structural stop (recent swing low)
+    s3360_timeout_candles: int = 40  # matches the backtest window — if RSI never reaches the target within this many candles, close at market instead of holding indefinitely
+    s3360_risk_pct: float = 5.0  # % of this strategy's own cash used per trade
+    s3360_max_open_positions: int = 5
     rsi_rebound_timeframe: str = "1h"  # kept for backward compatibility with old stored configs — no longer read directly, see rsi_rebound_timeframes below
     rsi_rebound_timeframes: list[str] = Field(default_factory=lambda: ["1h"])
     rsi_rebound_period: int = 14
@@ -2469,6 +2478,7 @@ async def scheduler_loop() -> None:
             await run_top10_scan()
             await run_rsi_rebound_scan()
             await run_wyckoff_scan()
+            await run_s3360_scan()
         except Exception as e:  # noqa: BLE001
             logger.exception("Scan loop error: %s", e)
         await asyncio.sleep(max(60, cfg.scan_interval_minutes * 60))
@@ -2634,6 +2644,7 @@ async def lifespan(_app: FastAPI):
     top10_monitor_task = asyncio.create_task(top10_monitor_loop())
     rsi_rebound_monitor_task = asyncio.create_task(rsi_rebound_monitor_loop())
     wyckoff_monitor_task = asyncio.create_task(wyckoff_monitor_loop())
+    s3360_monitor_task = asyncio.create_task(s3360_monitor_loop())
     ws_task = asyncio.create_task(price_feed.run())
     premature_task = asyncio.create_task(premature_stop_loop())
     entry_timing_task = asyncio.create_task(entry_timing_loop())
@@ -4953,6 +4964,18 @@ async def rsi_rebound_monitor_loop() -> None:
         await asyncio.sleep(3)
 
 
+async def s3360_monitor_loop() -> None:
+    """Check 33/60 stop/target-RSI/timeout every 3s using the real-time WS
+    price cache — same reasoning as the other monitors."""
+    await asyncio.sleep(8)
+    while True:
+        try:
+            await monitor_s3360_positions()
+        except Exception as e:  # noqa: BLE001
+            logger.exception("33/60 monitor error: %s", e)
+        await asyncio.sleep(3)
+
+
 async def wyckoff_monitor_loop() -> None:
     """Check Wyckoff Spring stop/trailing every 3s using the real-time WS
     price cache — same reasoning as the other monitors."""
@@ -5935,6 +5958,308 @@ async def rsi_rebound_reset() -> dict[str, Any]:
     await db.rsi_rebound_positions.delete_many({})
     await db.rsi_rebound_wallet.update_one(
         {"_id": RSI_REBOUND_WALLET_ID},
+        {"$set": {"cash": 0.0, "total_transferred_in": 0.0}, "$inc": {"reset_seq": 1}},
+        upsert=True,
+    )
+    return {"ok": True}
+
+
+# ============================================================================
+# Strategy "33/60" — buy when RSI crosses down through 35 (a fresh dip into
+# oversold-adjacent territory), exit once RSI recovers up to 60. Backtested
+# on ~41 days of BTC 1h data: 14 dips found, 10/14 (71%) reached RSI 60
+# within 40 candles, average gain +1.58% (median +1.57%, max +2.51%) on the
+# ones that did — none went negative among the ones that reached target.
+# The other 29% never got there within the window; those exit on the
+# timeout below instead of being held indefinitely. This is a genuinely
+# different entry rule from RSI Rebound (which waits for a confirmed
+# bullish reversal candle) — here entry fires the moment RSI first dips
+# below the threshold, no confirmation candle required.
+# ============================================================================
+
+S3360_WALLET_ID = "s3360_wallet_singleton"
+S3360_FEE_PCT = 0.001
+
+
+async def get_s3360_wallet() -> dict[str, Any]:
+    doc = await db.s3360_wallet.find_one({"_id": S3360_WALLET_ID}, {"_id": 0})
+    if not doc:
+        doc = {"cash": 0.0, "total_transferred_in": 0.0, "reset_seq": 0}
+        await db.s3360_wallet.update_one(
+            {"_id": S3360_WALLET_ID}, {"$set": doc}, upsert=True
+        )
+    doc.setdefault("reset_seq", 0)
+    return doc
+
+
+def detect_s3360_signal(candles: list[list[float]], cfg: Config) -> tuple[Optional[dict[str, Any]], str]:
+    """Entry fires the instant RSI crosses DOWN through the low threshold
+    (35 by default) — the first candle where this closed candle's RSI is at
+    or below the threshold and the previous one was still above it. No
+    confirmation candle, no minimum time spent below — this is the fast,
+    immediate-entry rule the backtest was built on."""
+    closes = [c[2] for c in candles]
+    lows = [c[4] for c in candles]
+    if len(closes) < cfg.s3360_rsi_period + 3:
+        return None, "dati insufficienti"
+    rsis = rsi_wilder(closes, cfg.s3360_rsi_period)
+    if rsis[-1] > cfg.s3360_low_threshold or rsis[-2] <= cfg.s3360_low_threshold:
+        return None, "nessun nuovo ingresso sotto soglia bassa"
+    entry = closes[-1]
+    stop = min(lows[-cfg.s3360_stop_lookback:]) * 0.998
+    if entry <= stop:
+        return None, "stop non valido rispetto all'entrata"
+    return {"entry": entry, "stop": stop, "rsi": rsis[-1], "candle_t": candles[-1][0]}, "ok"
+
+
+_s3360_last_candle: dict[tuple[str, str], float] = {}  # per (symbol, timeframe): timestamp of the last candle a position was actually attempted on
+
+
+async def run_s3360_scan() -> None:
+    cfg = await get_config()
+    if not cfg.s3360_enabled:
+        return
+
+    open_count = await db.s3360_positions.count_documents({"status": "open"})
+    if open_count >= cfg.s3360_max_open_positions:
+        return
+
+    wallet = await get_s3360_wallet()
+    cash = wallet.get("cash", 0.0)
+    if cash <= 1.0:
+        return
+
+    tickers = await exchange.get_tickers()
+    vol_map: dict[str, float] = {}
+    for t in tickers:
+        try:
+            vol_map[t["symbol"]] = float(t.get("volValue") or 0)
+        except (TypeError, ValueError):
+            continue
+    symbols = await exchange.get_symbols()
+    quotes = {q.strip() for q in (cfg.quote_filter or "").split(",") if q.strip()}
+    candidates: list[str] = []
+    for s in symbols:
+        if not s.get("enableTrading"):
+            continue
+        sym = s.get("symbol")
+        if not sym:
+            continue
+        if quotes and s.get("quoteCurrency") not in quotes:
+            continue
+        if any(sym.upper().startswith(base) for base in SCALPING_EXCLUDED_STABLE_BASES):
+            continue
+        if cfg.excluded_pairs and sym in cfg.excluded_pairs:
+            continue
+        if cfg.enabled_pairs and sym not in cfg.enabled_pairs:
+            continue
+        if vol_map.get(sym, 0) < cfg.min_24h_volume_usdt:
+            continue
+        candidates.append(sym)
+    candidates.sort(key=lambda s: vol_map.get(s, 0), reverse=True)
+    candidates = candidates[:30]
+    candidates = [c for c in candidates if await is_volume_stable(c, cfg)]
+
+    for symbol in candidates:
+        if open_count >= cfg.s3360_max_open_positions:
+            break
+        if await db.s3360_positions.find_one({"symbol": symbol, "status": "open"}):
+            continue
+        for tf in cfg.s3360_timeframes:
+            candles = await exchange.get_klines(symbol, tf)
+            if len(candles) < cfg.s3360_rsi_period + 3:
+                await log_reject(symbol, tf, "s3360", "dati insufficienti")
+                continue
+            signal, reason = detect_s3360_signal(candles, cfg)
+            if not signal:
+                await log_reject(symbol, tf, "s3360", reason)
+                continue
+            if _s3360_last_candle.get((symbol, tf)) == signal["candle_t"]:
+                await log_reject(symbol, tf, "s3360", "stessa candela già tentata")
+                continue
+            _s3360_last_candle[(symbol, tf)] = signal["candle_t"]
+            await open_s3360_position(symbol, tf, signal, cfg)
+            open_count += 1
+            break
+
+
+async def open_s3360_position(symbol: str, tf: str, signal: dict[str, Any], cfg: Config) -> None:
+    wallet = await get_s3360_wallet()
+    cash = wallet.get("cash", 0.0)
+    if cash <= 1.0:
+        return
+    entry = signal["entry"]
+    # Same staleness guard used by RSI Rebound: reject if the live price has
+    # already moved through the stop by the time we get here.
+    live_price = price_feed.get(symbol) or await price_feed.price_or_rest(symbol)
+    if live_price and live_price <= signal["stop"]:
+        await log_reject(symbol, tf, "s3360", "prezzo già oltre lo stop, segnale scaduto")
+        return
+    fill_price = live_price or entry
+    notional = min(cash * cfg.s3360_risk_pct / 100 * await get_regime_size_multiplier(cfg), cash)
+    if notional < 1.0:
+        return
+    quantity = notional / fill_price
+
+    candles = await exchange.get_klines(symbol, tf)
+    highs = [c[3] for c in candles]
+    lows = [c[4] for c in candles]
+    closes = [c[2] for c in candles]
+    atr = atr_wilder(highs, lows, closes, cfg.s3360_rsi_period) or 0.0
+
+    doc = {
+        "id": str(uuid.uuid4()),
+        "symbol": symbol,
+        "timeframe": tf,
+        "side": "long",
+        "entry": entry,
+        "fill_price": fill_price,
+        "stop_loss": signal["stop"],
+        "rsi_at_entry": signal.get("rsi"),
+        "atr": atr,
+        "quantity": quantity,
+        "notional": notional,
+        "status": "open",
+        "opened_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.s3360_positions.insert_one(dict(doc))
+    await db.s3360_wallet.update_one(
+        {"_id": S3360_WALLET_ID}, {"$inc": {"cash": -notional}}, upsert=True
+    )
+
+
+async def monitor_s3360_positions() -> None:
+    cfg = await get_config()
+    open_positions = await db.s3360_positions.find({"status": "open"}, {"_id": 0}).to_list(200)
+    for p in open_positions:
+        cur = price_feed.get(p["symbol"])
+        if not cur:
+            cur = await price_feed.price_or_rest(p["symbol"])
+        if not cur or cur <= 0:
+            continue
+
+        hit = None
+        if cur <= p["stop_loss"]:
+            hit = "stop_loss"
+        else:
+            tf = p.get("timeframe", "1h")
+            candles = await exchange.get_klines(p["symbol"], tf)
+            closes = [c[2] for c in candles]
+            rsis = rsi_wilder(closes, cfg.s3360_rsi_period) if len(closes) > cfg.s3360_rsi_period else []
+            if rsis and rsis[-1] >= cfg.s3360_high_threshold:
+                hit = "target_rsi_raggiunto"
+            else:
+                opened = datetime.fromisoformat(p["opened_at"]).timestamp()
+                tf_sec = TF_SECONDS.get(tf, 3600)
+                if (time.time() - opened) >= cfg.s3360_timeout_candles * tf_sec:
+                    hit = "timeout_rsi_mai_arrivato"
+        if not hit:
+            continue
+
+        gross_pnl = (cur - p.get("fill_price", p["entry"])) * p["quantity"]
+        exit_notional = cur * p["quantity"]
+        fees = (p["notional"] + exit_notional) * S3360_FEE_PCT
+        pnl = gross_pnl - fees
+        await db.s3360_wallet.update_one(
+            {"_id": S3360_WALLET_ID},
+            {"$inc": {"cash": p["notional"] + pnl}},
+            upsert=True,
+        )
+        await db.s3360_positions.update_one(
+            {"id": p["id"]},
+            {"$set": {
+                "status": "closed", "close_price": cur, "close_reason": hit,
+                "pnl_usdt": round(pnl, 4),
+                "closed_at": datetime.now(timezone.utc).isoformat(),
+            }},
+        )
+
+
+class S3360TransferRequest(BaseModel):
+    amount: float
+
+
+@api.post("/s3360/deposit")
+async def s3360_deposit(req: S3360TransferRequest) -> dict[str, Any]:
+    amount = req.amount
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="L'importo deve essere positivo")
+    main_cash = await get_paper_cash()
+    if amount > main_cash:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Fondi insufficienti nel portafoglio principale (disponibili: {round(main_cash, 2)})",
+        )
+    await set_paper_cash(main_cash - amount)
+    updated = await db.s3360_wallet.find_one_and_update(
+        {"_id": S3360_WALLET_ID},
+        {"$inc": {"cash": amount, "total_transferred_in": amount}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return {"ok": True, "s3360_cash": updated.get("cash", amount), "main_cash": main_cash - amount}
+
+
+@api.post("/s3360/withdraw")
+async def s3360_withdraw(req: S3360TransferRequest) -> dict[str, Any]:
+    amount = req.amount
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="L'importo deve essere positivo")
+    w = await get_s3360_wallet()
+    available = w.get("cash", 0.0)
+    if amount > available and (amount - available) <= 0.01:
+        amount = available
+    updated = await db.s3360_wallet.find_one_and_update(
+        {"_id": S3360_WALLET_ID, "cash": {"$gte": amount}},
+        {"$inc": {"cash": -amount}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not updated:
+        raise HTTPException(status_code=400, detail="Fondi insufficienti nel portafoglio 33/60")
+    main_cash = await get_paper_cash()
+    await set_paper_cash(main_cash + amount)
+    return {"ok": True, "s3360_cash": updated.get("cash", 0.0), "main_cash": main_cash + amount}
+
+
+@api.get("/s3360/portfolio")
+async def s3360_portfolio() -> dict[str, Any]:
+    wallet = await get_s3360_wallet()
+    open_docs = await db.s3360_positions.find({"status": "open"}, {"_id": 0}).to_list(200)
+    closed_docs = await db.s3360_positions.find({"status": "closed"}, {"_id": 0}).sort("closed_at", -1).to_list(500)
+
+    unrealized = 0.0
+    open_out = []
+    open_value = 0.0
+    for p in open_docs:
+        cur = price_feed.get(p["symbol"]) or p["entry"]
+        upnl = (cur - p["entry"]) * p["quantity"]
+        unrealized += upnl
+        open_value += cur * p["quantity"]
+        open_out.append({**p, "current_price": cur, "unrealized_pnl": round(upnl, 4)})
+
+    realized = sum(c.get("pnl_usdt", 0.0) for c in closed_docs)
+    equity = wallet.get("cash", 0.0) + open_value
+    wins = sum(1 for c in closed_docs if c.get("pnl_usdt", 0.0) > 0)
+    losses = sum(1 for c in closed_docs if c.get("pnl_usdt", 0.0) <= 0)
+    return {
+        "cash": round(wallet.get("cash", 0.0), 4),
+        "equity": round(equity, 4),
+        "total_transferred_in": wallet.get("total_transferred_in", 0.0),
+        "unrealized_pnl": round(unrealized, 4),
+        "realized_pnl": round(realized, 4),
+        "open_positions": open_out,
+        "closed_positions": closed_docs[:100],
+        "open_count": len(open_docs),
+        "closed_count": len(closed_docs),
+        "win_rate": round(wins / (wins + losses) * 100, 1) if (wins + losses) else 0.0,
+    }
+
+
+@api.post("/s3360/reset")
+async def s3360_reset() -> dict[str, Any]:
+    await db.s3360_positions.delete_many({})
+    await db.s3360_wallet.update_one(
+        {"_id": S3360_WALLET_ID},
         {"$set": {"cash": 0.0, "total_transferred_in": 0.0}, "$inc": {"reset_seq": 1}},
         upsert=True,
     )

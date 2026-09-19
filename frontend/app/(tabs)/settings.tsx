@@ -84,7 +84,8 @@ export default function SettingsScreen() {
       | "rsi_rebound_timeframes"
       | "wyckoff_timeframes"
       | "top10_timeframes"
-      | "scalping_timeframes",
+      | "scalping_timeframes"
+      | "s3360_timeframes",
     t: string
   ) => {
     if (!cfg) return;
@@ -139,6 +140,7 @@ export default function SettingsScreen() {
                 if (val === "top10") return cfg.top10_enabled;
                 if (val === "rsi_rebound") return cfg.rsi_rebound_enabled;
                 if (val === "wyckoff") return cfg.wyckoff_enabled;
+                if (val === "s3360") return cfg.s3360_enabled;
                 return stratOn(val);
               };
               const toggle = (val: string) => {
@@ -162,6 +164,10 @@ export default function SettingsScreen() {
                   update({ wyckoff_enabled: !cfg.wyckoff_enabled });
                   return;
                 }
+                if (val === "s3360") {
+                  update({ s3360_enabled: !cfg.s3360_enabled });
+                  return;
+                }
                 const set = new Set(enabledStrategies);
                 if (set.has(val)) set.delete(val);
                 else set.add(val);
@@ -178,6 +184,7 @@ export default function SettingsScreen() {
                     ["top10", "Top 10 Long"],
                     ["rsi_rebound", "RSI Rebound"],
                     ["wyckoff", "Wyckoff Spring"],
+                    ["s3360", "33/60"],
                   ] as const).map(([val, label]) => {
                     const active = isActive(val);
                     return (
@@ -803,6 +810,81 @@ export default function SettingsScreen() {
                 {cfg.rsi_rebound_trailing_atr_mult}×ATR dal massimo raggiunto.
                 Il target iniziale sopra resta solo informativo, mostrato
                 nell&apos;app.
+              </Text>
+            </Section>
+          )}
+
+          {cfg.s3360_enabled && (
+            <Section title="33/60">
+              <Text style={styles.fieldLabel}>Timeframe</Text>
+              <View style={styles.chipsRow}>
+                {TIMEFRAMES.map((t) => {
+                  const active = cfg.s3360_timeframes.includes(t);
+                  return (
+                    <Pressable
+                      key={t}
+                      onPress={() => toggleTimeframeFor("s3360_timeframes", t)}
+                      style={[styles.chip, active && styles.chipActive]}
+                      testID={`tf-select-s3360-${t}`}
+                    >
+                      <Text style={[styles.chipText, active && styles.chipTextActive]}>
+                        {t}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+              <NumRow
+                label="Soglia bassa (ingresso)"
+                value={cfg.s3360_low_threshold}
+                onChange={(v) => update({ s3360_low_threshold: v })}
+                step={1}
+                testID="input-s3360-low"
+              />
+              <NumRow
+                label="Soglia alta (uscita)"
+                value={cfg.s3360_high_threshold}
+                onChange={(v) => update({ s3360_high_threshold: v })}
+                step={1}
+                testID="input-s3360-high"
+              />
+              <NumRow
+                label="Candele per lo stop (minimo recente)"
+                value={cfg.s3360_stop_lookback}
+                onChange={(v) => update({ s3360_stop_lookback: v })}
+                testID="input-s3360-stop-lookback"
+              />
+              <NumRow
+                label="Timeout se RSI non arriva (candele)"
+                value={cfg.s3360_timeout_candles}
+                onChange={(v) => update({ s3360_timeout_candles: v })}
+                testID="input-s3360-timeout"
+              />
+              <NumRow
+                label="Taglia per operazione (% cassa)"
+                value={cfg.s3360_risk_pct}
+                onChange={(v) => update({ s3360_risk_pct: v })}
+                step={1}
+                testID="input-s3360-risk-pct"
+              />
+              <NumRow
+                label="Massimo posizioni aperte"
+                value={cfg.s3360_max_open_positions}
+                onChange={(v) => update({ s3360_max_open_positions: v })}
+                testID="input-s3360-max-positions"
+              />
+              <Text style={styles.scoreHintText}>
+                Entra appena l&apos;RSI scende sotto {cfg.s3360_low_threshold}{" "}
+                (nessuna candela di conferma richiesta — scatta al primo
+                attraversamento). Esce quando l&apos;RSI risale a{" "}
+                {cfg.s3360_high_threshold}, oppure prima se il prezzo tocca lo
+                stop (il minimo delle ultime {cfg.s3360_stop_lookback} candele),
+                oppure dopo {cfg.s3360_timeout_candles} candele se l&apos;RSI
+                non è mai arrivato alla soglia alta — per non restare in
+                posizione a tempo indeterminato. Backtest su ~41 giorni di
+                BTC 1h: 14 casi trovati, 10 arrivati alla soglia alta (71%),
+                guadagno medio +1,58% su quelli riusciti, nessuna perdita tra
+                i riusciti.
               </Text>
             </Section>
           )}

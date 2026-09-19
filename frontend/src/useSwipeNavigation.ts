@@ -12,6 +12,7 @@ export const STRATEGY_ORDER = [
   "/rsi-rebound",
   "/wyckoff",
   "/rsi-reversion",
+  "/s3360",
 ] as const;
 
 export type StrategyPath = (typeof STRATEGY_ORDER)[number];

@@ -136,6 +136,15 @@ export type Config = {
   top10_rsi_period: number;
   top10_atr_period: number;
   rsi_rebound_enabled: boolean;
+  s3360_enabled: boolean;
+  s3360_timeframes: string[];
+  s3360_rsi_period: number;
+  s3360_low_threshold: number;
+  s3360_high_threshold: number;
+  s3360_stop_lookback: number;
+  s3360_timeout_candles: number;
+  s3360_risk_pct: number;
+  s3360_max_open_positions: number;
   rsi_rebound_timeframe: string;
   rsi_rebound_timeframes: string[];
   rsi_rebound_period: number;
@@ -707,6 +716,57 @@ export const rsiReboundApi = {
       { method: "POST", body: JSON.stringify({ amount }) }
     ),
   reset: () => req<{ ok: boolean }>("/rsi-rebound/reset", { method: "POST" }),
+};
+
+// ---------------------------------------------------------------------------
+// 33/60 (RSI crosses down through 35 -> exit once RSI reaches 60, or on
+// stop-loss / timeout if it never gets there)
+// ---------------------------------------------------------------------------
+export type S3360Position = {
+  id: string;
+  symbol: string;
+  side: "long";
+  entry: number;
+  stop_loss: number;
+  quantity: number;
+  notional: number;
+  rsi_at_entry?: number;
+  status: string;
+  opened_at: string;
+  current_price?: number;
+  unrealized_pnl?: number;
+  close_price?: number;
+  close_reason?: string;
+  pnl_usdt?: number;
+  closed_at?: string;
+};
+
+export type S3360Portfolio = {
+  cash: number;
+  equity: number;
+  total_transferred_in: number;
+  unrealized_pnl: number;
+  realized_pnl: number;
+  open_positions: S3360Position[];
+  closed_positions: S3360Position[];
+  open_count: number;
+  closed_count: number;
+  win_rate: number;
+};
+
+export const s3360Api = {
+  portfolio: () => req<S3360Portfolio>("/s3360/portfolio"),
+  deposit: (amount: number) =>
+    req<{ ok: boolean; s3360_cash: number; main_cash: number }>(
+      "/s3360/deposit",
+      { method: "POST", body: JSON.stringify({ amount }) }
+    ),
+  withdraw: (amount: number) =>
+    req<{ ok: boolean; s3360_cash: number; main_cash: number }>(
+      "/s3360/withdraw",
+      { method: "POST", body: JSON.stringify({ amount }) }
+    ),
+  reset: () => req<{ ok: boolean }>("/s3360/reset", { method: "POST" }),
 };
 
 // ---------------------------------------------------------------------------
