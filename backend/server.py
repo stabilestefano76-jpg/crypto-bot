@@ -213,6 +213,7 @@ class Config(BaseModel):
     s3360_low_threshold: float = 35.0  # entry: RSI crosses down through this
     s3360_high_threshold: float = 60.0  # exit target: RSI reaching this closes the trade
     s3360_stop_lookback: int = 10  # candles used to find the structural stop (recent swing low)
+    s3360_stop_atr_mult: float = 2.5  # minimum stop distance in ATR — the actual stop is whichever is FARTHER from entry (structural low vs this), so a volatile move gets more real breathing room instead of closing on the first small dip below a tight recent low
     s3360_timeout_candles: int = 40  # matches the backtest window — if RSI never reaches the target within this many candles, close at market instead of holding indefinitely
     s3360_max_open_positions: int = 4  # ALSO doubles as the capital-sizing divisor: each trade gets equity/max_open_positions — e.g. 2 slots = 50% each, 4 slots = 25% each. Not just a cap on count.
     rsi_rebound_timeframe: str = "1h"  # kept for backward compatibility with old stored configs — no longer read directly, see rsi_rebound_timeframes below
@@ -6075,7 +6076,11 @@ async def run_s3360_scan() -> None:
                 await log_reject(symbol, tf, "s3360", "stessa candela già tentata")
                 continue
             lows = [c[4] for c in candles]
-            stop = min(lows[-cfg.s3360_stop_lookback:]) * 0.998
+            highs = [c[3] for c in candles]
+            structural_stop = min(lows[-cfg.s3360_stop_lookback:]) * 0.998
+            atr = atr_wilder(highs, lows, closes, cfg.s3360_rsi_period) or 0.0
+            atr_stop = live_price - cfg.s3360_stop_atr_mult * atr
+            stop = min(structural_stop, atr_stop)  # whichever is FARTHER below entry — more breathing room, not less
             if live_price <= stop:
                 await log_reject(symbol, tf, "s3360", "stop non valido rispetto all'entrata")
                 continue

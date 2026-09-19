@@ -855,6 +855,13 @@ export default function SettingsScreen() {
                 testID="input-s3360-stop-lookback"
               />
               <NumRow
+                label="Margine minimo dello stop (×ATR)"
+                value={cfg.s3360_stop_atr_mult}
+                onChange={(v) => update({ s3360_stop_atr_mult: v })}
+                step={0.5}
+                testID="input-s3360-stop-atr"
+              />
+              <NumRow
                 label="Timeout se RSI non arriva (candele)"
                 value={cfg.s3360_timeout_candles}
                 onChange={(v) => update({ s3360_timeout_candles: v })}
@@ -871,18 +878,23 @@ export default function SettingsScreen() {
                 (nessuna candela di conferma richiesta — scatta al primo
                 attraversamento). Esce quando l&apos;RSI risale a{" "}
                 {cfg.s3360_high_threshold}, oppure prima se il prezzo tocca lo
-                stop (il minimo delle ultime {cfg.s3360_stop_lookback} candele),
-                oppure dopo {cfg.s3360_timeout_candles} candele se l&apos;RSI
-                non è mai arrivato alla soglia alta — per non restare in
-                posizione a tempo indeterminato. La taglia di ogni operazione
-                non è più una percentuale fissa: si calcola dividendo il
-                capitale totale (cassa più valore delle posizioni aperte) per
-                il numero scelto sopra — con 1 operazione usa tutto il
-                capitale, con 2 metà ciascuna, con 4 un quarto ciascuna,
-                sempre riferito al totale e non a quanto resta libero in quel
-                momento. Backtest su ~41 giorni di BTC 1h: 14 casi trovati, 10
-                arrivati alla soglia alta (71%), guadagno medio +1,58% su
-                quelli riusciti, nessuna perdita tra i riusciti.
+                stop, oppure dopo {cfg.s3360_timeout_candles} candele se
+                l&apos;RSI non è mai arrivato alla soglia alta — per non
+                restare in posizione a tempo indeterminato. Lo stop non è più
+                solo il minimo delle ultime {cfg.s3360_stop_lookback} candele:
+                si prende il più largo tra quel livello e un margine di{" "}
+                {cfg.s3360_stop_atr_mult}×ATR dall&apos;entrata — così in un
+                mercato più mosso l&apos;operazione ha più respiro invece di
+                chiudersi al primo piccolo ritracciamento. La taglia di ogni
+                operazione non è più una percentuale fissa: si calcola
+                dividendo il capitale totale (cassa più valore delle posizioni
+                aperte) per il numero scelto sopra — con 1 operazione usa
+                tutto il capitale, con 2 metà ciascuna, con 4 un quarto
+                ciascuna, sempre riferito al totale e non a quanto resta
+                libero in quel momento. Backtest su ~41 giorni di BTC 1h: 14
+                casi trovati, 10 arrivati alla soglia alta (71%), guadagno
+                medio +1,58% su quelli riusciti, nessuna perdita tra i
+                riusciti.
               </Text>
             </Section>
           )}
