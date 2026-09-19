@@ -6159,7 +6159,10 @@ async def monitor_s3360_positions() -> None:
             if rsis and rsis[-1] >= cfg.s3360_high_threshold:
                 hit = "target_rsi_raggiunto"
             else:
-                opened = datetime.fromisoformat(p["opened_at"]).timestamp()
+                try:
+                    opened = datetime.fromisoformat(p["opened_at"]).timestamp()
+                except (ValueError, TypeError):
+                    opened = time.time()  # malformed timestamp — treat as just-opened rather than crashing the whole monitor loop
                 tf_sec = TF_SECONDS.get(tf, 3600)
                 if (time.time() - opened) >= cfg.s3360_timeout_candles * tf_sec:
                     hit = "timeout_rsi_mai_arrivato"
