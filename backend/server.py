@@ -5600,7 +5600,7 @@ async def top10_portfolio() -> dict[str, Any]:
     open_out = []
     open_value = 0.0
     for pos in open_docs:
-        cur = price_feed.get(pos["symbol"]) or pos["entry"]
+        cur = price_feed.get(pos["symbol"]) or await price_feed.price_or_rest(pos["symbol"]) or pos["entry"]
         upnl = (cur - pos["entry"]) * pos["quantity"] + pos.get("realized_partial_pnl", 0.0)
         unrealized += upnl
         open_value += cur * pos["quantity"]
@@ -5928,7 +5928,7 @@ async def rsi_rebound_portfolio() -> dict[str, Any]:
     open_out = []
     open_value = 0.0
     for p in open_docs:
-        cur = price_feed.get(p["symbol"]) or p["entry"]
+        cur = price_feed.get(p["symbol"]) or await price_feed.price_or_rest(p["symbol"]) or p["entry"]
         upnl = (cur - p["entry"]) * p["quantity"]
         unrealized += upnl
         open_value += cur * p["quantity"]
@@ -6244,7 +6244,7 @@ async def s3360_portfolio() -> dict[str, Any]:
     open_out = []
     open_value = 0.0
     for p in open_docs:
-        cur = price_feed.get(p["symbol"]) or p["entry"]
+        cur = price_feed.get(p["symbol"]) or await price_feed.price_or_rest(p["symbol"]) or p["entry"]
         upnl = (cur - p["entry"]) * p["quantity"]
         unrealized += upnl
         open_value += cur * p["quantity"]
@@ -6606,7 +6606,7 @@ async def wyckoff_portfolio() -> dict[str, Any]:
     open_out = []
     open_value = 0.0
     for p in open_docs:
-        cur = price_feed.get(p["symbol"]) or p["entry"]
+        cur = price_feed.get(p["symbol"]) or await price_feed.price_or_rest(p["symbol"]) or p["entry"]
         upnl = (cur - p["entry"]) * p["quantity"]
         unrealized += upnl
         open_value += cur * p["quantity"]
