@@ -201,6 +201,17 @@ export default function SignalsScreen() {
             <Ionicons name="repeat" size={16} color={colors.brand} />
           </Pressable>
           <Pressable
+            onPress={() => router.push("/s3360")}
+            style={({ pressed }) => [
+              styles.scanBtn,
+              { backgroundColor: colors.surfaceTertiary },
+              pressed && { opacity: 0.6 },
+            ]}
+            testID="s3360-button"
+          >
+            <Ionicons name="trending-up" size={16} color={colors.brand} />
+          </Pressable>
+          <Pressable
             onPress={() => router.push("/strategies")}
             style={({ pressed }) => [
               styles.scanBtn,
