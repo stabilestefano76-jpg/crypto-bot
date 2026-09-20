@@ -212,9 +212,6 @@ class Config(BaseModel):
     s3360_rsi_period: int = 14
     s3360_low_threshold: float = 35.0  # entry: RSI crosses down through this
     s3360_high_threshold: float = 60.0  # exit target: RSI reaching this closes the trade
-    s3360_stop_lookback: int = 10  # candles used to find the structural stop (recent swing low)
-    s3360_stop_atr_mult: float = 2.5  # minimum stop distance in ATR — the actual stop is whichever is FARTHER from entry (structural low vs this), so a volatile move gets more real breathing room instead of closing on the first small dip below a tight recent low
-    s3360_timeout_candles: int = 40  # matches the backtest window — if RSI never reaches the target within this many candles, close at market instead of holding indefinitely
     s3360_max_open_positions: int = 4  # ALSO doubles as the capital-sizing divisor: each trade gets equity/max_open_positions — e.g. 2 slots = 50% each, 4 slots = 25% each. Not just a cap on count.
     rsi_rebound_timeframe: str = "1h"  # kept for backward compatibility with old stored configs — no longer read directly, see rsi_rebound_timeframes below
     rsi_rebound_timeframes: list[str] = Field(default_factory=lambda: ["1h"])
@@ -6075,17 +6072,8 @@ async def run_s3360_scan() -> None:
             if _s3360_last_candle.get((symbol, tf)) == forming_candle_t:
                 await log_reject(symbol, tf, "s3360", "stessa candela già tentata")
                 continue
-            lows = [c[4] for c in candles]
-            highs = [c[3] for c in candles]
-            structural_stop = min(lows[-cfg.s3360_stop_lookback:]) * 0.998
-            atr = atr_wilder(highs, lows, closes, cfg.s3360_rsi_period) or 0.0
-            atr_stop = live_price - cfg.s3360_stop_atr_mult * atr
-            stop = min(structural_stop, atr_stop)  # whichever is FARTHER below entry — more breathing room, not less
-            if live_price <= stop:
-                await log_reject(symbol, tf, "s3360", "stop non valido rispetto all'entrata")
-                continue
             _s3360_last_candle[(symbol, tf)] = forming_candle_t
-            signal = {"entry": live_price, "stop": stop, "rsi": live_rsi, "candle_t": forming_candle_t}
+            signal = {"entry": live_price, "rsi": live_rsi, "candle_t": forming_candle_t}
             await open_s3360_position(symbol, tf, signal, cfg)
             open_count += 1
             break
@@ -6097,12 +6085,7 @@ async def open_s3360_position(symbol: str, tf: str, signal: dict[str, Any], cfg:
     if cash <= 1.0:
         return
     entry = signal["entry"]
-    # Same staleness guard used by RSI Rebound: reject if the live price has
-    # already moved through the stop by the time we get here.
     live_price = price_feed.get(symbol) or await price_feed.price_or_rest(symbol)
-    if live_price and live_price <= signal["stop"]:
-        await log_reject(symbol, tf, "s3360", "prezzo già oltre lo stop, segnale scaduto")
-        return
     fill_price = live_price or entry
     # Size each trade as a fixed share of TOTAL equity (cash + value of
     # currently open positions), not just the free cash — so "N slots"
@@ -6133,7 +6116,6 @@ async def open_s3360_position(symbol: str, tf: str, signal: dict[str, Any], cfg:
         "side": "long",
         "entry": entry,
         "fill_price": fill_price,
-        "stop_loss": signal["stop"],
         "rsi_at_entry": signal.get("rsi"),
         "atr": atr,
         "quantity": quantity,
@@ -6158,27 +6140,16 @@ async def monitor_s3360_positions() -> None:
             continue
 
         hit = None
-        if cur <= p["stop_loss"]:
-            hit = "stop_loss"
-        else:
-            tf = p.get("timeframe", "1h")
-            candles = await exchange.get_klines(p["symbol"], tf)
-            # Live exit: same principle as entry — use the real-time price as
-            # the still-forming candle's close, so a touch of the target RSI
-            # closes the trade immediately instead of waiting for the candle
-            # to finish (which could let the touch reverse away unrealized).
-            closes = [c[2] for c in candles] + [cur]
-            rsis = rsi_wilder(closes, cfg.s3360_rsi_period) if len(closes) > cfg.s3360_rsi_period else []
-            if rsis and rsis[-1] >= cfg.s3360_high_threshold:
-                hit = "target_rsi_raggiunto"
-            else:
-                try:
-                    opened = datetime.fromisoformat(p["opened_at"]).timestamp()
-                except (ValueError, TypeError):
-                    opened = time.time()  # malformed timestamp — treat as just-opened rather than crashing the whole monitor loop
-                tf_sec = TF_SECONDS.get(tf, 3600)
-                if (time.time() - opened) >= cfg.s3360_timeout_candles * tf_sec:
-                    hit = "timeout_rsi_mai_arrivato"
+        tf = p.get("timeframe", "1h")
+        candles = await exchange.get_klines(p["symbol"], tf)
+        # Live exit: same principle as entry — use the real-time price as
+        # the still-forming candle's close, so a touch of the target RSI
+        # closes the trade immediately instead of waiting for the candle
+        # to finish (which could let the touch reverse away unrealized).
+        closes = [c[2] for c in candles] + [cur]
+        rsis = rsi_wilder(closes, cfg.s3360_rsi_period) if len(closes) > cfg.s3360_rsi_period else []
+        if rsis and rsis[-1] >= cfg.s3360_high_threshold:
+            hit = "target_rsi_raggiunto"
         if not hit:
             continue
 
