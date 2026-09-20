@@ -124,7 +124,6 @@ export default function S3360Screen() {
           Entrata {p.entry.toFixed(4)}
           {!closed && p.current_price ? `  ·  Attuale ${p.current_price.toFixed(4)}` : ""}
         </Text>
-        <Text style={styles.posMeta}>SL {p.stop_loss.toFixed(4)}</Text>
         <View style={styles.posFooter}>
           <Text style={[styles.posPnl, { color: pnlColor }]}>
             {pnl >= 0 ? "+" : ""}
