@@ -4833,7 +4833,14 @@ async def monitor_grid_instances() -> None:
                 notional = grid["notional_per_cell"]
                 if notional < 1.0 or notional > cash:
                     continue
-                qty = notional / cur
+                # Fill AT the cell's own level, not the live price — a real
+                # limit order at this level fills there even if price already
+                # gapped further down by the time we notice. Using live
+                # price here was the cause of multiple cells all recording
+                # the same "entry" when several got crossed in one tick
+                # (e.g. catching up after being stuck armed for a while).
+                fill_price = cell["buy_price"]
+                qty = notional / fill_price
                 # Debit atomically FIRST, guarded on the reset counter: if a
                 # Reset happened since we read the wallet, this matches
                 # nothing and we skip the fill entirely (no ghost position).
@@ -4850,7 +4857,7 @@ async def monitor_grid_instances() -> None:
                     "grid_id": grid["id"],
                     "symbol": grid["symbol"],
                     "cell_index": cell["index"],
-                    "entry": cur,
+                    "entry": fill_price,
                     "target": cell["sell_price"],
                     "quantity": qty,
                     "notional": notional,
