@@ -160,7 +160,7 @@ class Config(BaseModel):
     rsi_rev_min_extreme_candles: int = 3  # min candles RSI must stay beyond 80/20 before reentry counts
     rsi_rev_catastrophic_atr_mult: float = 3.0  # wide safety stop, only for extreme/structural cases — lowered from 5-6: combined with the new min R:R gate below, an overly wide floor here was rejecting/mismatching too many otherwise-valid setups
     rsi_rev_structural_lookback: int = 10  # candles used to find the recent swing high/low that now anchors the stop, with the ATR buffer above only as a minimum safety margin
-    rsi_rev_min_rr_ratio: float = 3.0  # minimum natural reward:risk (target-to-mean distance vs stop distance) required to take the trade — rejects the setup outright rather than artificially tightening the stop to force a ratio the structure doesn't support
+    rsi_rev_min_rr_ratio: float = 1.5  # was 3.0 — zero trades fired in days at that bar; still requires a genuinely favorable setup (reward at least 1.5x the risk), just not an extreme one that almost never occurs naturally
     rsi_rev_trailing_atr_mult: float = 3.0  # wide trailing once in profit — only to catch a genuine sudden reversal, not to lock in small moves
     rsi_rev_trailing_activation_margin_pct: float = 0.5  # trailing now activates only once profit clears an ESTIMATED round-trip fee cost plus this extra % — not at the very first cent of profit, which was too easy to trigger on pure noise
     # --- Grid Bot (independent strategy: range/laterale trading) ---
@@ -240,6 +240,7 @@ class Config(BaseModel):
     wyckoff_max_range_atr_mult: float = 4.0  # range height must be no wider than this many ATR to count as genuine accumulation, not a trend
     wyckoff_risk_pct: float = 5.0  # % of wallet cash used as position notional per trade
     wyckoff_trailing_atr_mult: float = 1.5
+    wyckoff_max_stop_atr_mult: float = 2.5  # caps how far below entry the stop can be, even if the Spring's own low was a much deeper wick — without this, one unusually deep Spring can lose far more than several typical wins combined
     wyckoff_max_open_positions: int = 5
     regime_risk_reduction_pct: float = 50.0  # position size cut applied to Scalping/RSI Reversion/RSI Rebound whenever BTC's regime isn't clearly bullish (range or bearish) — trims risk during an uncertain/consolidating phase instead of sizing every trade the same
 
@@ -6372,7 +6373,10 @@ def detect_wyckoff_spring_setup(candles: list[list[float]], cfg: Config) -> tupl
         return None, "volume dell'ultima candela non più leggero del SOS"
 
     entry = closes[lps_idx]
-    stop = min(lows[spring_idx], lows[lps_idx]) * 0.998
+    structural_stop = min(lows[spring_idx], lows[lps_idx]) * 0.998
+    atr = atr_wilder(highs, lows, closes, cfg.atr_period) or 0.0
+    capped_stop = entry - cfg.wyckoff_max_stop_atr_mult * atr if atr > 0 else structural_stop
+    stop = max(structural_stop, capped_stop)  # whichever is CLOSER to entry — caps how deep a risk the Spring's own wick can force onto the trade
     if entry <= stop:
         return None, "stop non valido rispetto all'entrata"
     target = entry + (resistance - support)  # measured-move target from range height
