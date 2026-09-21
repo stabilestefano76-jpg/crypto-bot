@@ -4373,7 +4373,17 @@ async def build_grid_plan(symbol: str, tf: str, cfg: Config) -> Optional[dict[st
     if not bullish_fvgs:
         await log_reject(symbol, tf, "grid", "nessuna FVG rialzista trovata")
         return None
-    origin = max(bullish_fvgs, key=lambda f: f["gap"])  # most significant impulse
+    current = closes[-1]
+    # Filter to zones price is actually near RIGHT NOW before picking the
+    # most significant one — otherwise a big-but-stale FVG from days ago
+    # keeps winning on size alone even when price has since moved well away
+    # from it, permanently blocking a fresher, closer (if smaller) zone that
+    # would actually be tradeable.
+    nearby_fvgs = [f for f in bullish_fvgs if current <= f["top"] * 1.02 and current >= f["bottom"] * 0.97]
+    if not nearby_fvgs:
+        await log_reject(symbol, tf, "grid", "prezzo troppo lontano dalla zona FVG")
+        return None
+    origin = max(nearby_fvgs, key=lambda f: f["gap"])  # most significant impulse among the zones still actually relevant
     fvg_top, fvg_bottom = origin["top"], origin["bottom"]
     # Reject a degenerate (near-zero-height) FVG outright — this is what
     # caused a real bug: when the gap barely has any height, every cell's
@@ -4385,12 +4395,6 @@ async def build_grid_plan(symbol: str, tf: str, cfg: Config) -> Optional[dict[st
         await log_reject(symbol, tf, "grid", "FVG troppo stretta")
         return None
 
-    current = closes[-1]
-    # Only relevant if price is actually retracing at/near the zone right
-    # now — not still far above it, and not already broken well below it.
-    if current > fvg_top * 1.02 or current < fvg_bottom * 0.97:
-        await log_reject(symbol, tf, "grid", "prezzo troppo lontano dalla zona FVG")
-        return None
 
     i = origin["index"]
     lookback_start = max(0, i - 15)
