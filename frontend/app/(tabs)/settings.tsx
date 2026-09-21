@@ -505,21 +505,33 @@ export default function SettingsScreen() {
                 step={1}
                 testID="input-scalping-risk-pct"
               />
+              <NumRow
+                label="Volume minimo richiesto (× media)"
+                value={cfg.scalping_volume_multiplier}
+                onChange={(v) => update({ scalping_volume_multiplier: v })}
+                step={0.1}
+                testID="input-scalping-volume-mult"
+              />
               <Text style={styles.scoreHintText}>
                 EMA9/21 + VWAP + Bollinger su 5m, con RSI(9) come conferma di
-                momentum (sopra 50 per i long, sotto 50 per gli short) e un
-                controllo sul trend del timeframe superiore (scarta i long in
-                un trend ribassista netto, e viceversa) — evita di aprire
-                operazioni che remano contro la corrente generale. Stop e
-                target si adattano all&apos;ATR di ogni coppia invece di una
-                percentuale fissa uguale per tutte — allargati di recente
-                (stop a {cfg.scalping_sl_atr_mult}×ATR, target a{" "}
+                momentum (sopra 55 per i long, sotto 45 per gli short — alzato
+                da 50 per richiedere un momentum più deciso, non solo un
+                attraversamento marginale) e un controllo sul trend del
+                timeframe superiore (scarta i long in un trend ribassista
+                netto, e viceversa) — evita di aprire operazioni che remano
+                contro la corrente generale. Richiede anche un volume almeno{" "}
+                {cfg.scalping_volume_multiplier}× la media recente (alzato da
+                1,5×) per filtrare i segnali più deboli. Stop e target si
+                adattano all&apos;ATR di ogni coppia invece di una percentuale
+                fissa uguale per tutte — allargati di recente (stop a{" "}
+                {cfg.scalping_sl_atr_mult}×ATR, target a{" "}
                 {cfg.scalping_tp_atr_mult}×ATR) così il normale rumore di
                 prezzo non chiude l&apos;operazione prima che un movimento
-                vero si sviluppi. Taglia per operazione al{" "}
-                {cfg.scalping_risk_pct}% della cassa, così anche una vincita
-                modesta in percentuale genera un guadagno che si sente reale
-                in valore assoluto. Massimo{" "}
+                vero si sviluppi, e un target più largo lascia più spazio a
+                un&apos;operazione vincente prima che scatti il trailing.
+                Taglia per operazione al {cfg.scalping_risk_pct}% della
+                cassa, così anche una vincita modesta in percentuale genera
+                un guadagno che si sente reale in valore assoluto. Massimo{" "}
                 {cfg.scalping_max_open_positions} operazioni aperte insieme,
                 per non accumulare rischio correlato in un solo movimento di
                 mercato.

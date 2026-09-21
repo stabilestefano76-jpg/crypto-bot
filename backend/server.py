@@ -93,13 +93,13 @@ class Config(BaseModel):
     scalping_bb_std: float = 2.0
     scalping_ema_fast: int = 9
     scalping_ema_slow: int = 21
-    scalping_volume_multiplier: float = 1.5
+    scalping_volume_multiplier: float = 2.0  # was 1.5 — requires a stronger volume spike, fewer but higher-conviction signals
     scalping_min_hold_seconds: int = 60  # min time before the invalidation check can close early
     scalping_cooldown_minutes: int = 10  # pause on a symbol after a losing scalping trade
     scalping_invalidation_buffer_pct: float = 0.15  # min % beyond VWAP required, on top of the EMA cross, to count as invalidated
     scalping_max_open_positions: int = 5  # cap on concurrent Scalping trades — was unlimited, which let a correlated batch pile up during a broad market move
     scalping_sl_atr_mult: float = 1.5  # was 1.0 — widened so normal noise doesn't trigger the stop before a real move develops
-    scalping_tp_atr_mult: float = 3.5  # was 2.0 — widened so a winning trade captures a genuinely bigger, more meaningful move before trailing even has a chance to activate
+    scalping_tp_atr_mult: float = 5.0  # was 3.5, before that 2.0 — widened again: win rate (41.7%) and avg win/loss size (+0.93%/-0.59%) showed the edge was real but too thin after fees across many trades; a bigger target gives winners more room before trailing locks anything in
     scalping_risk_pct: float = 12.0  # was a hardcoded 0.08 (fraction) constant — raised further, now adjustable here as a plain percentage (matching rsi_rebound_risk_pct's convention), used as cfg.scalping_risk_pct / 100
     signal_validity_candles: int = 5  # a condition counts if it happened within N bars
     fvg_lookback: int = 40  # how far back to look for an open FVG
@@ -3579,19 +3579,19 @@ def analyze_scalping(highs, lows, closes, volumes, rsis, cfg) -> dict:
     if (
         ema_fast[-1] > ema_slow[-1]
         and last_close > vwap
-        and last_close <= lower_bb * 1.01
-        and last_rsi > 50
+        and last_close <= lower_bb * 1.005
+        and last_rsi > 55
     ):
         side = "long"
-        reasons = ["EMA9>EMA21", "Above VWAP", "Near lower BB", "RSI>50"]
+        reasons = ["EMA9>EMA21", "Above VWAP", "Near lower BB", "RSI>55"]
     elif (
         ema_fast[-1] < ema_slow[-1]
         and last_close < vwap
-        and last_close >= upper_bb * 0.99
-        and last_rsi < 50
+        and last_close >= upper_bb * 0.995
+        and last_rsi < 45
     ):
         side = "short"
-        reasons = ["EMA9<EMA21", "Below VWAP", "Near upper BB", "RSI<50"]
+        reasons = ["EMA9<EMA21", "Below VWAP", "Near upper BB", "RSI<45"]
 
     if vol_ok and side:
         reasons.append("Volume Spike")
