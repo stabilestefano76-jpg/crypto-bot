@@ -4716,6 +4716,7 @@ async def monitor_grid_instances() -> None:
         if not cur:
             continue
         cells = grid["cells"]
+        changed = False
 
         # Emergency stop: price fell well below the lowest grid cell — this
         # means the market broke out of the range into a real downtrend.
