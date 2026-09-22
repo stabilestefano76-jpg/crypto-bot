@@ -5326,7 +5326,10 @@ async def run_top10_scan() -> dict[str, Any]:
             continue
         trend_score, trend_meta = await compute_top10_trend_score(symbol, cfg)
         if regime == "bearish" and trend_score < 50:
-            await log_reject(symbol, cfg.top10_timeframes[0], "top10", "regime ribassista su BTC, trend debole")
+            await log_reject(
+                symbol, cfg.top10_timeframes[0], "top10",
+                f"regime ribassista su BTC ({btc_symbol} punteggio={btc_trend_score:.0f}), trend debole ({trend_score:.0f})",
+            )
             continue
 
         for tf in cfg.top10_timeframes:
