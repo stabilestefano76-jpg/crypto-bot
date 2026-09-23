@@ -2270,7 +2270,7 @@ async def analyze_pair_rsi_reversion(symbol: str, tf: str, cfg: Config) -> Optio
         await log_reject(symbol, tf, STRAT, "target/stop non validi")
         return None
     if (reward / risk) < cfg.rsi_rev_min_rr_ratio:
-        await log_reject(symbol, tf, STRAT, "R:R naturale insufficiente (sotto 1:3)")
+        await log_reject(symbol, tf, STRAT, f"R:R naturale insufficiente (sotto 1:{cfg.rsi_rev_min_rr_ratio:g})")
         return None
 
     vol_ratio = volume_spike_ratio([c[5] for c in candles], cfg.volume_ma_period)
@@ -5168,7 +5168,7 @@ async def compute_top10_trend_score(symbol: str, cfg: Config) -> tuple[float, di
     """0-100 trend-strength gate on the 4H timeframe: price vs EMA200,
     EMA20/50/200 alignment, HH/HL structure, momentum, volume coherence."""
     candles = await exchange.get_klines(symbol, "4h")
-    if len(candles) < cfg.top10_ema_slow + 5:
+    if len(candles) < cfg.top10_ema_slow:
         return 0.0, {}
     closes = [c[2] for c in candles]
     volumes = [c[5] for c in candles]
