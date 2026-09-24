@@ -190,7 +190,10 @@ export default function StrategyScreen() {
     return (
       <View key={p.id} style={styles.posCard}>
         <View style={styles.posTop}>
-          <Text style={styles.posSymbol}>{p.symbol}</Text>
+          <Text style={styles.posSymbol}>
+            {p.symbol}
+            {p.timeframe ? <Text style={styles.posTf}> · {p.timeframe.toUpperCase()}</Text> : null}
+          </Text>
           <View
             style={[
               styles.sideBadge,
@@ -387,7 +390,7 @@ export default function StrategyScreen() {
                     id: t.id,
                     signal_id: t.signal_id,
                     symbol: t.symbol,
-                    timeframe: "",
+                    timeframe: t.timeframe ?? "",
                     side: t.side,
                     entry: t.entry,
                     // Real values now that the backend persists them on close —
@@ -638,6 +641,7 @@ const styles = StyleSheet.create({
     marginBottom: spacing.xs,
   },
   posSymbol: { color: colors.onSurface, fontSize: font.lg, fontWeight: "700" },
+  posTf: { color: colors.onSurfaceSecondary, fontSize: font.sm, fontWeight: "600" },
   sideBadge: { borderRadius: radius.pill, paddingHorizontal: spacing.sm, paddingVertical: 2 },
   sideBadgeText: { color: colors.onSurface, fontSize: font.sm, fontWeight: "700" },
   posMeta: { color: colors.onSurfaceSecondary, fontSize: font.sm, marginBottom: 2 },

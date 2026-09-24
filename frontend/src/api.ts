@@ -224,6 +224,7 @@ export type PaperTrade = {
   opened_at: string;
   closed_at: string;
   strategy?: string;
+  timeframe?: string;
   stop_loss?: number;
   take_profit?: number;
 };
@@ -722,6 +723,7 @@ export const rsiReboundApi = {
 export type S3360Position = {
   id: string;
   symbol: string;
+  timeframe?: string;
   side: "long";
   entry: number;
   quantity: number;

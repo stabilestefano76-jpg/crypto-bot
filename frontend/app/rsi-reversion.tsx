@@ -115,7 +115,10 @@ export default function RsiReversionScreen() {
     return (
       <View key={p.id} style={styles.posCard}>
         <View style={styles.posTop}>
-          <Text style={styles.posSymbol}>{p.symbol}</Text>
+          <Text style={styles.posSymbol}>
+            {p.symbol}
+            {p.timeframe ? <Text style={styles.posTf}> · {p.timeframe.toUpperCase()}</Text> : null}
+          </Text>
           <View
             style={[
               styles.setupBadge,
@@ -466,6 +469,7 @@ const styles = StyleSheet.create({
     marginBottom: spacing.xs,
   },
   posSymbol: { color: colors.onSurface, fontSize: font.lg, fontWeight: "700" },
+  posTf: { color: colors.onSurfaceSecondary, fontSize: font.sm, fontWeight: "600" },
   setupBadge: {
     borderRadius: radius.pill,
     paddingHorizontal: spacing.sm,

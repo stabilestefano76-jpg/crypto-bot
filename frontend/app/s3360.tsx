@@ -113,7 +113,10 @@ export default function S3360Screen() {
     return (
       <View key={p.id} style={styles.posCard}>
         <View style={styles.posTop}>
-          <Text style={styles.posSymbol}>{p.symbol}</Text>
+          <Text style={styles.posSymbol}>
+            {p.symbol}
+            {p.timeframe ? <Text style={styles.posTf}> · {p.timeframe.toUpperCase()}</Text> : null}
+          </Text>
           {p.rsi_at_entry !== undefined && (
             <View style={styles.setupBadge}>
               <Text style={styles.setupBadgeText}>RSI {p.rsi_at_entry.toFixed(0)} → 60</Text>
@@ -200,6 +203,19 @@ export default function S3360Screen() {
               <View style={styles.walletStat}>
                 <Text style={styles.walletLabel}>Posizioni aperte</Text>
                 <Text style={styles.walletValue}>{portfolio?.open_count ?? 0}</Text>
+              </View>
+            </View>
+            <View style={styles.walletRow}>
+              <View style={styles.walletStat}>
+                <Text style={styles.walletLabel}>P&L fluttuante (aperte)</Text>
+                <Text
+                  style={[
+                    styles.walletValue,
+                    { color: (portfolio?.unrealized_pnl ?? 0) >= 0 ? colors.success : colors.error },
+                  ]}
+                >
+                  {money(portfolio?.unrealized_pnl)}
+                </Text>
               </View>
             </View>
 
@@ -437,6 +453,7 @@ const styles = StyleSheet.create({
     marginBottom: spacing.xs,
   },
   posSymbol: { color: colors.onSurface, fontSize: font.lg, fontWeight: "700" },
+  posTf: { color: colors.onSurfaceSecondary, fontSize: font.sm, fontWeight: "600" },
   setupBadge: {
     borderRadius: radius.pill,
     paddingHorizontal: spacing.sm,

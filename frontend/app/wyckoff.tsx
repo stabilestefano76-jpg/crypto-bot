@@ -113,7 +113,10 @@ export default function WyckoffScreen() {
     return (
       <View key={p.id} style={styles.posCard}>
         <View style={styles.posTop}>
-          <Text style={styles.posSymbol}>{p.symbol}</Text>
+          <Text style={styles.posSymbol}>
+            {p.symbol}
+            {p.timeframe ? <Text style={styles.posTf}> · {p.timeframe.toUpperCase()}</Text> : null}
+          </Text>
           <View style={styles.setupBadge}>
             <Text style={styles.setupBadgeText}>LPS</Text>
           </View>
@@ -197,6 +200,19 @@ export default function WyckoffScreen() {
                         100
                       ).toFixed(2)}%)`
                     : ""}
+                </Text>
+              </View>
+            </View>
+            <View style={styles.walletRow}>
+              <View style={styles.walletStat}>
+                <Text style={styles.walletLabel}>P&L fluttuante (aperte)</Text>
+                <Text
+                  style={[
+                    styles.walletValue,
+                    { color: (portfolio?.unrealized_pnl ?? 0) >= 0 ? colors.success : colors.error },
+                  ]}
+                >
+                  {money(portfolio?.unrealized_pnl)}
                 </Text>
               </View>
               <View style={styles.walletStat}>
@@ -439,6 +455,7 @@ const styles = StyleSheet.create({
     marginBottom: spacing.xs,
   },
   posSymbol: { color: colors.onSurface, fontSize: font.lg, fontWeight: "700" },
+  posTf: { color: colors.onSurfaceSecondary, fontSize: font.sm, fontWeight: "600" },
   setupBadge: {
     borderRadius: radius.pill,
     paddingHorizontal: spacing.sm,
