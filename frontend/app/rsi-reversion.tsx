@@ -228,6 +228,19 @@ export default function RsiReversionScreen() {
                 <Text style={styles.walletValue}>{portfolio?.open_count ?? 0}</Text>
               </View>
             </View>
+            <View style={styles.walletRow}>
+              <View style={styles.walletStat}>
+                <Text style={styles.walletLabel}>P&L fluttuante (aperte)</Text>
+                <Text
+                  style={[
+                    styles.walletValue,
+                    { color: (portfolio?.unrealized_pnl ?? 0) >= 0 ? colors.success : colors.error },
+                  ]}
+                >
+                  {money(portfolio?.unrealized_pnl)}
+                </Text>
+              </View>
+            </View>
 
             <View style={styles.depositWithdrawRow}>
               <Pressable
