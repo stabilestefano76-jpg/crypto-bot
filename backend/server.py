@@ -194,7 +194,7 @@ class Config(BaseModel):
     top10_tp1_close_pct: float = 50.0  # % of position closed at TP1
     top10_tp2_pct: float = 3.0  # second take-profit, % above entry
     top10_tp2_close_pct: float = 35.0  # % of ORIGINAL position closed at TP2 (remainder becomes the TP3 "runner")
-    top10_runner_trailing_atr_mult: float = 2.0  # after TP2, the small remaining runner trails by this many ATR — approximates "TP3 = next resistance if momentum stays strong"
+    top10_runner_trailing_atr_mult: float = 0.8  # was 2.0 — that was wider than many post-TP2 moves ever get, so the trailing level sat BELOW the breakeven stop and could never become the binding constraint, giving back the entire extra gain on the runner. Tighter now so it can actually lock in profit on modest continuations too.
     top10_max_daily_losses: int = 2  # consecutive losing trades before pausing for the rest of the UTC day
     top10_max_daily_loss_pct: float = 2.0  # cumulative daily loss (% of wallet) before pausing for the rest of the UTC day
     top10_max_total_risk_pct: float = 2.0  # total risk allowed open at once across all Top10 positions combined
@@ -5222,7 +5222,7 @@ def detect_top10_pullback(cfg: Config, h1_candles: list[list[float]]) -> Optiona
     confirm_volume_up = volumes[-1] > vol_avg
     if pulled_back and near_support and confirm_candle and confirm_volume_up:
         quality = 20 if pullback_vol_declining else 12
-        stop = min(lows[-3:]) * 0.998
+        stop = min(lows[-5:]) * 0.995  # was lows[-3:] * 0.998 — too tight, easily shaken out by ordinary 1h wick noise rather than a genuine invalidation of the pullback
         return {"type": "PULLBACK", "entry": closes[-1], "stop": stop, "quality": quality}
     return None
 
@@ -5456,6 +5456,15 @@ async def monitor_top10_positions() -> None:
             continue
 
         active_stop = pos.get("current_stop", pos["stop_loss"])
+        close_reason_if_stopped = "runner" if pos.get("realized_partial_pnl", 0.0) > 0 else "stop_loss"
+        if pos.get("runner_active"):
+            peak = max(pos.get("peak_price") or cur, cur)
+            if peak != pos.get("peak_price"):
+                await db.top10_positions.update_one({"id": pos["id"]}, {"$set": {"peak_price": peak}})
+            trail_level = peak - cfg.top10_runner_trailing_atr_mult * (pos.get("atr") or 0)
+            if trail_level > active_stop:
+                active_stop = trail_level
+                close_reason_if_stopped = "trailing_stop"
         if cur <= active_stop:
             qty = pos["quantity"]
             notional_portion = pos["entry"] * qty
@@ -5468,7 +5477,7 @@ async def monitor_top10_positions() -> None:
             await db.top10_positions.update_one(
                 {"id": pos["id"]},
                 {"$set": {
-                    "status": "closed", "close_price": cur, "close_reason": "stop_loss",
+                    "status": "closed", "close_price": cur, "close_reason": close_reason_if_stopped,
                     "pnl_usdt": round(total_pnl, 4),
                     "closed_at": datetime.now(timezone.utc).isoformat(),
                 }},
@@ -5535,30 +5544,6 @@ async def monitor_top10_positions() -> None:
                     }},
                 )
             continue
-
-        if pos.get("runner_active"):
-            peak = max(pos.get("peak_price") or cur, cur)
-            if peak != pos.get("peak_price"):
-                await db.top10_positions.update_one({"id": pos["id"]}, {"$set": {"peak_price": peak}})
-            trail_level = peak - cfg.top10_runner_trailing_atr_mult * (pos.get("atr") or 0)
-            if cur <= trail_level:
-                qty = pos["quantity"]
-                notional_portion = pos["entry"] * qty
-                fees = (notional_portion + cur * qty) * TOP10_FEE_PCT
-                pnl = (cur - pos["entry"]) * qty - fees
-                await db.top10_wallet.update_one(
-                    {"_id": TOP10_WALLET_ID}, {"$inc": {"cash": notional_portion + pnl}}, upsert=True
-                )
-                total_pnl = pnl + pos.get("realized_partial_pnl", 0.0)
-                await db.top10_positions.update_one(
-                    {"id": pos["id"]},
-                    {"$set": {
-                        "status": "closed", "close_price": cur, "close_reason": "trailing_stop",
-                        "pnl_usdt": round(total_pnl, 4),
-                        "closed_at": datetime.now(timezone.utc).isoformat(),
-                    }},
-                )
-                await record_top10_trade_outcome(total_pnl)
 
 
 class Top10TransferRequest(BaseModel):
