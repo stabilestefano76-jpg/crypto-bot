@@ -5396,8 +5396,19 @@ async def open_top10_position(candidate: dict[str, Any], cfg: Config) -> None:
     cash = wallet.get("cash", 0.0)
     if cash <= 1.0:
         return
+    symbol = candidate["symbol"]
     entry = candidate["entry"]
     stop = candidate["stop"]
+    # Same staleness guard used elsewhere: the signal was built from the
+    # last CLOSED candle, so real price may already have moved well past
+    # the stop by the time we get here — opening at the stale entry would
+    # just create a position that's already underwater and gets stopped
+    # out almost immediately, without ever having a real chance.
+    live_price = price_feed.get(symbol) or await price_feed.price_or_rest(symbol)
+    if live_price and live_price <= stop:
+        await log_reject(symbol, candidate.get("timeframe", "?"), "top10", "prezzo già oltre lo stop, segnale scaduto")
+        return
+    entry = live_price or entry
     risk_usdt = cash * cfg.top10_risk_pct / 100
     stop_dist_pct = (entry - stop) / entry
     if stop_dist_pct <= 0:
@@ -5407,7 +5418,6 @@ async def open_top10_position(candidate: dict[str, Any], cfg: Config) -> None:
         return
     quantity = notional / entry
 
-    symbol = candidate["symbol"]
     tf = candidate.get("timeframe") or cfg.top10_timeframes[0]
     h1_candles = await exchange.get_klines(symbol, tf)
     highs = [c[3] for c in h1_candles]
