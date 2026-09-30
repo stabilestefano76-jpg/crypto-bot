@@ -142,6 +142,11 @@ export type Config = {
   s3360_low_threshold: number;
   s3360_high_threshold: number;
   s3360_max_open_positions: number;
+  xrp_acc_enabled: boolean;
+  xrp_acc_timeframes: string[];
+  xrp_acc_rsi_period: number;
+  xrp_acc_low_threshold: number;
+  xrp_acc_high_threshold: number;
   rsi_rebound_timeframe: string;
   rsi_rebound_timeframes: string[];
   rsi_rebound_period: number;
@@ -765,6 +770,59 @@ export const s3360Api = {
       { method: "POST", body: JSON.stringify({ amount }) }
     ),
   reset: () => req<{ ok: boolean }>("/s3360/reset", { method: "POST" }),
+};
+
+// ---------------------------------------------------------------------------
+// XRP Accumulation (buy ALL capital on RSI<=25, sell all on RSI>=60 — only
+// the profit converts to permanent XRP, the original capital cycles again)
+// ---------------------------------------------------------------------------
+export type XrpAccPosition = {
+  id: string;
+  symbol: string;
+  timeframe?: string;
+  side: "long";
+  entry: number;
+  quantity: number;
+  notional: number;
+  rsi_at_entry?: number;
+  status: string;
+  opened_at: string;
+  current_price?: number;
+  unrealized_pnl?: number;
+  close_price?: number;
+  close_reason?: string;
+  profit_usdt?: number;
+  profit_xrp?: number;
+  closed_at?: string;
+};
+
+export type XrpAccPortfolio = {
+  cash: number;
+  permanent_xrp: number;
+  total_xrp: number;
+  xrp_price: number;
+  equity_usdt: number;
+  total_transferred_in: number;
+  total_profit_xrp: number;
+  open_positions: XrpAccPosition[];
+  closed_positions: XrpAccPosition[];
+  open_count: number;
+  closed_count: number;
+};
+
+export const xrpAccApi = {
+  portfolio: () => req<XrpAccPortfolio>("/xrp-accumulation/portfolio"),
+  deposit: (amount: number) =>
+    req<{ ok: boolean; xrp_acc_cash: number; main_cash: number }>(
+      "/xrp-accumulation/deposit",
+      { method: "POST", body: JSON.stringify({ amount }) }
+    ),
+  withdraw: (amount: number) =>
+    req<{ ok: boolean; xrp_acc_cash: number; main_cash: number }>(
+      "/xrp-accumulation/withdraw",
+      { method: "POST", body: JSON.stringify({ amount }) }
+    ),
+  reset: () => req<{ ok: boolean }>("/xrp-accumulation/reset", { method: "POST" }),
 };
 
 // ---------------------------------------------------------------------------

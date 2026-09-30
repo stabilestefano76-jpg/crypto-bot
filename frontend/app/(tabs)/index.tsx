@@ -212,6 +212,17 @@ export default function SignalsScreen() {
             <Ionicons name="trending-up" size={16} color={colors.brand} />
           </Pressable>
           <Pressable
+            onPress={() => router.push("/xrp-accumulation")}
+            style={({ pressed }) => [
+              styles.scanBtn,
+              { backgroundColor: colors.surfaceTertiary },
+              pressed && { opacity: 0.6 },
+            ]}
+            testID="xrp-accumulation-button"
+          >
+            <Ionicons name="diamond" size={16} color={colors.brand} />
+          </Pressable>
+          <Pressable
             onPress={() => router.push("/strategies")}
             style={({ pressed }) => [
               styles.scanBtn,

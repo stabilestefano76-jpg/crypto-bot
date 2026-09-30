@@ -213,6 +213,11 @@ class Config(BaseModel):
     s3360_low_threshold: float = 35.0  # entry: RSI crosses down through this
     s3360_high_threshold: float = 60.0  # exit target: RSI reaching this closes the trade
     s3360_max_open_positions: int = 4  # ALSO doubles as the capital-sizing divisor: each trade gets equity/max_open_positions — e.g. 2 slots = 50% each, 4 slots = 25% each. Not just a cap on count.
+    xrp_acc_enabled: bool = True
+    xrp_acc_timeframes: list[str] = Field(default_factory=lambda: ["1h"])
+    xrp_acc_rsi_period: int = 14
+    xrp_acc_low_threshold: float = 25.0  # entry: buy ALL trading capital when RSI drops to/below this
+    xrp_acc_high_threshold: float = 60.0  # exit: sell everything when RSI rises to/above this
     rsi_rebound_timeframe: str = "1h"  # kept for backward compatibility with old stored configs — no longer read directly, see rsi_rebound_timeframes below
     rsi_rebound_timeframes: list[str] = Field(default_factory=lambda: ["1h"])
     rsi_rebound_period: int = 14
@@ -2480,6 +2485,7 @@ async def scheduler_loop() -> None:
             await run_rsi_rebound_scan()
             await run_wyckoff_scan()
             await run_s3360_scan()
+            await run_xrp_acc_scan()
         except Exception as e:  # noqa: BLE001
             logger.exception("Scan loop error: %s", e)
         await asyncio.sleep(max(60, cfg.scan_interval_minutes * 60))
@@ -2646,6 +2652,7 @@ async def lifespan(_app: FastAPI):
     rsi_rebound_monitor_task = asyncio.create_task(rsi_rebound_monitor_loop())
     wyckoff_monitor_task = asyncio.create_task(wyckoff_monitor_loop())
     s3360_monitor_task = asyncio.create_task(s3360_monitor_loop())
+    xrp_acc_monitor_task = asyncio.create_task(xrp_acc_monitor_loop())
     ws_task = asyncio.create_task(price_feed.run())
     premature_task = asyncio.create_task(premature_stop_loop())
     entry_timing_task = asyncio.create_task(entry_timing_loop())
@@ -4989,6 +4996,18 @@ async def s3360_monitor_loop() -> None:
         await asyncio.sleep(3)
 
 
+async def xrp_acc_monitor_loop() -> None:
+    """Check XRP Accumulation's target-RSI every 3s using the real-time WS
+    price cache — same reasoning as the other monitors."""
+    await asyncio.sleep(8)
+    while True:
+        try:
+            await monitor_xrp_acc_positions()
+        except Exception as e:  # noqa: BLE001
+            logger.exception("XRP Accumulation monitor error: %s", e)
+        await asyncio.sleep(3)
+
+
 async def wyckoff_monitor_loop() -> None:
     """Check Wyckoff Spring stop/trailing every 3s using the real-time WS
     price cache — same reasoning as the other monitors."""
@@ -6272,6 +6291,232 @@ async def s3360_reset() -> dict[str, Any]:
     await db.s3360_wallet.update_one(
         {"_id": S3360_WALLET_ID},
         {"$set": {"cash": 0.0, "total_transferred_in": 0.0}, "$inc": {"reset_seq": 1}},
+        upsert=True,
+    )
+    return {"ok": True}
+
+
+# ============================================================================
+# XRP Accumulation — the goal here is NOT dollar profit, it's owning more XRP
+# over time. All trading capital buys XRPUSDC the instant RSI touches <=25,
+# sells everything the instant RSI touches >=60 (same live-touch mechanism
+# as 33/60 — no waiting for a candle to close). On every sale, the ORIGINAL
+# trading capital goes back to cash for the next cycle, and ONLY the profit
+# gets converted to XRP immediately and held forever — it never re-enters
+# the trading capital, so the tradeable USDC balance never inflates and the
+# permanent XRP stash only ever grows. No stop-loss, no timeout: this is a
+# pure accumulation philosophy — if RSI never comes back up, the position
+# just sits in XRP and waits, exactly as intended for something you'd want
+# to hold anyway.
+# ============================================================================
+
+XRP_ACC_WALLET_ID = "xrp_acc_wallet_singleton"
+XRP_ACC_FEE_PCT = 0.001
+XRP_ACC_SYMBOL = "XRPUSDC"
+
+
+async def get_xrp_acc_wallet() -> dict[str, Any]:
+    doc = await db.xrp_acc_wallet.find_one({"_id": XRP_ACC_WALLET_ID}, {"_id": 0})
+    if not doc:
+        doc = {"cash": 0.0, "permanent_xrp": 0.0, "total_transferred_in": 0.0, "reset_seq": 0}
+        await db.xrp_acc_wallet.update_one(
+            {"_id": XRP_ACC_WALLET_ID}, {"$set": doc}, upsert=True
+        )
+    doc.setdefault("permanent_xrp", 0.0)
+    doc.setdefault("reset_seq", 0)
+    return doc
+
+
+_xrp_acc_last_candle: dict[str, float] = {}  # per timeframe: timestamp of the CURRENT still-forming candle a live-touch attempt was already made on
+
+
+async def run_xrp_acc_scan() -> None:
+    cfg = await get_config()
+    if not cfg.xrp_acc_enabled:
+        return
+    if await db.xrp_acc_positions.find_one({"status": "open"}):
+        return
+    wallet = await get_xrp_acc_wallet()
+    cash = wallet.get("cash", 0.0)
+    if cash <= 1.0:
+        return
+
+    for tf in cfg.xrp_acc_timeframes:
+        candles = await exchange.get_klines(XRP_ACC_SYMBOL, tf)
+        if len(candles) < cfg.xrp_acc_rsi_period + 3:
+            await log_reject(XRP_ACC_SYMBOL, tf, "xrp_acc", "dati insufficienti")
+            continue
+        live_price = price_feed.get(XRP_ACC_SYMBOL) or await price_feed.price_or_rest(XRP_ACC_SYMBOL)
+        if not live_price:
+            await log_reject(XRP_ACC_SYMBOL, tf, "xrp_acc", "prezzo live non disponibile")
+            continue
+        closes = [c[2] for c in candles]
+        live_rsis = rsi_wilder(closes + [live_price], cfg.xrp_acc_rsi_period)
+        live_rsi = live_rsis[-1]
+        if live_rsi > cfg.xrp_acc_low_threshold:
+            await log_reject(XRP_ACC_SYMBOL, tf, "xrp_acc", "nessun nuovo ingresso sotto soglia bassa")
+            continue
+        tf_sec = TF_SECONDS.get(tf, 3600)
+        forming_candle_t = candles[-1][0] + tf_sec
+        if _xrp_acc_last_candle.get(tf) == forming_candle_t:
+            await log_reject(XRP_ACC_SYMBOL, tf, "xrp_acc", "stessa candela già tentata")
+            continue
+        _xrp_acc_last_candle[tf] = forming_candle_t
+
+        quantity = cash / live_price
+        doc = {
+            "id": str(uuid.uuid4()),
+            "symbol": XRP_ACC_SYMBOL,
+            "timeframe": tf,
+            "side": "long",
+            "entry": live_price,
+            "fill_price": live_price,
+            "rsi_at_entry": live_rsi,
+            "quantity": quantity,
+            "notional": cash,
+            "status": "open",
+            "opened_at": datetime.now(timezone.utc).isoformat(),
+        }
+        await db.xrp_acc_positions.insert_one(dict(doc))
+        await db.xrp_acc_wallet.update_one(
+            {"_id": XRP_ACC_WALLET_ID}, {"$inc": {"cash": -cash}}, upsert=True
+        )
+        break
+
+
+async def monitor_xrp_acc_positions() -> None:
+    cfg = await get_config()
+    open_positions = await db.xrp_acc_positions.find({"status": "open"}, {"_id": 0}).to_list(5)
+    for p in open_positions:
+        cur = price_feed.get(p["symbol"])
+        if not cur:
+            cur = await price_feed.price_or_rest(p["symbol"])
+        if not cur or cur <= 0:
+            continue
+        tf = p.get("timeframe", "1h")
+        candles = await exchange.get_klines(p["symbol"], tf)
+        closes = [c[2] for c in candles] + [cur]
+        rsis = rsi_wilder(closes, cfg.xrp_acc_rsi_period) if len(closes) > cfg.xrp_acc_rsi_period else []
+        if not (rsis and rsis[-1] >= cfg.xrp_acc_high_threshold):
+            continue
+
+        proceeds = cur * p["quantity"]
+        fees = (p["notional"] + proceeds) * XRP_ACC_FEE_PCT
+        net_proceeds = proceeds - fees
+        profit_usdt = net_proceeds - p["notional"]
+        # Original trading capital goes back to cash for the next cycle;
+        # only the profit (if any) converts to XRP and joins the permanent
+        # stash. If this cycle lost money, cash gets back less than it
+        # started with — the permanent stash never goes backwards, but the
+        # trading capital can shrink on a losing round since there's no
+        # stop protecting it (matches the pure-accumulation, no-stop design).
+        cash_back = min(net_proceeds, p["notional"])
+        profit_xrp = max(0.0, profit_usdt) / cur
+        await db.xrp_acc_wallet.update_one(
+            {"_id": XRP_ACC_WALLET_ID},
+            {"$inc": {"cash": cash_back, "permanent_xrp": profit_xrp}},
+            upsert=True,
+        )
+        await db.xrp_acc_positions.update_one(
+            {"id": p["id"]},
+            {"$set": {
+                "status": "closed", "close_price": cur, "close_reason": "target_rsi_raggiunto",
+                "profit_usdt": round(profit_usdt, 4),
+                "profit_xrp": round(profit_xrp, 6),
+                "closed_at": datetime.now(timezone.utc).isoformat(),
+            }},
+        )
+
+
+class XrpAccTransferRequest(BaseModel):
+    amount: float
+
+
+@api.post("/xrp-accumulation/deposit")
+async def xrp_acc_deposit(req: XrpAccTransferRequest) -> dict[str, Any]:
+    amount = req.amount
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="L'importo deve essere positivo")
+    main_cash = await get_paper_cash()
+    if amount > main_cash:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Fondi insufficienti nel portafoglio principale (disponibili: {round(main_cash, 2)})",
+        )
+    await set_paper_cash(main_cash - amount)
+    updated = await db.xrp_acc_wallet.find_one_and_update(
+        {"_id": XRP_ACC_WALLET_ID},
+        {"$inc": {"cash": amount, "total_transferred_in": amount}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return {"ok": True, "xrp_acc_cash": updated.get("cash", amount), "main_cash": main_cash - amount}
+
+
+@api.post("/xrp-accumulation/withdraw")
+async def xrp_acc_withdraw(req: XrpAccTransferRequest) -> dict[str, Any]:
+    amount = req.amount
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="L'importo deve essere positivo")
+    w = await get_xrp_acc_wallet()
+    available = w.get("cash", 0.0)
+    if amount > available and (amount - available) <= 0.01:
+        amount = available
+    updated = await db.xrp_acc_wallet.find_one_and_update(
+        {"_id": XRP_ACC_WALLET_ID, "cash": {"$gte": amount}},
+        {"$inc": {"cash": -amount}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not updated:
+        raise HTTPException(
+            status_code=400,
+            detail="Fondi insufficienti nel capitale di trading — la riserva permanente di XRP non può essere prelevata da qui",
+        )
+    main_cash = await get_paper_cash()
+    await set_paper_cash(main_cash + amount)
+    return {"ok": True, "xrp_acc_cash": updated.get("cash", 0.0), "main_cash": main_cash + amount}
+
+
+@api.get("/xrp-accumulation/portfolio")
+async def xrp_acc_portfolio() -> dict[str, Any]:
+    wallet = await get_xrp_acc_wallet()
+    open_docs = await db.xrp_acc_positions.find({"status": "open"}, {"_id": 0}).to_list(5)
+    closed_docs = await db.xrp_acc_positions.find({"status": "closed"}, {"_id": 0}).sort("closed_at", -1).to_list(500)
+
+    live_price = price_feed.get(XRP_ACC_SYMBOL) or await price_feed.price_or_rest(XRP_ACC_SYMBOL) or 0.0
+    open_out = []
+    open_quantity = 0.0
+    for p in open_docs:
+        cur = price_feed.get(p["symbol"]) or p["entry"]
+        open_quantity += p["quantity"]
+        open_out.append({**p, "current_price": cur, "unrealized_pnl": round((cur - p["entry"]) * p["quantity"], 4)})
+
+    permanent_xrp = wallet.get("permanent_xrp", 0.0)
+    total_xrp = permanent_xrp + open_quantity
+    cash = wallet.get("cash", 0.0)
+    equity_usdt = cash + open_quantity * live_price + permanent_xrp * live_price
+    total_profit_xrp = sum(c.get("profit_xrp", 0.0) for c in closed_docs)
+    return {
+        "cash": round(cash, 4),
+        "permanent_xrp": round(permanent_xrp, 6),
+        "total_xrp": round(total_xrp, 6),
+        "xrp_price": live_price,
+        "equity_usdt": round(equity_usdt, 4),
+        "total_transferred_in": wallet.get("total_transferred_in", 0.0),
+        "total_profit_xrp": round(total_profit_xrp, 6),
+        "open_positions": open_out,
+        "closed_positions": closed_docs[:100],
+        "open_count": len(open_docs),
+        "closed_count": len(closed_docs),
+    }
+
+
+@api.post("/xrp-accumulation/reset")
+async def xrp_acc_reset() -> dict[str, Any]:
+    await db.xrp_acc_positions.delete_many({})
+    await db.xrp_acc_wallet.update_one(
+        {"_id": XRP_ACC_WALLET_ID},
+        {"$set": {"cash": 0.0, "permanent_xrp": 0.0, "total_transferred_in": 0.0}, "$inc": {"reset_seq": 1}},
         upsert=True,
     )
     return {"ok": True}

@@ -85,7 +85,8 @@ export default function SettingsScreen() {
       | "wyckoff_timeframes"
       | "top10_timeframes"
       | "scalping_timeframes"
-      | "s3360_timeframes",
+      | "s3360_timeframes"
+      | "xrp_acc_timeframes",
     t: string
   ) => {
     if (!cfg) return;
@@ -141,6 +142,7 @@ export default function SettingsScreen() {
                 if (val === "rsi_rebound") return cfg.rsi_rebound_enabled;
                 if (val === "wyckoff") return cfg.wyckoff_enabled;
                 if (val === "s3360") return cfg.s3360_enabled;
+                if (val === "xrp_acc") return cfg.xrp_acc_enabled;
                 return stratOn(val);
               };
               const toggle = (val: string) => {
@@ -168,6 +170,10 @@ export default function SettingsScreen() {
                   update({ s3360_enabled: !cfg.s3360_enabled });
                   return;
                 }
+                if (val === "xrp_acc") {
+                  update({ xrp_acc_enabled: !cfg.xrp_acc_enabled });
+                  return;
+                }
                 const set = new Set(enabledStrategies);
                 if (set.has(val)) set.delete(val);
                 else set.add(val);
@@ -185,6 +191,7 @@ export default function SettingsScreen() {
                     ["rsi_rebound", "RSI Rebound"],
                     ["wyckoff", "Wyckoff Spring"],
                     ["s3360", "33/60"],
+                    ["xrp_acc", "XRP Accumulation"],
                   ] as const).map(([val, label]) => {
                     const active = isActive(val);
                     return (
@@ -883,6 +890,60 @@ export default function SettingsScreen() {
                 1h: 14 casi trovati, 10 arrivati alla soglia alta (71%),
                 guadagno medio +1,58% su quelli riusciti, nessuna perdita tra
                 i riusciti.
+              </Text>
+            </Section>
+          )}
+
+          {cfg.xrp_acc_enabled && (
+            <Section title="XRP Accumulation">
+              <Text style={styles.fieldLabel}>Timeframe</Text>
+              <View style={styles.chipsRow}>
+                {TIMEFRAMES.map((t) => {
+                  const active = cfg.xrp_acc_timeframes.includes(t);
+                  return (
+                    <Pressable
+                      key={t}
+                      onPress={() => toggleTimeframeFor("xrp_acc_timeframes", t)}
+                      style={[styles.chip, active && styles.chipActive]}
+                      testID={`tf-select-xrp-acc-${t}`}
+                    >
+                      <Text style={[styles.chipText, active && styles.chipTextActive]}>
+                        {t}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+              <NumRow
+                label="Soglia bassa (ingresso)"
+                value={cfg.xrp_acc_low_threshold}
+                onChange={(v) => update({ xrp_acc_low_threshold: v })}
+                step={1}
+                testID="input-xrp-acc-low"
+              />
+              <NumRow
+                label="Soglia alta (uscita)"
+                value={cfg.xrp_acc_high_threshold}
+                onChange={(v) => update({ xrp_acc_high_threshold: v })}
+                step={1}
+                testID="input-xrp-acc-high"
+              />
+              <Text style={styles.scoreHintText}>
+                Strategia dedicata solo a XRPUSDC, con un obiettivo diverso
+                dalle altre: non il guadagno in dollari, ma possedere più XRP
+                nel tempo. Entra con TUTTO il capitale di trading appena
+                l&apos;RSI scende a {cfg.xrp_acc_low_threshold} o sotto, esce
+                con tutto quando l&apos;RSI risale a{" "}
+                {cfg.xrp_acc_high_threshold} o sopra — stesso meccanismo in
+                tempo reale di 33/60, nessuno stop, nessun timeout. Ad ogni
+                vendita, il capitale originale torna in cassa per il giro
+                successivo, e SOLO il profitto viene convertito subito in XRP
+                e tenuto per sempre — così il capitale di trading non si
+                gonfia mai restando bloccato in USDC, e la riserva di XRP
+                cresce ad ogni ciclo vincente. Se una vendita chiude in
+                perdita, il capitale di trading torna in cassa ridotto (non
+                c&apos;è uno stop a proteggerlo), ma la riserva di XRP già
+                accumulata non si tocca mai.
               </Text>
             </Section>
           )}
