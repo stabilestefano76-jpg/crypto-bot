@@ -82,9 +82,7 @@ export default function SettingsScreen() {
       | "rsi_reversion_timeframes"
       | "grid_timeframes"
       | "rsi_rebound_timeframes"
-      | "wyckoff_timeframes"
       | "top10_timeframes"
-      | "scalping_timeframes"
       | "s3360_timeframes"
       | "xrp_acc_timeframes",
     t: string
@@ -129,27 +127,21 @@ export default function SettingsScreen() {
           <Section title="Motori attivi (tutte le sezioni)">
             {(() => {
               // Le 3 strategie tradizionali sono un array multi-selezione
-              // (enabled_strategies); Scalping e Grid Bot hanno invece un
+              // (enabled_strategies); le altre strategie hanno invece un
               // proprio interruttore booleano indipendente — questa
               // funzione unifica entrambe le logiche in un solo gruppo di
               // bottoni, così ogni sezione del bot si accende/spegne da un
               // unico pannello (utile per incanalare il budget quando si
               // passerà al reale).
               const isActive = (val: string): boolean => {
-                if (val === "scalping") return cfg.scalping_enabled;
                 if (val === "grid") return cfg.grid_enabled;
                 if (val === "top10") return cfg.top10_enabled;
                 if (val === "rsi_rebound") return cfg.rsi_rebound_enabled;
-                if (val === "wyckoff") return cfg.wyckoff_enabled;
                 if (val === "s3360") return cfg.s3360_enabled;
                 if (val === "xrp_acc") return cfg.xrp_acc_enabled;
                 return stratOn(val);
               };
               const toggle = (val: string) => {
-                if (val === "scalping") {
-                  update({ scalping_enabled: !cfg.scalping_enabled });
-                  return;
-                }
                 if (val === "grid") {
                   update({ grid_enabled: !cfg.grid_enabled });
                   return;
@@ -160,10 +152,6 @@ export default function SettingsScreen() {
                 }
                 if (val === "rsi_rebound") {
                   update({ rsi_rebound_enabled: !cfg.rsi_rebound_enabled });
-                  return;
-                }
-                if (val === "wyckoff") {
-                  update({ wyckoff_enabled: !cfg.wyckoff_enabled });
                   return;
                 }
                 if (val === "s3360") {
@@ -185,11 +173,9 @@ export default function SettingsScreen() {
                     ["counter_trend", "Rev Pre-FVG"],
                     ["fvg_reversal", "FVG Reversal"],
                     ["rsi_reversion", "RSI Reversion"],
-                    ["scalping", "Scalping"],
                     ["grid", "Grid Bot"],
                     ["top10", "Top 10 Long"],
                     ["rsi_rebound", "RSI Rebound"],
-                    ["wyckoff", "Wyckoff Spring"],
                     ["s3360", "33/60"],
                     ["xrp_acc", "XRP Accumulation"],
                   ] as const).map(([val, label]) => {
@@ -220,8 +206,8 @@ export default function SettingsScreen() {
               consolidamento verso il fill FVG. FVG Reversal = contro-trend
               sul ritracciamento verso la FVG (parametri indipendenti). RSI
               Reversion = rientro da ipercomprato/ipervenduto confermato da
-              divergenza. Scalping e Grid Bot hanno sempre avuto portafogli
-              propri separati — qui puoi anche fermarli del tutto, utile per
+              divergenza. Grid Bot ha sempre avuto un portafoglio proprio
+              separato — qui puoi anche fermarlo del tutto, utile per
               decidere quali motori usare quando si passerà al reale.
             </Text>
           </Section>
@@ -460,88 +446,6 @@ export default function SettingsScreen() {
                 stia davvero limitando i segnali. Il Grid Bot non è
                 toccato da nessuno di questi parametri, resta sempre
                 rigoroso.
-              </Text>
-            </Section>
-          )}
-
-          {cfg.scalping_enabled && (
-            <Section title="Scalping Strategy">
-              <Text style={styles.fieldLabel}>Timeframe</Text>
-              <View style={styles.chipsRow}>
-                {TIMEFRAMES.map((t) => {
-                  const active = cfg.scalping_timeframes.includes(t);
-                  return (
-                    <Pressable
-                      key={t}
-                      onPress={() => toggleTimeframeFor("scalping_timeframes", t)}
-                      style={[styles.chip, active && styles.chipActive]}
-                      testID={`tf-select-scalping-${t}`}
-                    >
-                      <Text style={[styles.chipText, active && styles.chipTextActive]}>
-                        {t}
-                      </Text>
-                    </Pressable>
-                  );
-                })}
-
-              </View>
-              <NumRow
-                label="Max operazioni simultanee"
-                value={cfg.scalping_max_open_positions}
-                onChange={(v) => update({ scalping_max_open_positions: v })}
-                testID="input-scalping-max-open"
-              />
-              <NumRow
-                label="Stop loss (×ATR)"
-                value={cfg.scalping_sl_atr_mult}
-                onChange={(v) => update({ scalping_sl_atr_mult: v })}
-                step={0.1}
-                testID="input-scalping-sl-atr"
-              />
-              <NumRow
-                label="Take profit (×ATR)"
-                value={cfg.scalping_tp_atr_mult}
-                onChange={(v) => update({ scalping_tp_atr_mult: v })}
-                step={0.1}
-                testID="input-scalping-tp-atr"
-              />
-              <NumRow
-                label="Taglia per operazione (% cassa)"
-                value={cfg.scalping_risk_pct}
-                onChange={(v) => update({ scalping_risk_pct: v })}
-                step={1}
-                testID="input-scalping-risk-pct"
-              />
-              <NumRow
-                label="Volume minimo richiesto (× media)"
-                value={cfg.scalping_volume_multiplier}
-                onChange={(v) => update({ scalping_volume_multiplier: v })}
-                step={0.1}
-                testID="input-scalping-volume-mult"
-              />
-              <Text style={styles.scoreHintText}>
-                EMA9/21 + VWAP + Bollinger su 5m, con RSI(9) come conferma di
-                momentum (sopra 55 per i long, sotto 45 per gli short — alzato
-                da 50 per richiedere un momentum più deciso, non solo un
-                attraversamento marginale) e un controllo sul trend del
-                timeframe superiore (scarta i long in un trend ribassista
-                netto, e viceversa) — evita di aprire operazioni che remano
-                contro la corrente generale. Richiede anche un volume almeno{" "}
-                {cfg.scalping_volume_multiplier}× la media recente (alzato da
-                1,5×) per filtrare i segnali più deboli. Stop e target si
-                adattano all&apos;ATR di ogni coppia invece di una percentuale
-                fissa uguale per tutte — allargati di recente (stop a{" "}
-                {cfg.scalping_sl_atr_mult}×ATR, target a{" "}
-                {cfg.scalping_tp_atr_mult}×ATR) così il normale rumore di
-                prezzo non chiude l&apos;operazione prima che un movimento
-                vero si sviluppi, e un target più largo lascia più spazio a
-                un&apos;operazione vincente prima che scatti il trailing.
-                Taglia per operazione al {cfg.scalping_risk_pct}% della
-                cassa, così anche una vincita modesta in percentuale genera
-                un guadagno che si sente reale in valore assoluto. Massimo{" "}
-                {cfg.scalping_max_open_positions} operazioni aperte insieme,
-                per non accumulare rischio correlato in un solo movimento di
-                mercato.
               </Text>
             </Section>
           )}
@@ -948,89 +852,6 @@ export default function SettingsScreen() {
             </Section>
           )}
 
-          {cfg.wyckoff_enabled && (
-            <Section title="Wyckoff Spring">
-              <Text style={styles.fieldLabel}>Timeframe</Text>
-              <View style={styles.chipsRow}>
-                {TIMEFRAMES.map((t) => {
-                  const active = cfg.wyckoff_timeframes.includes(t);
-                  return (
-                    <Pressable
-                      key={t}
-                      onPress={() => toggleTimeframeFor("wyckoff_timeframes", t)}
-                      style={[styles.chip, active && styles.chipActive]}
-                      testID={`tf-select-wyckoff-${t}`}
-                    >
-                      <Text style={[styles.chipText, active && styles.chipTextActive]}>
-                        {t}
-                      </Text>
-                    </Pressable>
-                  );
-                })}
-              </View>
-              <NumRow
-                label="Candele per il range (supporto/resistenza)"
-                value={cfg.wyckoff_range_window}
-                onChange={(v) => update({ wyckoff_range_window: v })}
-                testID="input-wyckoff-range-window"
-              />
-              <NumRow
-                label="Finestra per l'intera sequenza (candele)"
-                value={cfg.wyckoff_search_span}
-                onChange={(v) => update({ wyckoff_search_span: v })}
-                testID="input-wyckoff-search-span"
-              />
-              <NumRow
-                label="Finestra per il Test dopo lo Spring (candele)"
-                value={cfg.wyckoff_test_window}
-                onChange={(v) => update({ wyckoff_test_window: v })}
-                testID="input-wyckoff-test-window"
-              />
-              <NumRow
-                label="Ampiezza massima range (×ATR)"
-                value={cfg.wyckoff_max_range_atr_mult}
-                onChange={(v) => update({ wyckoff_max_range_atr_mult: v })}
-                step={0.1}
-                testID="input-wyckoff-max-range"
-              />
-              <NumRow
-                label="Rischio per operazione (% portafoglio)"
-                value={cfg.wyckoff_risk_pct}
-                onChange={(v) => update({ wyckoff_risk_pct: v })}
-                step={0.5}
-                testID="input-wyckoff-risk"
-              />
-              <NumRow
-                label="Trailing dopo il target (×ATR)"
-                value={cfg.wyckoff_trailing_atr_mult}
-                onChange={(v) => update({ wyckoff_trailing_atr_mult: v })}
-                step={0.1}
-                testID="input-wyckoff-trailing"
-              />
-              <NumRow
-                label="Massimo posizioni aperte"
-                value={cfg.wyckoff_max_open_positions}
-                onChange={(v) => update({ wyckoff_max_open_positions: v })}
-                testID="input-wyckoff-max-positions"
-              />
-              <Text style={styles.scoreHintText}>
-                Segue lo schema classico di accumulazione Wyckoff per intero,
-                su timeframe {cfg.wyckoff_timeframe}: prima identifica un
-                range (supporto/resistenza sulle ultime{" "}
-                {cfg.wyckoff_range_window} candele), poi cerca in ordine —
-                Spring (rottura falsa sotto supporto con volume sotto la
-                media), Test (ritorno sul minimo con volume ancora più
-                basso), Sign of Strength (rottura sopra resistenza con
-                volume in aumento) — e infine entra sul Last Point of
-                Support: il ritorno che tiene sopra la resistenza appena
-                rotta, con volume più leggero del breakout. Stop sotto il
-                minimo tra Spring e LPS; target iniziale pari all&apos;altezza
-                del range proiettata dal breakout, poi trailing una volta
-                raggiunto.
-              </Text>
-            </Section>
-          )}
-
           <Section title="Regime di mercato condiviso">
             <NumRow
               label="Riduzione taglia fuori da regime rialzista (%)"
@@ -1042,7 +863,7 @@ export default function SettingsScreen() {
             <Text style={styles.scoreHintText}>
               Guarda il regime di BTC su 1h (lo stesso calcolo già usato da Top
               10 Long): se non è chiaramente rialzista (fase laterale o
-              ribassista), la taglia delle nuove operazioni di Scalping, RSI
+              ribassista), la taglia delle nuove operazioni di RSI
               Reversion e RSI Rebound viene ridotta del{" "}
               {cfg.regime_risk_reduction_pct}% — meno esposizione quando il
               mercato è incerto, piena taglia solo quando il quadro è
@@ -1050,7 +871,7 @@ export default function SettingsScreen() {
             </Text>
           </Section>
 
-          <Section title="Trailing Stop (Scalping + Grid)">
+          <Section title="Trailing Stop (Grid)">
             <ToggleRow
               label="Trailing stop attivo"
               value={cfg.trailing_enabled}

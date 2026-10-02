@@ -135,17 +135,6 @@ export default function SignalsScreen() {
             <Ionicons name="school" size={16} color={colors.brand} />
           </Pressable>
           <Pressable
-            onPress={() => router.push("/scalping")}
-            style={({ pressed }) => [
-              styles.scanBtn,
-              { backgroundColor: colors.surfaceTertiary },
-              pressed && { opacity: 0.6 },
-            ]}
-            testID="scalping-button"
-          >
-            <Ionicons name="flash" size={16} color={colors.brand} />
-          </Pressable>
-          <Pressable
             onPress={() => router.push("/grid")}
             style={({ pressed }) => [
               styles.scanBtn,
@@ -177,17 +166,6 @@ export default function SignalsScreen() {
             testID="rsi-rebound-button"
           >
             <Ionicons name="pulse" size={16} color={colors.brand} />
-          </Pressable>
-          <Pressable
-            onPress={() => router.push("/wyckoff")}
-            style={({ pressed }) => [
-              styles.scanBtn,
-              { backgroundColor: colors.surfaceTertiary },
-              pressed && { opacity: 0.6 },
-            ]}
-            testID="wyckoff-button"
-          >
-            <Ionicons name="layers" size={16} color={colors.brand} />
           </Pressable>
           <Pressable
             onPress={() => router.push("/rsi-reversion")}

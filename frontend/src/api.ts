@@ -96,16 +96,9 @@ export type Config = {
   rsi_rev_structural_lookback: number;
   rsi_rev_trailing_atr_mult: number;
   rsi_rev_trailing_activation_margin_pct: number;
-  scalping_max_open_positions: number;
-  scalping_timeframe: string;
-  scalping_timeframes: string[];
-  scalping_sl_atr_mult: number;
-  scalping_tp_atr_mult: number;
-  scalping_risk_pct: number;
   max_pairs_per_scan: number;
   enabled_pairs: string[];
   excluded_pairs: string[];
-  scalping_enabled: boolean;
   grid_enabled: boolean;
   grid_timeframe: string;
   grid_timeframes: string[];
@@ -158,16 +151,6 @@ export type Config = {
   rsi_rebound_trailing_atr_mult: number;
   rsi_rebound_trailing_activation_margin_pct: number;
   rsi_rebound_max_open_positions: number;
-  wyckoff_enabled: boolean;
-  wyckoff_timeframe: string;
-  wyckoff_timeframes: string[];
-  wyckoff_range_window: number;
-  wyckoff_search_span: number;
-  wyckoff_test_window: number;
-  wyckoff_max_range_atr_mult: number;
-  wyckoff_risk_pct: number;
-  wyckoff_trailing_atr_mult: number;
-  wyckoff_max_open_positions: number;
   regime_risk_reduction_pct: number;
 };
 
@@ -368,90 +351,6 @@ export const api = {
 };
 
 
-export type ScalpingSignal = {
-  id: string;
-  symbol: string;
-  timeframe: string;
-  side: "long" | "short";
-  reasons: string[];
-  vwap: number;
-  rsi: number;
-  bb_lower: number;
-  bb_upper: number;
-  ema_fast: number;
-  ema_slow: number;
-  price: number;
-  status: string;
-  created_at: string;
-};
-
-export const scalpingApi = {
-  signals: () =>
-    req<{ signals: ScalpingSignal[]; count: number; active: number }>(
-      "/scalping/signals"
-    ),
-  config: () =>
-    req<{
-      scalping_enabled: boolean;
-      scalping_timeframe: string;
-      scalping_rsi_period: number;
-      scalping_bb_period: number;
-      scalping_bb_std: number;
-      scalping_ema_fast: number;
-      scalping_ema_slow: number;
-      scalping_volume_multiplier: number;
-    }>("/scalping/config"),
-};
-
-export type ScalpingPosition = {
-  id: string;
-  symbol: string;
-  side: "long" | "short";
-  entry: number;
-  stop_loss: number;
-  take_profit: number;
-  quantity: number;
-  notional: number;
-  status: string;
-  opened_at: string;
-  current_price?: number;
-  unrealized_pnl?: number;
-  unrealized_pnl_pct?: number;
-  close_price?: number;
-  close_reason?: string;
-  pnl_usdt?: number;
-  closed_at?: string;
-};
-
-export type ScalpingPortfolio = {
-  cash: number;
-  allocated: number;
-  unrealized_pnl: number;
-  realized_pnl: number;
-  equity: number;
-  open_positions: ScalpingPosition[];
-  closed_positions: ScalpingPosition[];
-  open_count: number;
-  closed_count: number;
-  win_rate: number;
-};
-
-export const scalpingWalletApi = {
-  portfolio: () => req<ScalpingPortfolio>("/scalping/portfolio"),
-  transfer: (amount: number) =>
-    req<{ ok: boolean; scalping_cash: number; main_cash: number }>(
-      "/scalping/transfer",
-      { method: "POST", body: JSON.stringify({ amount }) }
-    ),
-  reset: () => req<{ ok: boolean; cash: number }>("/scalping/reset", { method: "POST" }),
-};
-
-export const scalpingWithdraw = (amount: number) =>
-  req<{ ok: boolean; scalping_cash: number; main_cash: number }>(
-    "/scalping/withdraw",
-    { method: "POST", body: JSON.stringify({ amount }) }
-  );
-
 // ---------------------------------------------------------------------------
 // Grid Bot
 // ---------------------------------------------------------------------------
@@ -599,7 +498,7 @@ export const strategyApi = {
 export type BotEvent = {
   id: string;
   type: "open" | "close";
-  section: "counter_trend" | "fvg_reversal" | "rsi_reversion" | "scalping" | "grid";
+  section: "counter_trend" | "fvg_reversal" | "rsi_reversion" | "grid";
   symbol: string;
   side?: "long" | "short";
   pnl_usdt?: number | null;
@@ -823,58 +722,6 @@ export const xrpAccApi = {
       { method: "POST", body: JSON.stringify({ amount }) }
     ),
   reset: () => req<{ ok: boolean }>("/xrp-accumulation/reset", { method: "POST" }),
-};
-
-// ---------------------------------------------------------------------------
-// Wyckoff Spring (Range -> Spring -> Test -> Sign of Strength -> Last Point
-// of Support — entry at the LPS)
-// ---------------------------------------------------------------------------
-export type WyckoffPosition = {
-  id: string;
-  symbol: string;
-  side: "long";
-  entry: number;
-  stop_loss: number;
-  take_profit: number;
-  quantity: number;
-  notional: number;
-  trailing_active: boolean;
-  status: string;
-  opened_at: string;
-  current_price?: number;
-  unrealized_pnl?: number;
-  close_price?: number;
-  close_reason?: string;
-  pnl_usdt?: number;
-  closed_at?: string;
-};
-
-export type WyckoffPortfolio = {
-  cash: number;
-  equity: number;
-  total_transferred_in: number;
-  unrealized_pnl: number;
-  realized_pnl: number;
-  open_positions: WyckoffPosition[];
-  closed_positions: WyckoffPosition[];
-  open_count: number;
-  closed_count: number;
-  win_rate: number;
-};
-
-export const wyckoffApi = {
-  portfolio: () => req<WyckoffPortfolio>("/wyckoff/portfolio"),
-  deposit: (amount: number) =>
-    req<{ ok: boolean; wyckoff_cash: number; main_cash: number }>(
-      "/wyckoff/deposit",
-      { method: "POST", body: JSON.stringify({ amount }) }
-    ),
-  withdraw: (amount: number) =>
-    req<{ ok: boolean; wyckoff_cash: number; main_cash: number }>(
-      "/wyckoff/withdraw",
-      { method: "POST", body: JSON.stringify({ amount }) }
-    ),
-  reset: () => req<{ ok: boolean }>("/wyckoff/reset", { method: "POST" }),
 };
 
 // ---------------------------------------------------------------------------
