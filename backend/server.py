@@ -114,6 +114,7 @@ class Config(BaseModel):
     post_tp1_advance_pct: float = 0.5  # % beyond TP1 before moving SL to TP1 (net fees)
     # --- Parallel strategy selection ---
     enabled_strategies: list[str] = Field(default_factory=list)  # empty = ["counter_trend", "fvg_reversal"]
+    live_strategies: list[str] = Field(default_factory=list)  # which of the 8 strategies currently trade with REAL money via Bybit — empty means ALL of them are in paper mode (the safe default). No trading logic reads this yet; it's wired strategy-by-strategy as each one gets connected to real order placement.
     # --- FVG Reversal strategy (independent params, contro-trend on retracement) ---
     fvgr_rsi_high_tf_ob: float = 80.0
     fvgr_rsi_high_tf_os: float = 20.0
@@ -5793,6 +5794,75 @@ async def grid_instances_list() -> dict[str, Any]:
     for g in instances:
         g["current_price"] = price_map.get(g["symbol"])
     return {"instances": instances, "count": len(instances)}
+
+
+# ============================================================================
+# BROKER CONNECTION (Bybit real-money API credentials) — storage only, for
+# now. No trading logic reads these yet; this is just the plumbing to let
+# the user paste in their API key/secret from the app, ahead of actually
+# wiring any strategy to place real orders. The secret (and the key, once
+# saved) are NEVER returned by any GET — only a masked preview and a
+# connected/not-connected flag, so even the user's own browser/app never
+# sees the full credentials again after saving them.
+# ============================================================================
+
+BROKER_CREDENTIALS_ID = "bybit_broker_credentials_singleton"
+
+
+def _mask_key(key: str) -> str:
+    if len(key) <= 8:
+        return "•" * len(key)
+    return f"{key[:4]}{'•' * (len(key) - 8)}{key[-4:]}"
+
+
+async def get_broker_credentials() -> Optional[dict[str, str]]:
+    """Internal getter for future real-trading code — NOT used by anything
+    yet. Returns {"api_key": ..., "api_secret": ...} or None if not connected."""
+    doc = await db.broker_credentials.find_one({"_id": BROKER_CREDENTIALS_ID}, {"_id": 0})
+    if not doc or not doc.get("api_key") or not doc.get("api_secret"):
+        return None
+    return {"api_key": doc["api_key"], "api_secret": doc["api_secret"]}
+
+
+class BrokerConnectRequest(BaseModel):
+    api_key: str
+    api_secret: str
+
+
+@api.post("/broker/connect")
+async def broker_connect(req: BrokerConnectRequest) -> dict[str, Any]:
+    api_key = req.api_key.strip()
+    api_secret = req.api_secret.strip()
+    if not api_key or not api_secret:
+        raise HTTPException(status_code=400, detail="Chiave API e segreto sono entrambi obbligatori")
+    await db.broker_credentials.update_one(
+        {"_id": BROKER_CREDENTIALS_ID},
+        {"$set": {
+            "api_key": api_key,
+            "api_secret": api_secret,
+            "connected_at": datetime.now(timezone.utc).isoformat(),
+        }},
+        upsert=True,
+    )
+    return {"ok": True, "connected": True, "masked_key": _mask_key(api_key)}
+
+
+@api.get("/broker/status")
+async def broker_status() -> dict[str, Any]:
+    doc = await db.broker_credentials.find_one({"_id": BROKER_CREDENTIALS_ID}, {"_id": 0})
+    if not doc or not doc.get("api_key"):
+        return {"connected": False, "masked_key": None, "connected_at": None}
+    return {
+        "connected": True,
+        "masked_key": _mask_key(doc["api_key"]),
+        "connected_at": doc.get("connected_at"),
+    }
+
+
+@api.post("/broker/disconnect")
+async def broker_disconnect() -> dict[str, Any]:
+    await db.broker_credentials.delete_one({"_id": BROKER_CREDENTIALS_ID})
+    return {"ok": True, "connected": False}
 
 
 app.include_router(api)

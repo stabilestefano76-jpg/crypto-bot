@@ -3,6 +3,7 @@ import {
   ActivityIndicator,
   Alert,
   KeyboardAvoidingView,
+  Modal,
   Platform,
   Pressable,
   ScrollView,
@@ -14,7 +15,7 @@ import {
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
-import { api, Config, PaperConfig } from "@/src/api";
+import { api, brokerApi, BrokerStatus, Config, PaperConfig } from "@/src/api";
 import { colors, font, radius, spacing } from "@/src/theme";
 
 const TIMEFRAMES = ["5m", "15m", "1h", "4h", "1d"];
@@ -26,6 +27,13 @@ export default function SettingsScreen() {
   const [loading, setLoading] = useState(true);
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
+
+  const [brokerStatus, setBrokerStatus] = useState<BrokerStatus | null>(null);
+  const [connectModalVisible, setConnectModalVisible] = useState(false);
+  const [apiKeyText, setApiKeyText] = useState("");
+  const [apiSecretText, setApiSecretText] = useState("");
+  const [connecting, setConnecting] = useState(false);
+  const [disconnecting, setDisconnecting] = useState(false);
 
   const load = useCallback(async () => {
     try {
@@ -39,9 +47,47 @@ export default function SettingsScreen() {
     }
   }, []);
 
+  const loadBrokerStatus = useCallback(async () => {
+    try {
+      const s = await brokerApi.status();
+      setBrokerStatus(s);
+    } catch {
+      // ignore
+    }
+  }, []);
+
   useEffect(() => {
     load();
-  }, [load]);
+    loadBrokerStatus();
+  }, [load, loadBrokerStatus]);
+
+  const onConnectBroker = async () => {
+    const key = apiKeyText.trim();
+    const secret = apiSecretText.trim();
+    if (!key || !secret) return;
+    setConnecting(true);
+    try {
+      await brokerApi.connect(key, secret);
+      setConnectModalVisible(false);
+      setApiKeyText("");
+      setApiSecretText("");
+      await loadBrokerStatus();
+    } catch {
+      Alert.alert("Errore", "Non è stato possibile salvare la connessione. Riprova.");
+    } finally {
+      setConnecting(false);
+    }
+  };
+
+  const onDisconnectBroker = async () => {
+    setDisconnecting(true);
+    try {
+      await brokerApi.disconnect();
+      await loadBrokerStatus();
+    } finally {
+      setDisconnecting(false);
+    }
+  };
 
   const update = (patch: Partial<Config>) => {
     setCfg((prev) => (prev ? { ...prev, ...patch } : prev));
@@ -124,6 +170,130 @@ export default function SettingsScreen() {
           contentContainerStyle={styles.body}
           keyboardShouldPersistTaps="handled"
         >
+          <Section title="Connessione Bybit (trading reale)">
+            {brokerStatus?.connected ? (
+              <>
+                <View style={styles.brokerStatusRow}>
+                  <View style={styles.brokerDot} />
+                  <Text style={styles.brokerStatusText}>
+                    Connesso — chiave {brokerStatus.masked_key}
+                  </Text>
+                </View>
+                <Pressable
+                  style={({ pressed }) => [styles.disconnectBtn, pressed && { opacity: 0.7 }]}
+                  onPress={() =>
+                    Alert.alert(
+                      "Disconnetti",
+                      "Vuoi davvero rimuovere la chiave API salvata?",
+                      [
+                        { text: "Annulla", style: "cancel" },
+                        { text: "Disconnetti", style: "destructive", onPress: onDisconnectBroker },
+                      ]
+                    )
+                  }
+                  disabled={disconnecting}
+                >
+                  {disconnecting ? (
+                    <ActivityIndicator color={colors.error} size="small" />
+                  ) : (
+                    <Text style={styles.disconnectBtnText}>Disconnetti</Text>
+                  )}
+                </Pressable>
+              </>
+            ) : (
+              <>
+                <View style={styles.brokerStatusRow}>
+                  <View style={[styles.brokerDot, { backgroundColor: colors.onSurfaceSecondary }]} />
+                  <Text style={styles.brokerStatusText}>Non connesso — il bot opera solo in paper</Text>
+                </View>
+                <Pressable
+                  style={({ pressed }) => [styles.connectBrokerBtn, pressed && { opacity: 0.7 }]}
+                  onPress={() => setConnectModalVisible(true)}
+                >
+                  <Ionicons name="key" size={16} color="#000" />
+                  <Text style={styles.connectBrokerBtnText}>Collega API</Text>
+                </Pressable>
+              </>
+            )}
+            <Text style={styles.scoreHintText}>
+              Solo la chiave viene mostrata (mai per intero) una volta
+              salvata — né tu né nessun altro potrà più rileggerla
+              dall&apos;app, solo sostituirla o rimuoverla. Questo passaggio
+              salva solo le credenziali: quale strategia opera davvero in
+              reale si decide qui sotto, una alla volta.
+            </Text>
+          </Section>
+
+          <Section title="Modalità operativa (Paper / Reale)">
+            <Text style={styles.scoreHintText}>
+              Ogni strategia opera in Paper (simulato) finché non la passi
+              esplicitamente a Reale. Questo interruttore è indipendente da
+              quello di attivazione sopra — puoi avere una strategia
+              spenta e impostata su Reale allo stesso tempo, resterà
+              semplicemente ferma finché non la riaccendi.
+            </Text>
+            {([
+              ["counter_trend", "Rev Pre-FVG"],
+              ["fvg_reversal", "FVG Reversal"],
+              ["rsi_reversion", "RSI Reversion"],
+              ["grid", "Grid Bot"],
+              ["top10", "Top 10 Long"],
+              ["rsi_rebound", "RSI Rebound"],
+              ["s3360", "33/60"],
+              ["xrp_acc", "XRP Accumulation"],
+            ] as const).map(([key, label]) => {
+              const isLive = cfg.live_strategies.includes(key);
+              const setLive = (live: boolean) => {
+                if (live) {
+                  if (!brokerStatus?.connected) {
+                    Alert.alert(
+                      "Collega prima l'API",
+                      "Devi collegare la chiave API di Bybit (sezione sopra) prima di poter passare una strategia al trading reale."
+                    );
+                    return;
+                  }
+                  Alert.alert(
+                    "Attenzione: soldi veri",
+                    `${label} inizierà ad operare con denaro reale sul tuo account Bybit. Confermi?`,
+                    [
+                      { text: "Annulla", style: "cancel" },
+                      {
+                        text: "Conferma",
+                        style: "destructive",
+                        onPress: () => update({ live_strategies: [...cfg.live_strategies, key] }),
+                      },
+                    ]
+                  );
+                  return;
+                }
+                update({ live_strategies: cfg.live_strategies.filter((k) => k !== key) });
+              };
+              return (
+                <View key={key} style={styles.liveModeRow}>
+                  <Text style={styles.liveModeLabel}>{label}</Text>
+                  <View style={styles.liveModeToggle}>
+                    <Pressable
+                      style={[styles.liveModeChip, !isLive && styles.liveModeChipActivePaper]}
+                      onPress={() => setLive(false)}
+                    >
+                      <Text style={[styles.liveModeChipText, !isLive && styles.liveModeChipTextActive]}>
+                        Paper
+                      </Text>
+                    </Pressable>
+                    <Pressable
+                      style={[styles.liveModeChip, isLive && styles.liveModeChipActiveLive]}
+                      onPress={() => setLive(true)}
+                    >
+                      <Text style={[styles.liveModeChipText, isLive && styles.liveModeChipTextActive]}>
+                        Reale
+                      </Text>
+                    </Pressable>
+                  </View>
+                </View>
+              );
+            })}
+          </Section>
+
           <Section title="Motori attivi (tutte le sezioni)">
             {(() => {
               // Le 3 strategie tradizionali sono un array multi-selezione
@@ -1164,6 +1334,61 @@ export default function SettingsScreen() {
           </Pressable>
         </ScrollView>
       </View>
+
+      <Modal visible={connectModalVisible} transparent animationType="fade">
+        <View style={styles.modalOverlay}>
+          <View style={styles.modalBox}>
+            <Text style={styles.modalTitle}>Collega l&apos;API di Bybit</Text>
+            <Text style={styles.modalSubtitle}>
+              Incolla qui la chiave API e il segreto generati su Bybit. Una
+              volta salvati, non saranno più visibili per intero da nessuna
+              parte dell&apos;app — solo le ultime cifre, per riconoscerli.
+            </Text>
+            <TextInput
+              style={styles.modalInput}
+              placeholder="Chiave API"
+              placeholderTextColor={colors.onSurfaceSecondary}
+              autoCapitalize="none"
+              autoCorrect={false}
+              value={apiKeyText}
+              onChangeText={setApiKeyText}
+            />
+            <TextInput
+              style={styles.modalInput}
+              placeholder="Segreto API"
+              placeholderTextColor={colors.onSurfaceSecondary}
+              autoCapitalize="none"
+              autoCorrect={false}
+              secureTextEntry
+              value={apiSecretText}
+              onChangeText={setApiSecretText}
+            />
+            <View style={styles.modalButtons}>
+              <Pressable
+                style={[styles.modalBtn, { backgroundColor: colors.surfaceTertiary }]}
+                onPress={() => {
+                  setConnectModalVisible(false);
+                  setApiKeyText("");
+                  setApiSecretText("");
+                }}
+              >
+                <Text style={styles.modalBtnText}>Annulla</Text>
+              </Pressable>
+              <Pressable
+                style={[styles.modalBtn, { backgroundColor: colors.brand }]}
+                onPress={onConnectBroker}
+                disabled={connecting}
+              >
+                {connecting ? (
+                  <ActivityIndicator color={colors.onBrand} size="small" />
+                ) : (
+                  <Text style={[styles.modalBtnText, { color: colors.onBrand }]}>Salva</Text>
+                )}
+              </Pressable>
+            </View>
+          </View>
+        </View>
+      </Modal>
     </KeyboardAvoidingView>
   );
 }
@@ -1416,4 +1641,62 @@ const styles = StyleSheet.create({
     borderRadius: radius.md,
   },
   saveText: { color: colors.onBrand, fontWeight: "800", fontSize: font.lg },
+  brokerStatusRow: { flexDirection: "row", alignItems: "center", gap: spacing.sm, marginBottom: spacing.sm },
+  brokerDot: { width: 10, height: 10, borderRadius: 5, backgroundColor: colors.success },
+  brokerStatusText: { color: colors.onSurface, fontSize: font.base, fontWeight: "600", flexShrink: 1 },
+  connectBrokerBtn: {
+    flexDirection: "row",
+    alignItems: "center",
+    justifyContent: "center",
+    gap: 6,
+    backgroundColor: colors.brand,
+    borderRadius: radius.pill,
+    paddingVertical: spacing.sm,
+  },
+  connectBrokerBtnText: { color: "#000", fontWeight: "700", fontSize: font.base },
+  disconnectBtn: {
+    alignItems: "center",
+    justifyContent: "center",
+    borderRadius: radius.pill,
+    paddingVertical: spacing.sm,
+    borderWidth: 1,
+    borderColor: colors.error,
+  },
+  disconnectBtnText: { color: colors.error, fontWeight: "700", fontSize: font.base },
+  modalOverlay: {
+    flex: 1,
+    backgroundColor: "rgba(0,0,0,0.6)",
+    justifyContent: "center",
+    alignItems: "center",
+    padding: spacing.xl,
+  },
+  modalBox: { backgroundColor: colors.surfaceSecondary, borderRadius: radius.lg, padding: spacing.xl, width: "100%" },
+  modalTitle: { color: colors.onSurface, fontSize: font.lg, fontWeight: "700", marginBottom: 4 },
+  modalSubtitle: { color: colors.onSurfaceSecondary, fontSize: font.sm, marginBottom: spacing.lg },
+  modalInput: {
+    backgroundColor: colors.surfaceTertiary,
+    borderRadius: radius.md,
+    padding: spacing.sm,
+    color: colors.onSurface,
+    fontSize: font.lg,
+    marginBottom: spacing.sm,
+  },
+  modalButtons: { flexDirection: "row", gap: spacing.sm, marginTop: spacing.sm },
+  modalBtn: { flex: 1, borderRadius: radius.md, paddingVertical: spacing.sm, alignItems: "center" },
+  modalBtnText: { color: colors.onSurface, fontWeight: "700" },
+  liveModeRow: {
+    flexDirection: "row",
+    justifyContent: "space-between",
+    alignItems: "center",
+    paddingVertical: spacing.sm,
+    borderBottomWidth: StyleSheet.hairlineWidth,
+    borderBottomColor: colors.surfaceTertiary,
+  },
+  liveModeLabel: { color: colors.onSurface, fontSize: font.base, fontWeight: "600" },
+  liveModeToggle: { flexDirection: "row", backgroundColor: colors.surfaceTertiary, borderRadius: radius.pill, padding: 2 },
+  liveModeChip: { paddingHorizontal: spacing.md, paddingVertical: 6, borderRadius: radius.pill },
+  liveModeChipActivePaper: { backgroundColor: colors.onSurfaceSecondary },
+  liveModeChipActiveLive: { backgroundColor: colors.error },
+  liveModeChipText: { color: colors.onSurfaceSecondary, fontSize: font.sm, fontWeight: "700" },
+  liveModeChipTextActive: { color: "#fff" },
 });
