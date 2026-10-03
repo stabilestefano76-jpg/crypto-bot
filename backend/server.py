@@ -665,11 +665,35 @@ class PriceFeed:
         self._lock = asyncio.Lock()
 
     def get(self, symbol: str) -> Optional[float]:
-        return self.prices.get(symbol)
+        p = self.prices.get(symbol)
+        if p is None:
+            return None
+        # A price that hasn't been refreshed in 10s is NOT a live price: once a
+        # coin stops being followed over the websocket its last tick used to
+        # stay in this cache forever, and every caller kept reading it as if
+        # it were current — producing positions that "hit" a target or a stop
+        # within a second of opening, against a price that was hours old.
+        # Returning None here makes every caller fall back to a fresh REST
+        # price (they all already do).
+        if time.time() - self.updated_at.get(symbol, 0) > 10:
+            return None
+        return p
 
     async def desired_symbols(self) -> list[str]:
         docs = await db.paper_positions.find({}, {"symbol": 1, "_id": 0}).to_list(1000)
-        return sorted({d["symbol"] for d in docs})
+        symbols = {d["symbol"] for d in docs}
+        # The independent strategies' open positions need live prices too —
+        # otherwise their floating P&L falls back to the entry price (shown
+        # as 0.00) for any coin the websocket isn't following.
+        for coll in (
+            db.s3360_positions,
+            db.xrp_acc_positions,
+            db.top10_positions,
+            db.rsi_rebound_positions,
+        ):
+            rows = await coll.find({"status": "open"}, {"symbol": 1, "_id": 0}).to_list(1000)
+            symbols |= {d["symbol"] for d in rows}
+        return sorted(symbols)
 
     def _ws_url(self) -> str:
         return f"{BYBIT_WS_PUBLIC}/{exchange.category}"
