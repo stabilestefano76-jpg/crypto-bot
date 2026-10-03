@@ -701,6 +701,10 @@ class PriceFeed:
         ):
             rows = await coll.find({"status": "open"}, {"symbol": 1, "_id": 0}).to_list(1000)
             symbols |= {d["symbol"] for d in rows}
+        # XRP Accumulation checks its entry every few seconds, so XRPUSDC must
+        # be followed live permanently, not only while a position is open.
+        if (await get_config()).xrp_acc_enabled:
+            symbols.add(XRP_ACC_SYMBOL)
         return sorted(symbols)
 
     def _ws_url(self) -> str:
@@ -2452,7 +2456,6 @@ async def scheduler_loop() -> None:
             await run_top10_scan()
             await run_rsi_rebound_scan()
             await run_s3360_scan()
-            await run_xrp_acc_scan()
         except Exception as e:  # noqa: BLE001
             logger.exception("Scan loop error: %s", e)
         await asyncio.sleep(max(60, cfg.scan_interval_minutes * 60))
@@ -2506,14 +2509,22 @@ async def s3360_monitor_loop() -> None:
 
 
 async def xrp_acc_monitor_loop() -> None:
-    """Check XRP Accumulation's live-RSI target every 3s using the
-    real-time WS price cache — same reasoning as the other monitors."""
+    """Check XRP Accumulation every 3s using the real-time WS price cache:
+    the exit (RSI target) AND the entry (RSI dip). The entry used to run only
+    inside the main scan cycle, which takes 3-4 minutes, so a dip under the
+    threshold that lasted less than that could be missed. This is the ONLY
+    caller of the entry check, on purpose: two callers could both see 'no open
+    position' and open two at once."""
     await asyncio.sleep(8)
     while True:
         try:
             await monitor_xrp_acc_positions()
         except Exception as e:  # noqa: BLE001
             logger.exception("XRP Accumulation monitor error: %s", e)
+        try:
+            await run_xrp_acc_scan()
+        except Exception as e:  # noqa: BLE001
+            logger.exception("XRP Accumulation entry check error: %s", e)
         await asyncio.sleep(3)
 
 
@@ -4852,6 +4863,39 @@ async def get_xrp_acc_wallet() -> dict[str, Any]:
 _xrp_acc_last_candle: dict[str, float] = {}  # per timeframe: timestamp of the CURRENT still-forming candle a live-touch attempt was already made on
 
 
+_xrp_acc_log_at: dict[str, float] = {}
+_xrp_acc_candle_cache: dict[str, tuple[float, list[list[float]]]] = {}
+
+
+async def _xrp_acc_log(tf: str, reason: str) -> None:
+    """The entry check now runs every few seconds; a diagnostic row each time
+    would flood the log (and the database), so each (timeframe, reason) is
+    written at most once a minute — enough to show the strategy is alive."""
+    key = f"{tf}|{reason}"
+    now = time.time()
+    if now - _xrp_acc_log_at.get(key, 0.0) < 60:
+        return
+    _xrp_acc_log_at[key] = now
+    await log_reject(XRP_ACC_SYMBOL, tf, "xrp_acc", reason)
+
+
+async def _xrp_acc_candles(tf: str) -> list[list[float]]:
+    """Closed candles only change when a candle closes, so re-downloading
+    ~200 of them every 3 seconds would be wasted traffic. Reuse them for 30s,
+    and fall back to the last good copy (up to 5 minutes) if a download fails."""
+    now = time.time()
+    cached = _xrp_acc_candle_cache.get(tf)
+    if cached and cached[1] and now - cached[0] < 30:
+        return cached[1]
+    candles = await exchange.get_klines(XRP_ACC_SYMBOL, tf)
+    if candles:
+        _xrp_acc_candle_cache[tf] = (now, candles)
+        return candles
+    if cached and cached[1] and now - cached[0] < 300:
+        return cached[1]
+    return []
+
+
 async def run_xrp_acc_scan() -> None:
     cfg = await get_config()
     if not cfg.xrp_acc_enabled:
@@ -4864,24 +4908,24 @@ async def run_xrp_acc_scan() -> None:
         return
 
     for tf in cfg.xrp_acc_timeframes:
-        candles = await exchange.get_klines(XRP_ACC_SYMBOL, tf)
+        candles = await _xrp_acc_candles(tf)
         if len(candles) < cfg.xrp_acc_rsi_period + 3:
-            await log_reject(XRP_ACC_SYMBOL, tf, "xrp_acc", "dati insufficienti")
+            await _xrp_acc_log(tf, "dati insufficienti")
             continue
         live_price = price_feed.get(XRP_ACC_SYMBOL) or await price_feed.price_or_rest(XRP_ACC_SYMBOL)
         if not live_price:
-            await log_reject(XRP_ACC_SYMBOL, tf, "xrp_acc", "prezzo live non disponibile")
+            await _xrp_acc_log(tf, "prezzo live non disponibile")
             continue
         closes = [c[2] for c in candles]
         live_rsis = rsi_wilder(closes + [live_price], cfg.xrp_acc_rsi_period)
         live_rsi = live_rsis[-1]
         if live_rsi > cfg.xrp_acc_low_threshold:
-            await log_reject(XRP_ACC_SYMBOL, tf, "xrp_acc", "nessun nuovo ingresso sotto soglia bassa")
+            await _xrp_acc_log(tf, "nessun nuovo ingresso sotto soglia bassa")
             continue
         tf_sec = TF_SECONDS.get(tf, 3600)
         forming_candle_t = candles[-1][0] + tf_sec
         if _xrp_acc_last_candle.get(tf) == forming_candle_t:
-            await log_reject(XRP_ACC_SYMBOL, tf, "xrp_acc", "stessa candela già tentata")
+            await _xrp_acc_log(tf, "stessa candela già tentata")
             continue
         _xrp_acc_last_candle[tf] = forming_candle_t
 
