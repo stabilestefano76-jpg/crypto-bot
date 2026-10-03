@@ -135,17 +135,6 @@ export default function SignalsScreen() {
             <Ionicons name="school" size={16} color={colors.brand} />
           </Pressable>
           <Pressable
-            onPress={() => router.push("/grid")}
-            style={({ pressed }) => [
-              styles.scanBtn,
-              { backgroundColor: colors.surfaceTertiary },
-              pressed && { opacity: 0.6 },
-            ]}
-            testID="grid-button"
-          >
-            <Ionicons name="grid" size={16} color={colors.brand} />
-          </Pressable>
-          <Pressable
             onPress={() => router.push("/top10")}
             style={({ pressed }) => [
               styles.scanBtn,

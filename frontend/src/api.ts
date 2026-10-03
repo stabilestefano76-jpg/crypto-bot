@@ -99,15 +99,6 @@ export type Config = {
   max_pairs_per_scan: number;
   enabled_pairs: string[];
   excluded_pairs: string[];
-  grid_enabled: boolean;
-  grid_timeframe: string;
-  grid_timeframes: string[];
-  grid_num_levels: number;
-  grid_atr_spacing_mult: number;
-  grid_cell_target_pct: number;
-  grid_cascade_min_margin_pct: number;
-  grid_max_pairs: number;
-  grid_extension_spacing_mult: number;
   top10_enabled: boolean;
   top10_universe_size: number;
   top10_risk_pct: number;
@@ -353,86 +344,6 @@ export const api = {
 
 
 // ---------------------------------------------------------------------------
-// Grid Bot
-// ---------------------------------------------------------------------------
-export type GridPosition = {
-  id: string;
-  grid_id: string;
-  symbol: string;
-  cell_index: number;
-  entry: number;
-  target: number;
-  quantity: number;
-  notional: number;
-  status: string;
-  opened_at: string;
-  current_price?: number;
-  unrealized_pnl?: number;
-  unrealized_pnl_pct?: number;
-  close_price?: number;
-  close_reason?: string;
-  pnl_usdt?: number;
-  closed_at?: string;
-};
-
-export type GridPortfolio = {
-  cash: number;
-  allocated: number;
-  unrealized_pnl: number;
-  realized_pnl: number;
-  equity: number;
-  open_positions: GridPosition[];
-  closed_positions: GridPosition[];
-  open_count: number;
-  closed_count: number;
-  win_rate: number;
-};
-
-export type GridCellInfo = {
-  index: number;
-  buy_price: number;
-  sell_price: number;
-  status: "armed" | "holding";
-};
-
-export type GridInstance = {
-  id: string;
-  symbol: string;
-  timeframe: string;
-  center_price: number;
-  spacing: number;
-  atr: number;
-  cells: GridCellInfo[];
-  notional_per_cell: number;
-  status: "active" | "stopped";
-  stopped_reason?: string | null;
-  created_at: string;
-  bb_width_pct: number;
-  ema_gap_pct: number;
-  current_price?: number | null;
-};
-
-export const gridWalletApi = {
-  portfolio: () => req<GridPortfolio>("/grid/portfolio"),
-  transfer: (amount: number) =>
-    req<{ ok: boolean; grid_cash: number; main_cash: number }>(
-      "/grid/transfer",
-      { method: "POST", body: JSON.stringify({ amount }) }
-    ),
-  reset: () => req<{ ok: boolean; cash: number }>("/grid/reset", { method: "POST" }),
-};
-
-export const gridWithdraw = (amount: number) =>
-  req<{ ok: boolean; grid_cash: number; main_cash: number }>(
-    "/grid/withdraw",
-    { method: "POST", body: JSON.stringify({ amount }) }
-  );
-
-export const gridApi = {
-  instances: () => req<{ instances: GridInstance[]; count: number }>("/grid/instances"),
-};
-
-// ---------------------------------------------------------------------------
 // Per-strategy fund allocation ("cross"/shared by default, isolated on
 // request) for the three traditional strategies: counter_trend, fvg_reversal,
 // rsi_reversion.
@@ -499,7 +410,7 @@ export const strategyApi = {
 export type BotEvent = {
   id: string;
   type: "open" | "close";
-  section: "counter_trend" | "fvg_reversal" | "rsi_reversion" | "grid";
+  section: "counter_trend" | "fvg_reversal" | "rsi_reversion";
   symbol: string;
   side?: "long" | "short";
   pnl_usdt?: number | null;

@@ -133,8 +133,8 @@ class Config(BaseModel):
     trend_htf_check_enabled: bool = True  # Rev Pre-FVG, FVG Reversal: require a genuine (non-range) trend on the higher timeframe before considering a setup
     exhaustion_check_enabled: bool = True  # Rev Pre-FVG, FVG Reversal: require the trend-exhaustion score to clear exhaustion_min_score
     trend_structure_strict: bool = False  # False = only ONE of higher-high/higher-low (or the "down" mirror) is needed to call a trend, not both — set True in Settings to go back to the strict textbook definition
-    trailing_enabled: bool = True  # shared by Scalping and Grid: once price reaches the original target, arm a trailing stop instead of closing immediately, to let a strong run continue
-    trailing_atr_mult: float = 0.5  # how far (in ATR multiples) price may pull back from its post-target peak before the trailing stop closes the trade — was 1.2 (and briefly duplicated as a dead 1.0 default elsewhere in this same class), which gave back up to 60% of a Scalping trade's target profit before locking anything in
+    trailing_enabled: bool = True  # used by the 3 traditional strategies (Rev Pre-FVG, FVG Reversal, RSI Reversion): once price reaches the original target, arm a trailing stop instead of closing immediately, to let a strong run continue
+    trailing_atr_mult: float = 0.5  # how far (in ATR multiples) price may pull back from its post-target peak before the trailing stop closes the trade
     # --- RSI Reversion strategy (independent, simple): RSI extreme -> confirmed
     # reentry -> target back near RSI-50 (proxied by price returning to its own
     # N-period average). Deliberately no tight stop, only a wide catastrophic
@@ -147,25 +147,6 @@ class Config(BaseModel):
     rsi_rev_min_rr_ratio: float = 1.5  # was 3.0 — zero trades fired in days at that bar; still requires a genuinely favorable setup (reward at least 1.5x the risk), just not an extreme one that almost never occurs naturally
     rsi_rev_trailing_atr_mult: float = 3.0  # wide trailing once in profit — only to catch a genuine sudden reversal, not to lock in small moves
     rsi_rev_trailing_activation_margin_pct: float = 0.5  # trailing now activates only once profit clears an ESTIMATED round-trip fee cost plus this extra % — not at the very first cent of profit, which was too easy to trigger on pure noise
-    # --- Grid Bot (independent strategy: range/laterale trading) ---
-    grid_enabled: bool = True
-    grid_timeframe: str = "1h"  # kept for backward compatibility with old stored configs — no longer read directly, see grid_timeframes below
-    grid_timeframes: list[str] = Field(default_factory=lambda: ["1h"])
-    grid_bb_period: int = 20
-    grid_bb_std: float = 2.0
-    grid_max_bb_width_pct: float = 3.0  # market considered "laterale" if BB width <= this % of price
-    grid_ema_fast: int = 9
-    grid_ema_slow: int = 21
-    grid_max_ema_gap_pct: float = 0.5  # EMA fast/slow must be within this % of each other (flat trend)
-    grid_atr_period: int = 14
-    grid_num_levels: int = 4  # wide/sparse grid: few levels below the center price
-    grid_atr_spacing_mult: float = 1.8  # distance between grid levels = this * ATR
-    grid_cell_target_pct: float = 2.0  # each cell's own sell target = its buy price + this % — flat percentage instead of ATR-based spacing, so every cell's profit target is predictable regardless of volatility
-    grid_cascade_min_margin_pct: float = 0.3  # a cell only closes early via cascade_recovery if its gain clears round-trip fees (0.20%) PLUS this extra % — otherwise it was closing at ~breakeven, covering only the commission and locking in nothing real
-    grid_range_break_atr_mult: float = 3.0  # unused since spot removed the forced emergency stop — kept only so old grid documents that still reference it don't break
-    grid_max_pairs: int = 6  # max symbols with an active grid at once — raised from 4 given the current range-bound market phase suits Grid Bot well
-    grid_replace_improvement_pct: float = 20.0  # candidate must be this much MORE lateral (lower bb_width+ema_gap) than the worst idle active grid to replace it
-    grid_extension_spacing_mult: float = 2.0  # extra levels (beyond the original 4) space out this many times wider than the normal ladder spacing — spreads coverage across a larger continued decline instead of bunching up entries close together
     # --- Top 10 Long (multi-setup: pullback / breakout-retest / momentum / mean-reversion) ---
     top10_enabled: bool = True
     top10_universe_size: int = 10  # how many coins to consider each scan, ranked by 24h volume (proxy for market cap)
@@ -189,7 +170,7 @@ class Config(BaseModel):
     top10_atr_period: int = 14
     # --- RSI Rebound: RSI dips below a deep-oversold threshold, then closes
     # back above it — long entry, stop below the recent structural low,
-    # trailing stop/target once in profit (same mechanic as Scalping/Grid). ---
+    # trailing stop/target once in profit. ---
     rsi_rebound_enabled: bool = True
     s3360_enabled: bool = True
     s3360_timeframes: list[str] = Field(default_factory=lambda: ["1h"])
@@ -688,13 +669,7 @@ class PriceFeed:
 
     async def desired_symbols(self) -> list[str]:
         docs = await db.paper_positions.find({}, {"symbol": 1, "_id": 0}).to_list(1000)
-        grid_docs = await db.grid_instances.find(
-            {"status": "active"}, {"symbol": 1, "_id": 0}
-        ).to_list(1000)
-        return sorted(
-            {d["symbol"] for d in docs}
-            | {d["symbol"] for d in grid_docs}
-        )
+        return sorted({d["symbol"] for d in docs})
 
     def _ws_url(self) -> str:
         return f"{BYBIT_WS_PUBLIC}/{exchange.category}"
@@ -876,7 +851,7 @@ async def set_paper_cash(cash: float) -> None:
 
 # ---------------------------------------------------------------------------
 # Per-strategy fund isolation ("cross" by default, "isolated" on request) for
-# the three traditional (non-Scalping, non-Grid) strategies. By default a
+# the three traditional strategies. By default a
 # strategy has no dedicated wallet and draws from/settles to the SHARED main
 # paper wallet (get_paper_cash/set_paper_cash above) exactly as before. If the
 # user allocates funds to a specific strategy, that strategy gets its own
@@ -2442,7 +2417,6 @@ async def scheduler_loop() -> None:
         try:
             await expire_stale_signals(cfg)
             await run_scan()
-            await run_grid_scan()
             await run_top10_scan()
             await run_rsi_rebound_scan()
             await run_s3360_scan()
@@ -2594,7 +2568,6 @@ async def lifespan(_app: FastAPI):
     await get_paper_config()  # sync exchange.category from trading_mode
     scan_task = asyncio.create_task(scheduler_loop())
     monitor_task = asyncio.create_task(paper_monitor_loop())
-    grid_monitor_task = asyncio.create_task(grid_monitor_loop())
     top10_monitor_task = asyncio.create_task(top10_monitor_loop())
     rsi_rebound_monitor_task = asyncio.create_task(rsi_rebound_monitor_loop())
     s3360_monitor_task = asyncio.create_task(s3360_monitor_loop())
@@ -2606,7 +2579,6 @@ async def lifespan(_app: FastAPI):
     yield
     scan_task.cancel()
     monitor_task.cancel()
-    grid_monitor_task.cancel()
     ws_task.cancel()
     premature_task.cancel()
     entry_timing_task.cancel()
@@ -2643,7 +2615,7 @@ async def update_config(cfg: Config) -> Config:
 async def get_events(limit: int = 100) -> dict[str, Any]:
     """Unified chronological feed of open/close events across ALL five
     sections (the 3 traditional strategies sharing paper_positions/
-    paper_trades, Scalping, and Grid) — powers the app's single 'Eventi'
+    paper_trades) — powers the app's single 'Eventi'
     screen so the person doesn't have to check five separate sections to
     see what just happened."""
     events: list[dict[str, Any]] = []
@@ -2663,21 +2635,6 @@ async def get_events(limit: int = 100) -> dict[str, Any]:
             "section": t.get("strategy", "counter_trend"),
             "symbol": t["symbol"], "side": t.get("side"),
             "pnl_usdt": t.get("pnl_usdt"), "at": t["closed_at"],
-        })
-
-    g_open = await db.grid_positions.find({"status": "open"}, {"_id": 0}).sort("opened_at", -1).limit(limit).to_list(limit)
-    for p in g_open:
-        events.append({
-            "id": f"{p['id']}_open", "type": "open", "section": "grid",
-            "symbol": p["symbol"], "side": "long",
-            "pnl_usdt": None, "at": p["opened_at"],
-        })
-    g_close = await db.grid_positions.find({"status": "closed"}, {"_id": 0}).sort("closed_at", -1).limit(limit).to_list(limit)
-    for p in g_close:
-        events.append({
-            "id": f"{p['id']}_close", "type": "close", "section": "grid",
-            "symbol": p["symbol"], "side": "long",
-            "pnl_usdt": p.get("pnl_usdt"), "at": p.get("closed_at"),
         })
 
     events.sort(key=lambda e: e["at"], reverse=True)
@@ -3247,7 +3204,7 @@ async def strategy_reset(strategy: str) -> dict[str, Any]:
     """Reset a single strategy's own history: removes its open positions and
     closed trades. If it has an isolated wallet, undoes just the
     accumulated trading P&L from its cash (keeps whatever was allocated
-    intact — same spirit as Scalping/Grid's reset). Does NOT touch the
+    intact). Does NOT touch the
     other two strategies, and does NOT touch the shared main wallet if this
     strategy is currently on the shared pool (cash there isn't
     attributable to a single strategy)."""
@@ -3496,796 +3453,12 @@ def _vwap(highs, lows, closes, volumes) -> float:
     return num / den if den else closes[-1]
 
 
-def _bollinger(closes: list[float], period: int, std_mult: float):
-    window = closes[-period:]
-    mean = sum(window) / len(window)
-    variance = sum((x - mean) ** 2 for x in window) / len(window)
-    std = variance ** 0.5
-    return mean - std_mult * std, mean, mean + std_mult * std
-
-
-
-# ---------------------------------------------------------------------------
-# Grid Bot (independent strategy): range/laterale trading with ATR-spaced,
-# wide/sparse grid levels. Long-only spot-style cells: buy at the lower edge
-# of a cell, sell at its upper edge, then re-arm the cell so it can buy again
-# on the next dip — this is what produces the repeated small profits typical
-# of grid trading, but ONLY while the market stays range-bound.
-# ---------------------------------------------------------------------------
-GRID_WALLET_ID = "grid_wallet_singleton"
-GRID_FEE_PCT = 0.001  # 0.10% Bybit spot fee per side
-
-
-async def get_grid_wallet() -> dict[str, Any]:
-    doc = await db.grid_wallet.find_one({"_id": GRID_WALLET_ID}, {"_id": 0})
-    if not doc:
-        doc = {"cash": 0.0, "total_transferred_in": 0.0, "reset_seq": 0}
-        await db.grid_wallet.update_one(
-            {"_id": GRID_WALLET_ID}, {"$set": doc}, upsert=True
-        )
-    doc.setdefault("reset_seq", 0)
-    return doc
-
-
-async def save_grid_wallet(doc: dict[str, Any]) -> None:
-    await db.grid_wallet.update_one(
-        {"_id": GRID_WALLET_ID}, {"$set": doc}, upsert=True
-    )
-
-
-def analyze_grid_eligibility(closes: list[float], cfg: Config) -> dict[str, Any]:
-    """LEGACY (no longer used to build grids — kept only in case old code
-    elsewhere still calls it). A market is 'laterale' (range-bound) when
-    both the Bollinger Bands are tight AND the fast/slow EMAs are close."""
-    ema_f = _ema(closes, cfg.grid_ema_fast)
-    ema_s = _ema(closes, cfg.grid_ema_slow)
-    lower, mid, upper = _bollinger(closes, cfg.grid_bb_period, cfg.grid_bb_std)
-    last = closes[-1]
-    ema_gap_pct = abs(ema_f[-1] - ema_s[-1]) / last * 100 if last else 0.0
-    bb_width_pct = (upper - lower) / mid * 100 if mid else 0.0
-    ranging = (
-        bb_width_pct <= cfg.grid_max_bb_width_pct
-        and ema_gap_pct <= cfg.grid_max_ema_gap_pct
-    )
-    return {
-        "ranging": ranging,
-        "bb_width_pct": round(bb_width_pct, 3),
-        "ema_gap_pct": round(ema_gap_pct, 3),
-    }
-
-
-async def build_grid_plan(symbol: str, tf: str, cfg: Config) -> Optional[dict[str, Any]]:
-    """Look for a live long-only setup: a confirmed UPTREND on the higher
-    timeframe, currently retracing DOWN into the bullish FVG left by its own
-    impulse — the same structural idea as Rev Pre-FVG / FVG Reversal, but
-    executed as a staggered multi-level buy grid across the FVG zone instead
-    of one single entry. Returns None if no such live setup exists right now
-    for this symbol (no uptrend, no FVG, or price too far from the zone).
-
-    Target: NOT full trend resumption — a 50% recovery of the retracement
-    leg (from the FVG's bottom back up toward the swing high that preceded
-    it), a modest and more achievable level, shared by every cell in this
-    grid. Long-only, matching spot (no shorts)."""
-    candles = await exchange.get_klines(symbol, tf)
-    if len(candles) < 60:
-        await log_reject(symbol, tf, "grid", "dati insufficienti")
-        return None
-    closes = [c[2] for c in candles]
-    highs = [c[3] for c in candles]
-    lows = [c[4] for c in candles]
-
-    htf = _higher_tf(tf)
-    hcandles = await exchange.get_klines(symbol, htf)
-    if len(hcandles) < 20:
-        await log_reject(symbol, tf, "grid", "dati insufficienti (timeframe superiore)")
-        return None
-    if detect_market_structure(hcandles, cfg.pivot_window) != "up":
-        await log_reject(symbol, tf, "grid", "trend non rialzista")
-        return None  # long-only: needs a genuinely confirmed uptrend
-
-    atr = atr_wilder(highs, lows, closes, cfg.grid_atr_period)
-    if not atr or atr <= 0:
-        await log_reject(symbol, tf, "grid", "ATR non calcolabile")
-        return None
-
-    fvgs = detect_all_fvgs(highs, lows, closes, cfg.fvg_lookback)
-    bullish_fvgs = [f for f in fvgs if f["kind"] == "bullish"]
-    if not bullish_fvgs:
-        await log_reject(symbol, tf, "grid", "nessuna FVG rialzista trovata")
-        return None
-    current = closes[-1]
-    # Filter to zones price is actually near RIGHT NOW before picking the
-    # most significant one — otherwise a big-but-stale FVG from days ago
-    # keeps winning on size alone even when price has since moved well away
-    # from it, permanently blocking a fresher, closer (if smaller) zone that
-    # would actually be tradeable.
-    nearby_fvgs = [f for f in bullish_fvgs if current <= f["top"] * 1.02 and current >= f["bottom"] * 0.97]
-    if not nearby_fvgs:
-        await log_reject(symbol, tf, "grid", "prezzo troppo lontano dalla zona FVG")
-        return None
-    origin = max(nearby_fvgs, key=lambda f: f["gap"])  # most significant impulse among the zones still actually relevant
-    fvg_top, fvg_bottom = origin["top"], origin["bottom"]
-    # Reject a degenerate (near-zero-height) FVG outright — this is what
-    # caused a real bug: when the gap barely has any height, every cell's
-    # buy_price and the sell target can collapse onto the same price,
-    # producing an instant buy-sell round trip that only bleeds fees,
-    # repeating every few seconds forever. Require genuine room relative
-    # to volatility before treating this as a usable setup.
-    if (fvg_top - fvg_bottom) < 0.1 * atr:
-        await log_reject(symbol, tf, "grid", "FVG troppo stretta")
-        return None
-
-
-    i = origin["index"]
-    lookback_start = max(0, i - 15)
-    swing_high = max(highs[lookback_start:i + 1]) if i > lookback_start else fvg_top
-    if swing_high <= fvg_top:
-        await log_reject(symbol, tf, "grid", "nessun impulso reale sopra la FVG")
-        return None  # no real impulse leg above the gap — not a usable setup
-
-    target = fvg_bottom + 0.5 * (swing_high - fvg_bottom)
-    # If the target doesn't land MEANINGFULLY above the top buy level, this
-    # setup is unusable — reject it outright rather than clamping it to
-    # fvg_top (which is exactly what produced the instant-flip fee-bleed
-    # loop: buy_price == sell_price for every cell).
-    if (target - fvg_top) < 0.1 * atr:
-        await log_reject(symbol, tf, "grid", "target troppo vicino al livello più alto")
-        return None
-
-    n = cfg.grid_num_levels
-    step = (fvg_top - fvg_bottom) / max(1, n - 1) if n > 1 else 0.0
-    # Classic grid mechanic: each buy level gets its OWN sell target just
-    # above it (a flat percentage), instead of every cell sharing one distant
-    # target. Buys portions on the way down, sells portions on the way up —
-    # many small round-trips instead of waiting for one big recovery.
-    cells = []
-    for idx in range(n):
-        buy_price = fvg_top - idx * step
-        cells.append({
-            "index": idx + 1,
-            "buy_price": round(buy_price, 8),
-            "sell_price": round(buy_price * (1 + cfg.grid_cell_target_pct / 100), 8),
-            "status": "armed",
-            "trailing_active": False,
-            "peak_price": None,
-            "needs_low_confirmation": False,
-            "low_confirmed": False,
-        })
-
-    # Score for ranking candidates (lower = better): a bigger impulse
-    # relative to volatility is a more significant, more credible setup.
-    score = -(origin["gap"] / atr)
-
-    return {
-        "symbol": symbol,
-        "timeframe": tf,
-        "score": score,
-        "center_price": round(current, 8),
-        "atr": round(atr, 8),
-        "cells": cells,
-        "fvg_top": round(fvg_top, 8),
-        "fvg_bottom": round(fvg_bottom, 8),
-        "swing_high": round(swing_high, 8),
-        "target": round(target, 8),
-    }
-
-
-async def create_grid_instance_from_plan(plan: dict[str, Any], cfg: Config) -> dict[str, Any]:
-    """Persist a plan already computed by build_grid_plan — kept separate so
-    the scan can score many candidates without re-fetching/re-computing
-    anything when it's time to actually create the chosen ones."""
-    wallet = await get_grid_wallet()
-    notional_per_cell = (wallet.get("cash", 0.0) / max(1, cfg.grid_max_pairs)) / cfg.grid_num_levels
-    n = cfg.grid_num_levels
-    spacing = (plan["fvg_top"] - plan["fvg_bottom"]) / max(1, n - 1) if n > 1 else 0.0
-    doc = {
-        "id": str(uuid.uuid4()),
-        "symbol": plan["symbol"],
-        "timeframe": plan["timeframe"],
-        "center_price": plan["center_price"],
-        "spacing": round(spacing, 8),
-        "atr": plan["atr"],
-        "cells": plan["cells"],
-        "notional_per_cell": round(notional_per_cell, 4),
-        "status": "active",
-        "stopped_reason": None,
-        "created_at": datetime.now(timezone.utc).isoformat(),
-        # Legacy fields kept for schema/frontend compatibility — no longer
-        # meaningful under the FVG-retracement design (always 0 now).
-        "bb_width_pct": 0.0,
-        "ema_gap_pct": 0.0,
-        # New, informative fields for this design.
-        "fvg_top": plan["fvg_top"],
-        "fvg_bottom": plan["fvg_bottom"],
-        "swing_high": plan["swing_high"],
-        "target": plan["target"],
-        "extension_count": 0,  # how many extra buy levels added below the original zone (capped at 4)
-        "extension_fvg_tops": [],  # tops of bullish FVGs already used for an extension level, so the same zone isn't reused
-    }
-    await db.grid_instances.insert_one(doc)
-    return doc
-
-
-async def check_grid_reversals(cfg: Config) -> int:
-    """Close any ACTIVE grid whose higher-timeframe structure has flipped to
-    a confirmed downtrend (lower highs + lower lows) — the real invalidation
-    for a long-only 'buy the uptrend retracement' grid, checked on the scan
-    cadence (not every 3s — a structural reversal doesn't need that
-    frequency, and it saves hammering the exchange with extra candle
-    fetches). This runs in ADDITION to the fast ATR-distance emergency stop
-    in monitor_grid_instances, which stays as a quick circuit-breaker for a
-    sudden crash between scan cycles."""
-    active = await db.grid_instances.find({"status": "active"}, {"_id": 0}).to_list(100)
-    stopped = 0
-    for g in active:
-        hcandles = await exchange.get_klines(g["symbol"], _higher_tf(g.get("timeframe") or cfg.grid_timeframes[0]))
-        if len(hcandles) < 20:
-            continue
-        if detect_market_structure(hcandles, cfg.pivot_window) != "down":
-            continue
-        cur = price_feed.get(g["symbol"])
-        if not cur:
-            tickers = await exchange.get_tickers()
-            cur = next((float(t.get("last") or 0) for t in tickers if t.get("symbol") == g["symbol"]), None)
-        if not cur:
-            continue
-        holding = await db.grid_positions.find(
-            {"grid_id": g["id"], "status": "open"}, {"_id": 0}
-        ).to_list(100)
-        for pos in holding:
-            exit_notional = cur * pos["quantity"]
-            fees = (pos["notional"] + exit_notional) * GRID_FEE_PCT
-            pnl = (cur - pos["entry"]) * pos["quantity"] - fees
-            await db.grid_wallet.update_one(
-                {"_id": GRID_WALLET_ID}, {"$inc": {"cash": pos["notional"] + pnl}}, upsert=True
-            )
-            await db.grid_positions.update_one(
-                {"id": pos["id"]},
-                {"$set": {
-                    "status": "closed", "close_price": cur,
-                    "close_reason": "trend_reversal_confirmed", "pnl_usdt": round(pnl, 4),
-                    "closed_at": datetime.now(timezone.utc).isoformat(),
-                }},
-            )
-        await db.grid_instances.update_one(
-            {"id": g["id"]},
-            {"$set": {"status": "stopped", "stopped_reason": "trend_reversal_confirmed"}},
-        )
-        stopped += 1
-    return stopped
-
-
-async def run_grid_scan() -> dict[str, Any]:
-    """Score EVERY candidate pair for a live 'buy the uptrend retracement
-    into its own FVG' setup first, THEN fill open slots with the best-scored
-    ones (biggest impulse relative to volatility) — not just the first ones
-    found scanning in volume order. Once slots are full, whatever's left
-    over is still considered for a replacement: if a leftover candidate is a
-    meaningfully better setup than the worst-scoring currently-active grid
-    that has NO cell currently holding (no capital mid-trade gets forced
-    out — only idle, still-armed capital is ever reassigned), it swaps in.
-    Also closes any active grid whose higher-timeframe trend has confirmed-
-    reversed, before doing anything else."""
-    cfg = await get_config()
-    if not cfg.grid_enabled:
-        return {"skipped": True, "reason": "grid disabled"}
-    wallet = await get_grid_wallet()
-
-    reversals_closed = await check_grid_reversals(cfg)
-
-    if wallet.get("cash", 0.0) <= 1.0:
-        return {"skipped": True, "reason": "no funds in grid wallet", "reversals_closed": reversals_closed}
-
-    active_instances = await db.grid_instances.find(
-        {"status": "active"}, {"_id": 0}
-    ).to_list(100)
-    active_symbols = {g["symbol"] for g in active_instances}
-    slots = cfg.grid_max_pairs - len(active_instances)
-
-    tickers = await exchange.get_tickers()
-    vol_map: dict[str, float] = {}
-    for t in tickers:
-        try:
-            vol_map[t["symbol"]] = float(t.get("volValue") or 0)
-        except (TypeError, ValueError):
-            continue
-
-    symbols_info = await exchange.get_symbols()
-    quotes = {q.strip() for q in (cfg.quote_filter or "").split(",") if q.strip()}
-    candidates: list[str] = []
-    for s in symbols_info:
-        if not s.get("enableTrading"):
-            continue
-        sym = s.get("symbol")
-        if not sym or sym in active_symbols:
-            continue
-        if quotes and s.get("quoteCurrency") not in quotes:
-            continue
-        if cfg.excluded_pairs and sym in cfg.excluded_pairs:
-            continue
-        if cfg.enabled_pairs and sym not in cfg.enabled_pairs:
-            continue
-        if vol_map.get(sym, 0) < cfg.min_24h_volume_usdt:
-            continue
-        candidates.append(sym)
-    candidates.sort(key=lambda s: vol_map.get(s, 0), reverse=True)
-    candidates = candidates[:30]  # cap scan for performance
-    candidates = [c for c in candidates if await is_volume_stable(c, cfg)]
-
-    # Score EVERY candidate up front (one pass) — so slot-filling can pick
-    # the best live setup, not just the fastest-found-in-volume-order.
-    scored: list[tuple[float, dict[str, Any]]] = []  # (score, plan) — lower = better
-    for sym in candidates:
-        best_plan: Optional[dict[str, Any]] = None
-        for tf in cfg.grid_timeframes:
-            plan = await build_grid_plan(sym, tf, cfg)
-            if plan and (best_plan is None or plan["score"] < best_plan["score"]):
-                best_plan = plan
-        if best_plan:
-            scored.append((best_plan["score"], best_plan))
-    scored.sort(key=lambda x: x[0])  # best (most significant relative impulse) first
-
-    created = 0
-    used = 0
-    while slots > 0 and used < len(scored):
-        _, plan = scored[used]
-        used += 1
-        await create_grid_instance_from_plan(plan, cfg)
-        created += 1
-        slots -= 1
-    leftover = scored[used:]  # already scored, not used to fill a slot
-
-    # --- Replacement pass: slots are full, but the leftover candidates are
-    # still worth checking against the weakest idle active grids. ---
-    replaced = 0
-    if leftover:
-        holding_grid_ids = {
-            p["grid_id"] for p in await db.grid_positions.find(
-                {"status": "open"}, {"_id": 0, "grid_id": 1}
-            ).to_list(1000)
-        }
-        idle_actives = [g for g in active_instances if g["id"] not in holding_grid_ids]
-        # Re-score every idle active grid's setup RIGHT NOW (not the value
-        # from whenever it was created) — if its setup no longer holds at
-        # all (trend faded, price moved off the zone), treat it as
-        # infinitely bad so any valid candidate can take its place.
-        idle_scored: list[tuple[float, dict[str, Any]]] = []
-        for g in idle_actives:
-            gplan = await build_grid_plan(g["symbol"], g.get("timeframe") or cfg.grid_timeframes[0], cfg)
-            score = gplan["score"] if gplan else float("inf")
-            idle_scored.append((score, g))
-        idle_scored.sort(key=lambda x: x[0], reverse=True)  # worst (highest/inf) first
-
-        for cand_score, plan in leftover:
-            if not idle_scored:
-                break
-            worst_score, worst_grid = idle_scored[0]
-            if worst_score == float("inf"):
-                should_replace = True  # that active grid's setup is fully gone
-            else:
-                margin = abs(worst_score) * (cfg.grid_replace_improvement_pct / 100)
-                should_replace = cand_score <= worst_score - margin
-            if not should_replace:
-                continue
-            await db.grid_instances.update_one(
-                {"id": worst_grid["id"]},
-                {"$set": {"status": "stopped", "stopped_reason": "replaced_by_better_pair"}},
-            )
-            await create_grid_instance_from_plan(plan, cfg)
-            replaced += 1
-            idle_scored.pop(0)  # that slot is now taken by the new grid
-
-    return {
-        "scanned": len(candidates), "created": created, "replaced": replaced,
-        "reversals_closed": reversals_closed,
-    }
-
-
-async def find_grid_extension_fvg_target(symbol: str, tf: str, below_price: float, used_tops: list[float], cfg: Config) -> Optional[float]:
-    """Among still-open bullish FVGs on the grid's own timeframe, find the
-    one closest below `below_price` that hasn't already been used for a
-    previous extension level on this grid. These are zones the price left
-    behind on its way up — a real continued decline revisiting one of them
-    is a more meaningful place to add a level than an arbitrary fixed
-    distance."""
-    candles = await exchange.get_klines(symbol, tf)
-    if len(candles) < 10:
-        return None
-    highs = [c[3] for c in candles]
-    lows = [c[4] for c in candles]
-    closes = [c[2] for c in candles]
-    fvgs = detect_all_fvgs(highs, lows, closes, lookback=len(candles))
-    candidates = [
-        f for f in fvgs
-        if f["kind"] == "bullish"
-        and f["top"] < below_price
-        and not any(abs(f["top"] - used) < 1e-9 for used in used_tops)
-    ]
-    if not candidates:
-        return None
-    best = max(candidates, key=lambda f: f["top"])  # closest below the current lowest level
-    return best["top"]
-
-
-async def monitor_grid_instances() -> None:
-    """Check every active grid's cells against the current price: fill armed
-    cells that got dipped into, close holding cells that reached their sell
-    target (re-arming them), and emergency-stop a grid if price breaks well
-    below its lowest cell (the real risk of a long-only range grid)."""
-    instances = await db.grid_instances.find({"status": "active"}, {"_id": 0}).to_list(100)
-    if not instances:
-        return
-    cfg = await get_config()
-    wallet = await get_grid_wallet()
-    reset_seq = wallet.get("reset_seq", 0)
-    cash = wallet.get("cash", 0.0)  # used only to check affordability before a fill
-
-    need_rest = any(price_feed.get(g["symbol"]) is None for g in instances)
-    rest_map: dict[str, float] = {}
-    if need_rest:
-        tickers = await exchange.get_tickers()
-        for t in tickers:
-            try:
-                rest_map[t["symbol"]] = float(t.get("last") or 0)
-            except (TypeError, ValueError):
-                continue
-
-    for grid in instances:
-        cur = price_feed.get(grid["symbol"]) or rest_map.get(grid["symbol"])
-        if not cur:
-            continue
-        cells = grid["cells"]
-        changed = False
-
-        # Emergency stop: price fell well below the lowest grid cell — this
-        # means the market broke out of the range into a real downtrend.
-        lowest_buy = min(c["buy_price"] for c in cells)
-
-        # Extend the ladder downward (up to 4 extra levels total) when price
-        # has fallen meaningfully below the lowest existing buy. Extension
-        # levels use a WIDER spacing than the original ladder (configurable
-        # multiple) — during a real extended decline, tightly-packed levels
-        # all fill in quick succession and cover little price ground; wider
-        # spacing spreads the remaining capital across more of the move.
-        # One new level per tick at most — a single sharp wick shouldn't
-        # instantly max out all 4.
-        extension_spacing = grid["spacing"] * cfg.grid_extension_spacing_mult
-        if grid.get("extension_count", 0) < 4 and cur < lowest_buy - extension_spacing:
-            fvg_target = await find_grid_extension_fvg_target(
-                grid["symbol"], grid.get("timeframe") or cfg.grid_timeframes[0], lowest_buy, grid.get("extension_fvg_tops", []), cfg
-            )
-            used_fvg_top: Optional[float] = None
-            if fvg_target is not None and fvg_target < lowest_buy:
-                new_buy = fvg_target
-                used_fvg_top = fvg_target
-            else:
-                new_buy = lowest_buy - extension_spacing
-            new_cell = {
-                "index": len(cells) + 1,
-                "buy_price": round(new_buy, 8),
-                "sell_price": round(new_buy * (1 + cfg.grid_cell_target_pct / 100), 8),
-                "status": "armed",
-                "trailing_active": False,
-                "peak_price": None,
-                "needs_low_confirmation": False,
-                "low_confirmed": False,
-            }
-            cells = cells + [new_cell]
-            update_ops: dict[str, Any] = {
-                "$set": {"cells": cells},
-                "$inc": {"extension_count": 1},
-            }
-            if used_fvg_top is not None:
-                update_ops["$push"] = {"extension_fvg_tops": used_fvg_top}
-            await db.grid_instances.update_one({"id": grid["id"]}, update_ops)
-            grid["cells"] = cells
-            lowest_buy = new_buy
-
-        # Emergency stop removed: in spot there's no liquidation risk, and
-        # forcing a sale at a loss just crystallizes it. The only remaining
-        # cap on capital committed to a falling market is the 4-extension
-        # limit above — once exhausted, positions simply wait, however long
-        # it takes, for price to recover into their own targets.
-
-
-        # --- Cascade profit-lock: when price returns up to the entry of the
-        # highest-priced (shallowest) currently-holding cell, close every
-        # OTHER holding cell whose gain at that price clears round-trip fees
-        # plus a real margin (grid_cascade_min_margin_pct) — rather than
-        # leaving them to wait for the shared far target, which can reverse
-        # before ever being reached. A cell whose gain would only just cover
-        # (or not even cover) the commission stays holding instead of closing
-        # at an effective breakeven that locks in nothing real. The trigger
-        # cell itself always stays open (at that exact price it's only at
-        # breakeven, not yet ahead).
-        holding_cells = [c for c in cells if c["status"] == "holding"]
-        if len(holding_cells) >= 2:
-            highest_entry = max(c["buy_price"] for c in holding_cells)
-            if cur >= highest_entry:
-                min_gain_pct = 2 * GRID_FEE_PCT * 100 + cfg.grid_cascade_min_margin_pct
-                for cell in holding_cells:
-                    if cell["buy_price"] >= highest_entry:
-                        continue  # this is the trigger cell itself — leave it open
-                    gain_pct = (cur - cell["buy_price"]) / cell["buy_price"] * 100
-                    if gain_pct < min_gain_pct:
-                        continue  # would only cover (or not even cover) the round-trip fee — leave it holding for its own real target instead
-                    pos = await db.grid_positions.find_one(
-                        {"grid_id": grid["id"], "cell_index": cell["index"], "status": "open"},
-                        {"_id": 0},
-                    )
-                    if pos:
-                        exit_notional = cur * pos["quantity"]
-                        fees = (pos["notional"] + exit_notional) * GRID_FEE_PCT
-                        pnl = (cur - pos["entry"]) * pos["quantity"] - fees
-                        await db.grid_wallet.update_one(
-                            {"_id": GRID_WALLET_ID},
-                            {"$inc": {"cash": pos["notional"] + pnl}},
-                            upsert=True,
-                        )
-                        await db.grid_positions.update_one(
-                            {"id": pos["id"]},
-                            {"$set": {
-                                "status": "closed", "close_price": cur,
-                                "close_reason": "cascade_recovery", "pnl_usdt": round(pnl, 4),
-                                "closed_at": datetime.now(timezone.utc).isoformat(),
-                            }},
-                        )
-                    cell["status"] = "armed"
-                    cell["trailing_active"] = False
-                    cell["peak_price"] = None
-                    cell["needs_low_confirmation"] = True
-                    cell["low_confirmed"] = False
-                    changed = True
-
-        for cell in cells:
-            if cell["status"] == "armed" and cell.get("needs_low_confirmation") and not cell.get("low_confirmed"):
-                # This cell was closed by the cascade profit-lock — it may
-                # only re-buy after price has actually undershot the grid's
-                # absolute floor (a confirmed low), then risen back up to
-                # touch its own level again. Until that undershoot happens,
-                # it stays armed but inert even if price dips to its level.
-                if cur < lowest_buy:
-                    cell["low_confirmed"] = True
-                    changed = True
-                continue
-            if cell["status"] == "armed" and cur <= cell["buy_price"]:
-                notional = grid["notional_per_cell"]
-                if notional < 1.0 or notional > cash:
-                    continue
-                # Fill AT the cell's own level, not the live price — a real
-                # limit order at this level fills there even if price already
-                # gapped further down by the time we notice. Using live
-                # price here was the cause of multiple cells all recording
-                # the same "entry" when several got crossed in one tick
-                # (e.g. catching up after being stuck armed for a while).
-                fill_price = cell["buy_price"]
-                qty = notional / fill_price
-                # Debit atomically FIRST, guarded on the reset counter: if a
-                # Reset happened since we read the wallet, this matches
-                # nothing and we skip the fill entirely (no ghost position).
-                result = await db.grid_wallet.update_one(
-                    {"_id": GRID_WALLET_ID, "reset_seq": reset_seq},
-                    {"$inc": {"cash": -notional}},
-                )
-                if result.matched_count == 0:
-                    logger.warning("Grid fill aborted: reset happened concurrently for %s", grid["symbol"])
-                    continue
-                cash -= notional  # keep the local affordability check current for this cycle
-                await db.grid_positions.insert_one({
-                    "id": str(uuid.uuid4()),
-                    "grid_id": grid["id"],
-                    "symbol": grid["symbol"],
-                    "cell_index": cell["index"],
-                    "entry": fill_price,
-                    "target": cell["sell_price"],
-                    "quantity": qty,
-                    "notional": notional,
-                    "opened_at": datetime.now(timezone.utc).isoformat(),
-                    "status": "open",
-                })
-                cell["status"] = "holding"
-                changed = True
-            elif cell["status"] == "holding" and cell.get("trailing_active"):
-                atr = grid.get("atr") or 0.0
-                peak = cell.get("peak_price") or cur
-                new_peak = max(peak, cur)
-                if new_peak != peak:
-                    cell["peak_price"] = new_peak
-                    changed = True
-                trail_level = new_peak - cfg.trailing_atr_mult * atr
-                if cur <= trail_level:
-                    pos = await db.grid_positions.find_one(
-                        {"grid_id": grid["id"], "cell_index": cell["index"], "status": "open"},
-                        {"_id": 0},
-                    )
-                    if pos:
-                        exit_notional = cur * pos["quantity"]
-                        fees = (pos["notional"] + exit_notional) * GRID_FEE_PCT
-                        pnl = (cur - pos["entry"]) * pos["quantity"] - fees
-                        await db.grid_wallet.update_one(
-                            {"_id": GRID_WALLET_ID},
-                            {"$inc": {"cash": pos["notional"] + pnl}},
-                            upsert=True,
-                        )
-                        await db.grid_positions.update_one(
-                            {"id": pos["id"]},
-                            {"$set": {
-                                "status": "closed", "close_price": cur,
-                                "close_reason": "trailing_stop", "pnl_usdt": round(pnl, 4),
-                                "closed_at": datetime.now(timezone.utc).isoformat(),
-                            }},
-                        )
-                    cell["status"] = "armed"
-                    cell["trailing_active"] = False
-                    cell["peak_price"] = None
-                    changed = True
-            elif cell["status"] == "holding" and cur >= cell["sell_price"]:
-                if cfg.trailing_enabled and (grid.get("atr") or 0) > 0:
-                    # Arm trailing instead of closing now — let a strong run continue.
-                    cell["trailing_active"] = True
-                    cell["peak_price"] = cur
-                    changed = True
-                else:
-                    pos = await db.grid_positions.find_one(
-                        {"grid_id": grid["id"], "cell_index": cell["index"], "status": "open"},
-                        {"_id": 0},
-                    )
-                    if pos:
-                        exit_notional = cur * pos["quantity"]
-                        fees = (pos["notional"] + exit_notional) * GRID_FEE_PCT
-                        pnl = (cur - pos["entry"]) * pos["quantity"] - fees
-                        await db.grid_wallet.update_one(
-                            {"_id": GRID_WALLET_ID},
-                            {"$inc": {"cash": pos["notional"] + pnl}},
-                            upsert=True,
-                        )
-                        await db.grid_positions.update_one(
-                            {"id": pos["id"]},
-                            {"$set": {
-                                "status": "closed", "close_price": cur,
-                                "close_reason": "target", "pnl_usdt": round(pnl, 4),
-                                "closed_at": datetime.now(timezone.utc).isoformat(),
-                            }},
-                        )
-                    cell["status"] = "armed"
-                    changed = True
-
-        if changed:
-            await db.grid_instances.update_one(
-                {"id": grid["id"]}, {"$set": {"cells": cells}}
-            )
-
-
-async def grid_monitor_loop() -> None:
-    """Check grid fills/closes every 3s using the real-time WS price cache —
-    infrequent checks let price slip past a level before the bot notices."""
-    await asyncio.sleep(8)
-    while True:
-        try:
-            await monitor_grid_instances()
-        except Exception as e:  # noqa: BLE001
-            logger.exception("Grid monitor error: %s", e)
-        await asyncio.sleep(3)
-
-
-async def top10_monitor_loop() -> None:
-    """Check Top10 stop/TP1/TP2/runner-trailing every 3s using the
-    real-time WS price cache — same reasoning as the other monitors."""
-    await asyncio.sleep(8)
-    while True:
-        try:
-            await monitor_top10_positions()
-        except Exception as e:  # noqa: BLE001
-            logger.exception("Top10 monitor error: %s", e)
-        await asyncio.sleep(3)
-
-
-async def rsi_rebound_monitor_loop() -> None:
-    """Check RSI Rebound stop/trailing every 3s using the real-time WS
-    price cache — same reasoning as the other monitors."""
-    await asyncio.sleep(8)
-    while True:
-        try:
-            await monitor_rsi_rebound_positions()
-        except Exception as e:  # noqa: BLE001
-            logger.exception("RSI Rebound monitor error: %s", e)
-        await asyncio.sleep(3)
-
-
-async def s3360_monitor_loop() -> None:
-    """Check 33/60 stop/target-RSI/timeout every 3s using the real-time WS
-    price cache — same reasoning as the other monitors."""
-    await asyncio.sleep(8)
-    while True:
-        try:
-            await monitor_s3360_positions()
-        except Exception as e:  # noqa: BLE001
-            logger.exception("33/60 monitor error: %s", e)
-        await asyncio.sleep(3)
-
-
-async def xrp_acc_monitor_loop() -> None:
-    """Check XRP Accumulation's target-RSI every 3s using the real-time WS
-    price cache — same reasoning as the other monitors."""
-    await asyncio.sleep(8)
-    while True:
-        try:
-            await monitor_xrp_acc_positions()
-        except Exception as e:  # noqa: BLE001
-            logger.exception("XRP Accumulation monitor error: %s", e)
-        await asyncio.sleep(3)
-
-
-class GridTransferRequest(BaseModel):
-    amount: float
-
-
-@api.post("/grid/transfer")
-async def grid_transfer(req: GridTransferRequest) -> dict[str, Any]:
-    amount = req.amount
-    if amount <= 0:
-        raise HTTPException(status_code=400, detail="L'importo deve essere positivo")
-    main_cash = await get_paper_cash()
-    if amount > main_cash:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Fondi insufficienti nel portafoglio principale (disponibili: {round(main_cash, 2)})",
-        )
-    await set_paper_cash(main_cash - amount)
-    # Atomic increment — same reasoning as the Scalping Bot's transfer: never
-    # clobbers a concurrent change to "cash" made by a cell filling/closing.
-    updated = await db.grid_wallet.find_one_and_update(
-        {"_id": GRID_WALLET_ID},
-        {"$inc": {"cash": amount, "total_transferred_in": amount}},
-        upsert=True,
-        return_document=ReturnDocument.AFTER,
-    )
-    return {"ok": True, "grid_cash": updated.get("cash", amount), "main_cash": main_cash - amount}
-
-
-@api.post("/grid/withdraw")
-async def grid_withdraw(req: GridTransferRequest) -> dict[str, Any]:
-    amount = req.amount
-    if amount <= 0:
-        raise HTTPException(status_code=400, detail="L'importo deve essere positivo")
-    wallet = await get_grid_wallet()
-    grid_cash = wallet.get("cash", 0.0)
-    if amount > grid_cash:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Fondi insufficienti nel portafoglio griglia (disponibili: {round(grid_cash, 2)})",
-        )
-    updated = await db.grid_wallet.find_one_and_update(
-        {"_id": GRID_WALLET_ID},
-        {"$inc": {"cash": -amount, "total_transferred_in": -amount}},
-        upsert=True,
-        return_document=ReturnDocument.AFTER,
-    )
-    main_cash = await get_paper_cash()
-    await set_paper_cash(main_cash + amount)
-    return {"ok": True, "grid_cash": updated.get("cash", 0.0), "main_cash": main_cash + amount}
-
-
-@api.post("/grid/reset")
-async def grid_reset() -> dict[str, Any]:
-    """Reset del Grid Bot: cancella tutte le griglie attive/fermate, le
-    posizioni aperte/chiuse e azzera il portafoglio griglia. NON tocca il
-    portafoglio principale."""
-    current = await get_grid_wallet()
-    next_seq = current.get("reset_seq", 0) + 1
-    await db.grid_positions.delete_many({})
-    await db.grid_instances.delete_many({})
-    await save_grid_wallet({"cash": 0.0, "total_transferred_in": 0.0, "reset_seq": next_seq})
-    return {"ok": True, "cash": 0.0}
-
-
-
 
 # ============================================================================
 # TOP 10 LONG — multi-setup strategy (Pullback / Breakout-Retest / Momentum /
 # Mean-Reversion) over the top coins by 24h volume (proxy for market cap).
 # Long-only, spot. Own isolated wallet, own position lifecycle, independent
-# of the 3 traditional strategies and of Scalping/Grid.
+# of the 3 traditional strategies.
 # ============================================================================
 
 TOP10_WALLET_ID = "top10_wallet_singleton"
@@ -4330,7 +3503,7 @@ async def record_top10_trade_outcome(pnl_usdt: float) -> None:
         )
 
 
-EXCLUDED_STABLE_BASES = ("USDC", "USDT", "BUSD", "DAI", "TUSD", "USDE", "FDUSD", "USDP", "GUSD")  # stablecoin base assets to skip — a stablecoin-vs-stablecoin pair has near-zero volatility and is useless for any of these strategies. Rebuilt here (was accidentally deleted along with the removed Scalping code, which is where this constant used to live, even though Grid/Top10 also depend on it) and renamed from the old SCALPING_-prefixed name since it's shared, not Scalping-specific.
+EXCLUDED_STABLE_BASES = ("USDC", "USDT", "BUSD", "DAI", "TUSD", "USDE", "FDUSD", "USDP", "GUSD")  # stablecoin base assets to skip — a stablecoin-vs-stablecoin pair has near-zero volatility and is useless for any of these strategies.
 
 
 async def get_top10_universe(cfg: Config) -> list[str]:
@@ -5721,79 +4894,6 @@ async def xrp_acc_reset() -> dict[str, Any]:
     return {"ok": True}
 
 
-
-
-@api.get("/grid/portfolio")
-async def grid_portfolio() -> dict[str, Any]:
-    wallet = await get_grid_wallet()
-    cash = wallet.get("cash", 0.0)
-    open_positions = await db.grid_positions.find({"status": "open"}, {"_id": 0}).to_list(1000)
-    tickers = await exchange.get_tickers()
-    price_map: dict[str, float] = {}
-    for t in tickers:
-        try:
-            price_map[t["symbol"]] = float(t.get("last") or 0)
-        except (TypeError, ValueError):
-            continue
-    unrealized = 0.0
-    allocated = 0.0
-    enriched: list[dict[str, Any]] = []
-    for p in open_positions:
-        cur = price_map.get(p["symbol"], p["entry"])
-        gross_pnl = (cur - p["entry"]) * p["quantity"]
-        notional = p["entry"] * p["quantity"]
-        exit_notional = cur * p["quantity"]
-        est_fees = (notional + exit_notional) * GRID_FEE_PCT
-        pnl = gross_pnl - est_fees
-        pnl_pct = (pnl / notional) * 100 if notional > 0 else 0.0
-        unrealized += pnl
-        allocated += notional
-        enriched.append({
-            **p, "current_price": round(cur, 8),
-            "unrealized_pnl": round(pnl, 4), "unrealized_pnl_pct": round(pnl_pct, 2),
-        })
-    closed = await db.grid_positions.find(
-        {"status": "closed"}, {"_id": 0}
-    ).sort("closed_at", -1).to_list(200)
-    realized = sum(c.get("pnl_usdt", 0.0) for c in closed)
-    wins = sum(1 for c in closed if c.get("pnl_usdt", 0.0) > 0)
-    losses = sum(1 for c in closed if c.get("pnl_usdt", 0.0) <= 0)
-    settled = wins + losses
-    win_rate = round((wins / settled) * 100, 1) if settled else 0.0
-    equity = cash + allocated + unrealized
-    total_in = wallet.get("total_transferred_in", 0.0)
-    discrepancy = round((cash + allocated) - (total_in + realized), 4)
-    return {
-        "cash": round(cash, 4),
-        "allocated": round(allocated, 4),
-        "unrealized_pnl": round(unrealized, 4),
-        "realized_pnl": round(realized, 4),
-        "equity": round(equity, 4),
-        "total_transferred_in": round(total_in, 4),
-        "ledger_discrepancy_usdt": discrepancy,
-        "open_positions": enriched,
-        "closed_positions": closed,
-        "open_count": len(enriched),
-        "closed_count": len(closed),
-        "win_rate": win_rate,
-    }
-
-
-@api.get("/grid/instances")
-async def grid_instances_list() -> dict[str, Any]:
-    """Active/stopped grids with their cell levels and current price — this
-    is what the frontend chart uses to draw the grid lines over the price."""
-    instances = await db.grid_instances.find({}, {"_id": 0}).sort("created_at", -1).to_list(50)
-    tickers = await exchange.get_tickers()
-    price_map: dict[str, float] = {}
-    for t in tickers:
-        try:
-            price_map[t["symbol"]] = float(t.get("last") or 0)
-        except (TypeError, ValueError):
-            continue
-    for g in instances:
-        g["current_price"] = price_map.get(g["symbol"])
-    return {"instances": instances, "count": len(instances)}
 
 
 # ============================================================================

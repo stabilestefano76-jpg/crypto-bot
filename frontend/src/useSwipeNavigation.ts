@@ -6,7 +6,6 @@ import { useRouter } from "expo-router";
 // source of truth — every strategy screen imports it, so adding/reordering
 // a strategy here updates the swipe sequence everywhere at once.
 export const STRATEGY_ORDER = [
-  "/grid",
   "/top10",
   "/rsi-rebound",
   "/rsi-reversion",

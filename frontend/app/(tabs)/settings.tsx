@@ -126,7 +126,6 @@ export default function SettingsScreen() {
       | "counter_trend_timeframes"
       | "fvg_reversal_timeframes"
       | "rsi_reversion_timeframes"
-      | "grid_timeframes"
       | "rsi_rebound_timeframes"
       | "top10_timeframes"
       | "s3360_timeframes"
@@ -236,7 +235,6 @@ export default function SettingsScreen() {
               ["counter_trend", "Rev Pre-FVG"],
               ["fvg_reversal", "FVG Reversal"],
               ["rsi_reversion", "RSI Reversion"],
-              ["grid", "Grid Bot"],
               ["top10", "Top 10 Long"],
               ["rsi_rebound", "RSI Rebound"],
               ["s3360", "33/60"],
@@ -304,7 +302,6 @@ export default function SettingsScreen() {
               // unico pannello (utile per incanalare il budget quando si
               // passerà al reale).
               const isActive = (val: string): boolean => {
-                if (val === "grid") return cfg.grid_enabled;
                 if (val === "top10") return cfg.top10_enabled;
                 if (val === "rsi_rebound") return cfg.rsi_rebound_enabled;
                 if (val === "s3360") return cfg.s3360_enabled;
@@ -312,10 +309,6 @@ export default function SettingsScreen() {
                 return stratOn(val);
               };
               const toggle = (val: string) => {
-                if (val === "grid") {
-                  update({ grid_enabled: !cfg.grid_enabled });
-                  return;
-                }
                 if (val === "top10") {
                   update({ top10_enabled: !cfg.top10_enabled });
                   return;
@@ -343,7 +336,6 @@ export default function SettingsScreen() {
                     ["counter_trend", "Rev Pre-FVG"],
                     ["fvg_reversal", "FVG Reversal"],
                     ["rsi_reversion", "RSI Reversion"],
-                    ["grid", "Grid Bot"],
                     ["top10", "Top 10 Long"],
                     ["rsi_rebound", "RSI Rebound"],
                     ["s3360", "33/60"],
@@ -376,8 +368,8 @@ export default function SettingsScreen() {
               consolidamento verso il fill FVG. FVG Reversal = contro-trend
               sul ritracciamento verso la FVG (parametri indipendenti). RSI
               Reversion = rientro da ipercomprato/ipervenduto confermato da
-              divergenza. Grid Bot ha sempre avuto un portafoglio proprio
-              separato — qui puoi anche fermarlo del tutto, utile per
+              divergenza. Le altre strategie hanno ciascuna un portafoglio
+              proprio separato — qui puoi anche fermarle del tutto, utile per
               decidere quali motori usare quando si passerà al reale.
             </Text>
           </Section>
@@ -613,88 +605,7 @@ export default function SettingsScreen() {
                 timeframe superiore (usato anche da RSI Reversion solo per
                 la divergenza, non per il trend), esaurimento trend, e
                 divergenza RSI — utile per capire quanto ciascun filtro
-                stia davvero limitando i segnali. Il Grid Bot non è
-                toccato da nessuno di questi parametri, resta sempre
-                rigoroso.
-              </Text>
-            </Section>
-          )}
-
-          {cfg.grid_enabled && (
-            <Section title="Grid Bot">
-              <Text style={styles.fieldLabel}>Timeframe</Text>
-              <View style={styles.chipsRow}>
-                {TIMEFRAMES.map((t) => {
-                  const active = cfg.grid_timeframes.includes(t);
-                  return (
-                    <Pressable
-                      key={t}
-                      onPress={() => toggleTimeframeFor("grid_timeframes", t)}
-                      style={[styles.chip, active && styles.chipActive]}
-                      testID={`tf-select-grid-${t}`}
-                    >
-                      <Text style={[styles.chipText, active && styles.chipTextActive]}>
-                        {t}
-                      </Text>
-                    </Pressable>
-                  );
-                })}
-              </View>
-              <NumRow
-                label="Numero livelli di acquisto"
-                value={cfg.grid_num_levels}
-                onChange={(v) => update({ grid_num_levels: v })}
-                testID="input-grid-num-levels"
-              />
-              <NumRow
-                label="Target vendita per livello (% sopra l'acquisto)"
-                value={cfg.grid_cell_target_pct}
-                onChange={(v) => update({ grid_cell_target_pct: v })}
-                step={0.5}
-                testID="input-grid-cell-target-pct"
-              />
-              <NumRow
-                label="Margine minimo recupero anticipato (% oltre le commissioni)"
-                value={cfg.grid_cascade_min_margin_pct}
-                onChange={(v) => update({ grid_cascade_min_margin_pct: v })}
-                step={0.1}
-                testID="input-grid-cascade-margin"
-              />
-              <NumRow
-                label="Spaziatura livelli estesi (×normale)"
-                value={cfg.grid_extension_spacing_mult}
-                onChange={(v) => update({ grid_extension_spacing_mult: v })}
-                step={0.1}
-                testID="input-grid-extension-spacing"
-              />
-              <NumRow
-                label="Numero massimo di griglie in contemporanea"
-                value={cfg.grid_max_pairs}
-                onChange={(v) => update({ grid_max_pairs: v })}
-                testID="input-grid-max-pairs"
-              />
-              <Text style={styles.scoreHintText}>
-                Quante celle di acquisto crea ogni griglia, distribuite dal
-                fondo al bordo della propria zona FVG — più livelli
-                significa acquisti più ravvicinati (mediando più spesso), meno
-                livelli significa acquisti più distanziati. Ogni livello ha il
-                proprio target di vendita, calcolato automaticamente sopra il
-                proprio prezzo di entrata (percentuale fissa, non più
-                distanza in ATR): compra a scaglioni
-                scendendo, vende a scaglioni salendo — non più un unico
-                target lontano condiviso da tutte le celle. Se il prezzo scende
-                oltre l&apos;ultimo livello, la griglia ne aggiunge fino a 4 in
-                più (mai oltre): prova prima ad agganciarsi a una FVG rialzista
-                ancora aperta più in basso (una zona lasciata indietro durante
-                la salita, mai riusata due volte sulla stessa griglia); se non
-                ce n&apos;è una disponibile, usa come riserva una distanza fissa
-                pari a &quot;×normale&quot; volte la spaziatura originale. Quando il
-                prezzo risale fino all&apos;entrata della cella meno profonda, il
-                recupero anticipato ("cascade") chiude anche le altre celle in
-                attesa — ma solo se il loro guadagno a quel prezzo supera le
-                commissioni di andata/ritorno (0,20%) più il margine impostato
-                sopra: altrimenti restano in attesa del proprio vero target,
-                invece di chiudersi a un pareggio che non lascia nulla in tasca.
+                stia davvero limitando i segnali.
               </Text>
             </Section>
           )}
@@ -1041,7 +952,7 @@ export default function SettingsScreen() {
             </Text>
           </Section>
 
-          <Section title="Trailing Stop (Grid)">
+          <Section title="Trailing Stop">
             <ToggleRow
               label="Trailing stop attivo"
               value={cfg.trailing_enabled}
