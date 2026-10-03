@@ -286,11 +286,12 @@ export const api = {
       exchange: string;
       api_key_masked?: string;
       usdt_balance?: number;
+      usdc_balance?: number;
       connected_at?: string;
       error?: string;
     }>("/exchange/status"),
   exchangeConnect: (creds: { api_key: string; api_secret: string }) =>
-    req<{ connected: boolean; usdt_balance?: number; api_key_masked?: string }>(
+    req<{ connected: boolean; usdt_balance?: number; usdc_balance?: number; api_key_masked?: string }>(
       "/exchange/connect",
       { method: "POST", body: JSON.stringify(creds) }
     ),

@@ -3441,19 +3441,23 @@ async def exchange_status() -> dict[str, Any]:
                 "error": data.get("retMsg", f"HTTP {r.status_code}"),
                 "api_key_masked": doc.get("api_key_masked", ""),
             }
-        usdt_total = 0.0
+        # The strategies trade USDC pairs, so USDC has to be reported too —
+        # summing only USDT showed 0 even with funds sitting in USDC.
+        totals = {"USDT": 0.0, "USDC": 0.0}
         for acc in data.get("result", {}).get("list", []):
             for coin in acc.get("coin", []):
-                if coin.get("coin") == "USDT":
+                name = coin.get("coin")
+                if name in totals:
                     try:
-                        usdt_total += float(coin.get("walletBalance") or 0)
+                        totals[name] += float(coin.get("walletBalance") or 0)
                     except (TypeError, ValueError):
                         continue
         return {
             "connected": True,
             "exchange": "bybit",
             "api_key_masked": doc.get("api_key_masked", ""),
-            "usdt_balance": round(usdt_total, 2),
+            "usdt_balance": round(totals["USDT"], 2),
+            "usdc_balance": round(totals["USDC"], 2),
             "connected_at": doc.get("connected_at"),
         }
     except (httpx.HTTPError, InvalidToken) as e:

@@ -39,6 +39,7 @@ export default function PortfolioScreen() {
     connected: boolean;
     api_key_masked?: string;
     usdt_balance?: number;
+    usdc_balance?: number;
   } | null>(null);
 
   const load = useCallback(async () => {
@@ -382,10 +383,10 @@ export default function PortfolioScreen() {
             <View style={styles.connectedRow} testID="exchange-connected">
               <View style={styles.connectedLeft}>
                 <View style={styles.connectedDot} />
-                <View>
+                <View style={{ flexShrink: 1 }}>
                   <Text style={styles.connectedTitle}>Bybit connected</Text>
                   <Text style={styles.connectedSub}>
-                    {exchange.api_key_masked} · ${exchange.usdt_balance?.toFixed(2) ?? "0.00"} USDT
+                    {exchange.api_key_masked} · {(exchange.usdc_balance ?? 0).toFixed(2)} USDC · {(exchange.usdt_balance ?? 0).toFixed(2)} USDT
                   </Text>
                 </View>
               </View>
