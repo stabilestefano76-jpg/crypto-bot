@@ -2437,6 +2437,54 @@ async def paper_monitor_loop() -> None:
         await asyncio.sleep(3)
 
 
+async def top10_monitor_loop() -> None:
+    """Check Top10 SL/TP1/TP2/runner trailing every 3s using the real-time
+    WS price cache — same reasoning as the other monitors."""
+    await asyncio.sleep(8)
+    while True:
+        try:
+            await monitor_top10_positions()
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Top10 monitor error: %s", e)
+        await asyncio.sleep(3)
+
+
+async def rsi_rebound_monitor_loop() -> None:
+    """Check RSI Rebound stop/trailing every 3s using the real-time WS
+    price cache — same reasoning as the other monitors."""
+    await asyncio.sleep(8)
+    while True:
+        try:
+            await monitor_rsi_rebound_positions()
+        except Exception as e:  # noqa: BLE001
+            logger.exception("RSI Rebound monitor error: %s", e)
+        await asyncio.sleep(3)
+
+
+async def s3360_monitor_loop() -> None:
+    """Check 33/60's live-RSI target every 3s using the real-time WS price
+    cache — same reasoning as the other monitors."""
+    await asyncio.sleep(8)
+    while True:
+        try:
+            await monitor_s3360_positions()
+        except Exception as e:  # noqa: BLE001
+            logger.exception("33/60 monitor error: %s", e)
+        await asyncio.sleep(3)
+
+
+async def xrp_acc_monitor_loop() -> None:
+    """Check XRP Accumulation's live-RSI target every 3s using the
+    real-time WS price cache — same reasoning as the other monitors."""
+    await asyncio.sleep(8)
+    while True:
+        try:
+            await monitor_xrp_acc_positions()
+        except Exception as e:  # noqa: BLE001
+            logger.exception("XRP Accumulation monitor error: %s", e)
+        await asyncio.sleep(3)
+
+
 async def resolve_premature_stops() -> None:
     """For each pending SL log, look ahead N candles to see if the ORIGINAL
     target would have been reached — i.e. whether the stop was premature."""
@@ -3504,6 +3552,50 @@ async def record_top10_trade_outcome(pnl_usdt: float) -> None:
 
 
 EXCLUDED_STABLE_BASES = ("USDC", "USDT", "BUSD", "DAI", "TUSD", "USDE", "FDUSD", "USDP", "GUSD")  # stablecoin base assets to skip — a stablecoin-vs-stablecoin pair has near-zero volatility and is useless for any of these strategies.
+
+
+async def is_volume_stable(symbol: str, cfg: Config, days: int = 10) -> bool:
+    """A pair must clear the minimum 24h volume threshold on EACH of the
+    last `days` daily candles, not just right now — filters out a pair
+    that only looks liquid because of one recent volume spike."""
+    candles = await exchange.get_klines(symbol, "1d")
+    if len(candles) < days:
+        return False
+    for c in candles[-days:]:
+        quote_volume = c[2] * c[5]  # close * base volume ≈ quote volume for that day
+        if quote_volume < cfg.min_24h_volume_usdt:
+            return False
+    return True
+
+
+_shared_regime_cache: dict[str, Any] = {"regime": "range", "at": 0.0}
+
+
+async def get_shared_market_regime(cfg: Config) -> str:
+    """BTC's trend regime (bullish / range / bearish), cached for 5 minutes
+    so every strategy that needs it in the same scan cycle doesn't each
+    recompute it from scratch. Falls back to 'range' (the conservative
+    middle ground) if BTC's own score can't be computed for some reason."""
+    now = time.time()
+    if now - _shared_regime_cache["at"] < 300:
+        return _shared_regime_cache["regime"]
+    universe = await get_top10_universe(cfg)
+    btc_symbol = next((s for s in universe if s.startswith("BTC")), universe[0] if universe else "BTCUSDC")
+    btc_trend_score, _ = await compute_top10_trend_score(btc_symbol, cfg)
+    regime = "bullish" if btc_trend_score >= 65 else ("bearish" if btc_trend_score < 40 else "range")
+    _shared_regime_cache["regime"] = regime
+    _shared_regime_cache["at"] = now
+    return regime
+
+
+async def get_regime_size_multiplier(cfg: Config) -> float:
+    """1.0 when BTC's regime is clearly bullish; otherwise trims position
+    size by regime_risk_reduction_pct to size down during an
+    uncertain/consolidating or outright bearish phase."""
+    regime = await get_shared_market_regime(cfg)
+    if regime == "bullish":
+        return 1.0
+    return max(0.0, (100 - cfg.regime_risk_reduction_pct) / 100)
 
 
 async def get_top10_universe(cfg: Config) -> list[str]:
