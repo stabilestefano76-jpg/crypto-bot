@@ -650,25 +650,3 @@ export const rsiReversionApi = {
   withdraw: (amount: number) => strategyWalletApi.withdraw(RSI_REVERSION_STRATEGY, amount),
   reset: () => strategyApi.reset(RSI_REVERSION_STRATEGY),
 };
-
-// ---------------------------------------------------------------------------
-// Broker connection (Bybit real-money API credentials) — storage only for
-// now. The key/secret are write-only: once saved, the API never returns them
-// again, only a masked preview and a connected/not-connected flag.
-// ---------------------------------------------------------------------------
-export type BrokerStatus = {
-  connected: boolean;
-  masked_key: string | null;
-  connected_at: string | null;
-};
-
-export const brokerApi = {
-  status: () => req<BrokerStatus>("/broker/status"),
-  connect: (api_key: string, api_secret: string) =>
-    req<{ ok: boolean; connected: boolean; masked_key: string }>(
-      "/broker/connect",
-      { method: "POST", body: JSON.stringify({ api_key, api_secret }) }
-    ),
-  disconnect: () =>
-    req<{ ok: boolean; connected: boolean }>("/broker/disconnect", { method: "POST" }),
-};

@@ -314,6 +314,14 @@ KEY_PATH = ROOT_DIR / ".fernet_key"
 
 
 def _load_or_create_fernet() -> Fernet:
+    # Preferred: derive the key from the ENCRYPTION_SECRET variable (set on
+    # Railway). The container's filesystem is wiped on every deploy, so a key
+    # file alone would be regenerated each time and every stored credential
+    # would silently become undecryptable. A variable survives deploys.
+    secret = os.environ.get("ENCRYPTION_SECRET", "").strip()
+    if secret:
+        derived = base64.urlsafe_b64encode(hashlib.sha256(secret.encode()).digest())
+        return Fernet(derived)
     if KEY_PATH.exists():
         return Fernet(KEY_PATH.read_bytes())
     key = Fernet.generate_key()
@@ -3454,6 +3462,14 @@ async def exchange_status() -> dict[str, Any]:
 
 @api.post("/exchange/connect")
 async def exchange_connect(req: ExchangeConnectRequest) -> dict[str, Any]:
+    if not os.environ.get("ENCRYPTION_SECRET", "").strip():
+        # Without it the encryption key lives in a file that is wiped on every
+        # deploy, so the saved credentials would become unreadable. Refuse
+        # instead of saving something that silently disappears.
+        raise HTTPException(
+            status_code=400,
+            detail="Prima imposta la variabile ENCRYPTION_SECRET su Railway: senza, la chiave salvata andrebbe persa a ogni aggiornamento del bot.",
+        )
     if not req.api_key or not req.api_secret:
         raise HTTPException(status_code=400, detail="API key and secret required")
     doc = {
@@ -3578,48 +3594,62 @@ async def record_top10_trade_outcome(pnl_usdt: float) -> None:
 EXCLUDED_STABLE_BASES = ("USDC", "USDT", "BUSD", "DAI", "TUSD", "USDE", "FDUSD", "USDP", "GUSD")  # stablecoin base assets to skip — a stablecoin-vs-stablecoin pair has near-zero volatility and is useless for any of these strategies.
 
 
-async def is_volume_stable(symbol: str, cfg: Config, days: int = 10) -> bool:
-    """A pair must clear the minimum 24h volume threshold on EACH of the
-    last `days` daily candles, not just right now — filters out a pair
-    that only looks liquid because of one recent volume spike."""
-    candles = await exchange.get_klines(symbol, "1d")
-    if len(candles) < days:
-        return False
-    for c in candles[-days:]:
-        quote_volume = c[2] * c[5]  # close * base volume ≈ quote volume for that day
-        if quote_volume < cfg.min_24h_volume_usdt:
-            return False
-    return True
+async def is_volume_stable(symbol: str, cfg: Config) -> bool:
+    """True if 24h volume has stayed above the configured minimum for each
+    of the last 10 days — guards against picking a coin whose current
+    volume is just a short-lived spike about to collapse, rather than
+    genuine sustained liquidity."""
+    try:
+        daily = await exchange.get_klines(symbol, "1d")
+    except Exception:  # noqa: BLE001
+        return True  # fail open on a transient API hiccup — don't block all trading over it
+    if len(daily) < 10:
+        return False  # too new to have proven itself yet
+    recent = daily[-10:]
+    return all((c[5] * c[2]) >= cfg.min_24h_volume_usdt for c in recent)
 
 
-_shared_regime_cache: dict[str, Any] = {"regime": "range", "at": 0.0}
+_shared_regime_cache: dict[str, Any] = {"regime": None, "at": 0.0}
 
 
 async def get_shared_market_regime(cfg: Config) -> str:
-    """BTC's trend regime (bullish / range / bearish), cached for 5 minutes
-    so every strategy that needs it in the same scan cycle doesn't each
-    recompute it from scratch. Falls back to 'range' (the conservative
-    middle ground) if BTC's own score can't be computed for some reason."""
+    """BTC's regime (bullish/range/bearish) on 1h — shared across Scalping,
+    RSI Reversion and RSI Rebound so position sizing can be trimmed during
+    an uncertain/consolidating phase, not just an outright downtrend.
+    Reuses the same trend-score computation Top10 already relies on.
+    Cached for 5 minutes so every position-open across every strategy
+    doesn't each trigger a fresh BTC candle fetch."""
     now = time.time()
-    if now - _shared_regime_cache["at"] < 300:
+    if _shared_regime_cache["regime"] is not None and (now - _shared_regime_cache["at"]) < 300:
         return _shared_regime_cache["regime"]
-    universe = await get_top10_universe(cfg)
-    btc_symbol = next((s for s in universe if s.startswith("BTC")), universe[0] if universe else "BTCUSDC")
-    btc_trend_score, _ = await compute_top10_trend_score(btc_symbol, cfg)
-    regime = "bullish" if btc_trend_score >= 65 else ("bearish" if btc_trend_score < 40 else "range")
+    regime = "range"
+    try:
+        universe = await get_top10_universe(cfg)
+        btc_symbol = next((s for s in universe if s.startswith("BTC")), None)
+        if btc_symbol:
+            trend_score, _ = await compute_top10_trend_score(btc_symbol, cfg)
+            if trend_score >= 65:
+                regime = "bullish"
+            elif trend_score < 40:
+                regime = "bearish"
+            else:
+                regime = "range"
+    except Exception:  # noqa: BLE001
+        regime = "range"  # fail safe to cautious sizing rather than crash
     _shared_regime_cache["regime"] = regime
     _shared_regime_cache["at"] = now
     return regime
 
 
 async def get_regime_size_multiplier(cfg: Config) -> float:
-    """1.0 when BTC's regime is clearly bullish; otherwise trims position
-    size by regime_risk_reduction_pct to size down during an
-    uncertain/consolidating or outright bearish phase."""
+    """1.0 in a clearly bullish regime; reduced (by
+    `regime_risk_reduction_pct`) otherwise — trims position size during a
+    consolidating or bearish phase instead of sizing every trade the same
+    regardless of how uncertain conditions currently are."""
     regime = await get_shared_market_regime(cfg)
     if regime == "bullish":
         return 1.0
-    return max(0.0, (100 - cfg.regime_risk_reduction_pct) / 100)
+    return max(0.0, 1.0 - cfg.regime_risk_reduction_pct / 100)
 
 
 async def get_top10_universe(cfg: Config) -> list[str]:
@@ -5012,73 +5042,6 @@ async def xrp_acc_reset() -> dict[str, Any]:
 
 
 
-# ============================================================================
-# BROKER CONNECTION (Bybit real-money API credentials) — storage only, for
-# now. No trading logic reads these yet; this is just the plumbing to let
-# the user paste in their API key/secret from the app, ahead of actually
-# wiring any strategy to place real orders. The secret (and the key, once
-# saved) are NEVER returned by any GET — only a masked preview and a
-# connected/not-connected flag, so even the user's own browser/app never
-# sees the full credentials again after saving them.
-# ============================================================================
-
-BROKER_CREDENTIALS_ID = "bybit_broker_credentials_singleton"
-
-
-def _mask_key(key: str) -> str:
-    if len(key) <= 8:
-        return "•" * len(key)
-    return f"{key[:4]}{'•' * (len(key) - 8)}{key[-4:]}"
-
-
-async def get_broker_credentials() -> Optional[dict[str, str]]:
-    """Internal getter for future real-trading code — NOT used by anything
-    yet. Returns {"api_key": ..., "api_secret": ...} or None if not connected."""
-    doc = await db.broker_credentials.find_one({"_id": BROKER_CREDENTIALS_ID}, {"_id": 0})
-    if not doc or not doc.get("api_key") or not doc.get("api_secret"):
-        return None
-    return {"api_key": doc["api_key"], "api_secret": doc["api_secret"]}
-
-
-class BrokerConnectRequest(BaseModel):
-    api_key: str
-    api_secret: str
-
-
-@api.post("/broker/connect")
-async def broker_connect(req: BrokerConnectRequest) -> dict[str, Any]:
-    api_key = req.api_key.strip()
-    api_secret = req.api_secret.strip()
-    if not api_key or not api_secret:
-        raise HTTPException(status_code=400, detail="Chiave API e segreto sono entrambi obbligatori")
-    await db.broker_credentials.update_one(
-        {"_id": BROKER_CREDENTIALS_ID},
-        {"$set": {
-            "api_key": api_key,
-            "api_secret": api_secret,
-            "connected_at": datetime.now(timezone.utc).isoformat(),
-        }},
-        upsert=True,
-    )
-    return {"ok": True, "connected": True, "masked_key": _mask_key(api_key)}
-
-
-@api.get("/broker/status")
-async def broker_status() -> dict[str, Any]:
-    doc = await db.broker_credentials.find_one({"_id": BROKER_CREDENTIALS_ID}, {"_id": 0})
-    if not doc or not doc.get("api_key"):
-        return {"connected": False, "masked_key": None, "connected_at": None}
-    return {
-        "connected": True,
-        "masked_key": _mask_key(doc["api_key"]),
-        "connected_at": doc.get("connected_at"),
-    }
-
-
-@api.post("/broker/disconnect")
-async def broker_disconnect() -> dict[str, Any]:
-    await db.broker_credentials.delete_one({"_id": BROKER_CREDENTIALS_ID})
-    return {"ok": True, "connected": False}
 
 
 app.include_router(api)

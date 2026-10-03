@@ -15,7 +15,9 @@ import {
 } from "react-native";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
-import { api, brokerApi, BrokerStatus, Config, PaperConfig } from "@/src/api";
+import { api, Config, PaperConfig } from "@/src/api";
+
+type ExchangeStatus = Awaited<ReturnType<typeof api.exchangeStatus>>;
 import { colors, font, radius, spacing } from "@/src/theme";
 
 const TIMEFRAMES = ["5m", "15m", "1h", "4h", "1d"];
@@ -28,7 +30,7 @@ export default function SettingsScreen() {
   const [saving, setSaving] = useState(false);
   const [saved, setSaved] = useState(false);
 
-  const [brokerStatus, setBrokerStatus] = useState<BrokerStatus | null>(null);
+  const [brokerStatus, setBrokerStatus] = useState<ExchangeStatus | null>(null);
   const [connectModalVisible, setConnectModalVisible] = useState(false);
   const [apiKeyText, setApiKeyText] = useState("");
   const [apiSecretText, setApiSecretText] = useState("");
@@ -49,7 +51,7 @@ export default function SettingsScreen() {
 
   const loadBrokerStatus = useCallback(async () => {
     try {
-      const s = await brokerApi.status();
+      const s = await api.exchangeStatus();
       setBrokerStatus(s);
     } catch {
       // ignore
@@ -67,13 +69,18 @@ export default function SettingsScreen() {
     if (!key || !secret) return;
     setConnecting(true);
     try {
-      await brokerApi.connect(key, secret);
+      await api.exchangeConnect({ api_key: key, api_secret: secret });
       setConnectModalVisible(false);
       setApiKeyText("");
       setApiSecretText("");
       await loadBrokerStatus();
-    } catch {
-      Alert.alert("Errore", "Non è stato possibile salvare la connessione. Riprova.");
+    } catch (e) {
+      // The server tests the key with Bybit before saving it, so a wrong key
+      // or missing permission comes back here with the reason.
+      Alert.alert(
+        "Collegamento non riuscito",
+        e instanceof Error ? e.message : "Non è stato possibile salvare la connessione. Riprova."
+      );
     } finally {
       setConnecting(false);
     }
@@ -82,7 +89,7 @@ export default function SettingsScreen() {
   const onDisconnectBroker = async () => {
     setDisconnecting(true);
     try {
-      await brokerApi.disconnect();
+      await api.exchangeDisconnect();
       await loadBrokerStatus();
     } finally {
       setDisconnecting(false);
@@ -175,7 +182,7 @@ export default function SettingsScreen() {
                 <View style={styles.brokerStatusRow}>
                   <View style={styles.brokerDot} />
                   <Text style={styles.brokerStatusText}>
-                    Connesso — chiave {brokerStatus.masked_key}
+                    Connesso — chiave {brokerStatus.api_key_masked}
                   </Text>
                 </View>
                 <Pressable
@@ -215,11 +222,12 @@ export default function SettingsScreen() {
               </>
             )}
             <Text style={styles.scoreHintText}>
-              Solo la chiave viene mostrata (mai per intero) una volta
-              salvata — né tu né nessun altro potrà più rileggerla
-              dall&apos;app, solo sostituirla o rimuoverla. Questo passaggio
-              salva solo le credenziali: quale strategia opera davvero in
-              reale si decide qui sotto, una alla volta.
+              Alla conferma il bot prova subito la chiave con Bybit: se è
+              sbagliata o manca un permesso, non viene salvata e ti dice
+              perché. Una volta salvata (cifrata) non è più leggibile per
+              intero da nessuna parte, solo sostituibile o rimovibile. Questo
+              passaggio salva solo le credenziali: quale strategia opera
+              davvero in reale si decide qui sotto, una alla volta.
             </Text>
           </Section>
 
