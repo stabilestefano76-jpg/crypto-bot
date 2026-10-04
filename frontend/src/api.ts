@@ -126,6 +126,10 @@ export type Config = {
   s3360_low_threshold: number;
   s3360_high_threshold: number;
   s3360_max_open_positions: number;
+  s3360_max_daily_rise_pct: number;
+  s3360_min_atr_pct: number;
+  s3360_hold_below_entry: boolean;
+  s3360_min_exit_gain_pct: number;
   xrp_acc_enabled: boolean;
   xrp_acc_timeframes: string[];
   xrp_acc_rsi_period: number;

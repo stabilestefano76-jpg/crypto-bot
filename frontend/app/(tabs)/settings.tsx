@@ -861,11 +861,66 @@ export default function SettingsScreen() {
                 testID="input-s3360-high"
               />
               <NumRow
-                label="Numero di operazioni contemporanee (1-4)"
+                label="Numero di operazioni contemporanee"
                 value={cfg.s3360_max_open_positions}
                 onChange={(v) => update({ s3360_max_open_positions: v })}
                 testID="input-s3360-max-positions"
               />
+              <NumRow
+                label="Crescita massima di oggi per entrare (%, 0 = spento)"
+                value={cfg.s3360_max_daily_rise_pct}
+                onChange={(v) => update({ s3360_max_daily_rise_pct: v })}
+                step={0.5}
+                testID="input-s3360-max-daily-rise"
+              />
+              <Text style={styles.scoreHintText}>
+                Filtro sulla candela giornaliera: se la moneta è già salita
+                più di questa percentuale dall&apos;apertura di oggi (00:00 UTC,
+                le 02:00 in Italia), il bot non entra, anche con l&apos;RSI
+                sotto la soglia. Con 0 il filtro è spento. Non cambia le
+                uscite.
+              </Text>
+              <NumRow
+                label="Volatilità minima per entrare (ATR %, 0 = spento)"
+                value={cfg.s3360_min_atr_pct}
+                onChange={(v) => update({ s3360_min_atr_pct: v })}
+                step={0.01}
+                testID="input-s3360-min-atr"
+              />
+              <Text style={styles.scoreHintText}>
+                Filtro sul mercato troppo piatto: se il movimento tipico di
+                una candela (ATR) è sotto questa percentuale del prezzo, il
+                bot non entra, anche con l&apos;RSI sotto la soglia. Sul
+                timeframe da 5 minuti, 0,10 esclude i mercati quasi fermi;
+                sui timeframe più lunghi quel numero è quasi sempre superato.
+                Con 0 il filtro è spento.
+              </Text>
+              <ToggleRow
+                label="Non chiudere sotto il prezzo di entrata"
+                value={cfg.s3360_hold_below_entry}
+                onChange={(v) => update({ s3360_hold_below_entry: v })}
+                testID="toggle-s3360-hold-below-entry"
+              />
+              <NumRow
+                label="Margine minimo sopra l'entrata per chiudere (%)"
+                value={cfg.s3360_min_exit_gain_pct}
+                onChange={(v) => update({ s3360_min_exit_gain_pct: v })}
+                step={0.05}
+                testID="input-s3360-min-exit-gain"
+              />
+              <Text style={styles.scoreHintText}>
+                Con l&apos;interruttore acceso, quando l&apos;RSI arriva al
+                target ma il prezzo è ancora sotto l&apos;entrata (più il
+                margine), l&apos;operazione resta aperta e aspetta: chiude
+                solo quando le due condizioni sono vere insieme. Il margine di
+                0,25% copre le commissioni di andata e ritorno (0,2%), così
+                una chiusura non è mai in perdita netta. Attenzione: senza
+                stop né limite di tempo, una moneta che non recupera tiene
+                occupato il suo posto, e quel capitale resta bloccato finché
+                non torna sopra l&apos;entrata. Le perdite non si realizzano
+                più ma restano nel capitale come perdita sulla carta: guarda il
+                capitale, non la percentuale di vincite.
+              </Text>
               <Text style={styles.scoreHintText}>
                 Entra appena l&apos;RSI scende sotto {cfg.s3360_low_threshold}{" "}
                 (nessuna candela di conferma richiesta — scatta al primo

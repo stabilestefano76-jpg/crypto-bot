@@ -178,6 +178,10 @@ class Config(BaseModel):
     s3360_low_threshold: float = 35.0  # entry: RSI crosses down through this
     s3360_high_threshold: float = 60.0  # exit target: RSI reaching this closes the trade
     s3360_max_open_positions: int = 4  # ALSO doubles as the capital-sizing divisor: each trade gets equity/max_open_positions — e.g. 2 slots = 50% each, 4 slots = 25% each. Not just a cap on count.
+    s3360_max_daily_rise_pct: float = 0.0  # entry filter: skip a coin that is already up more than this % since the current UTC day opened (0 = filter off, the old behaviour)
+    s3360_min_atr_pct: float = 0.0  # entry filter: skip when the timeframe's ATR (as % of price) is below this — in a dead-flat market the rebounds are tiny (0 = filter off)
+    s3360_hold_below_entry: bool = True  # exit rule: when RSI reaches the target but the price is still below the entry (plus the margin below), keep the position open instead of closing at a loss
+    s3360_min_exit_gain_pct: float = 0.25  # how far above the entry price the exit must be (0.25 ≈ round-trip fees 0.2% plus a hair, so a close is never a net loss); only used with hold_below_entry
     xrp_acc_enabled: bool = True
     xrp_acc_timeframes: list[str] = Field(default_factory=lambda: ["1h"])
     xrp_acc_rsi_period: int = 14
@@ -4558,6 +4562,33 @@ async def get_s3360_wallet() -> dict[str, Any]:
 _s3360_last_candle: dict[tuple[str, str], float] = {}  # per (symbol, timeframe): timestamp of the CURRENT still-forming candle a live-touch attempt was already made on — see run_s3360_scan
 
 
+_daily_ref_cache: dict[str, tuple[float, float]] = {}  # symbol -> (UTC day start, price the day opened at)
+
+
+async def get_daily_open_price(symbol: str) -> Optional[float]:
+    """Price the CURRENT UTC day opened at, taken as yesterday's close (this
+    market never closes, so the two are practically the same). get_klines drops
+    the still-forming candle, so the last daily candle it returns should be
+    yesterday's; if it is anything else (exchange lag around midnight, a gap)
+    return None instead of a wrong number — callers then let the trade through,
+    exactly as before the filter existed."""
+    day_start = (time.time() // 86400) * 86400
+    cached = _daily_ref_cache.get(symbol)
+    if cached and cached[0] == day_start:
+        return cached[1]
+    try:
+        daily = await exchange.get_klines(symbol, "1d")
+    except Exception:  # noqa: BLE001
+        return None
+    if not daily or abs(daily[-1][0] - (day_start - 86400)) > 1:
+        return None
+    ref = daily[-1][2]
+    if not ref or ref <= 0:
+        return None
+    _daily_ref_cache[symbol] = (day_start, ref)
+    return ref
+
+
 async def run_s3360_scan() -> None:
     cfg = await get_config()
     if not cfg.s3360_enabled:
@@ -4638,8 +4669,35 @@ async def run_s3360_scan() -> None:
             if _s3360_last_candle.get((symbol, tf)) == forming_candle_t:
                 await log_reject(symbol, tf, "s3360", "stessa candela già tentata")
                 continue
+            if cfg.s3360_min_atr_pct > 0:
+                atr_now = atr_wilder(
+                    [c[3] for c in candles], [c[4] for c in candles], closes, cfg.s3360_rsi_period
+                )
+                # If the ATR cannot be computed, let the trade through (as before the filter).
+                if atr_now is not None and atr_now / live_price * 100.0 < cfg.s3360_min_atr_pct:
+                    # Not marked as "attempted": volatility may pick up within this candle.
+                    await log_reject(symbol, tf, "s3360", "mercato troppo piatto (filtro volatilità)")
+                    continue
+            rise_pct: Optional[float] = None
+            day_open = await get_daily_open_price(symbol)
+            if day_open:
+                rise_pct = round((live_price / day_open - 1.0) * 100.0, 4)
+            if (
+                cfg.s3360_max_daily_rise_pct > 0
+                and rise_pct is not None
+                and rise_pct > cfg.s3360_max_daily_rise_pct
+            ):
+                # Not marked as "attempted": the coin may cool off within this
+                # same candle and qualify on a later scan.
+                await log_reject(symbol, tf, "s3360", "già salita troppo oggi (filtro crescita giornaliera)")
+                continue
             _s3360_last_candle[(symbol, tf)] = forming_candle_t
-            signal = {"entry": live_price, "rsi": live_rsi, "candle_t": forming_candle_t}
+            signal = {
+                "entry": live_price,
+                "rsi": live_rsi,
+                "candle_t": forming_candle_t,
+                "daily_rise_pct": rise_pct,
+            }
             await open_s3360_position(symbol, tf, signal, cfg)
             open_count += 1
             break
@@ -4683,6 +4741,9 @@ async def open_s3360_position(symbol: str, tf: str, signal: dict[str, Any], cfg:
         "entry": entry,
         "fill_price": fill_price,
         "rsi_at_entry": signal.get("rsi"),
+        "daily_rise_pct": (
+            None if signal.get("daily_rise_pct") is None else round(signal["daily_rise_pct"], 2)
+        ),
         "atr": atr,
         "quantity": quantity,
         "notional": notional,
@@ -4692,6 +4753,22 @@ async def open_s3360_position(symbol: str, tf: str, signal: dict[str, Any], cfg:
     await db.s3360_positions.insert_one(dict(doc))
     await db.s3360_wallet.update_one(
         {"_id": S3360_WALLET_ID}, {"$inc": {"cash": -notional}}, upsert=True
+    )
+
+
+_s3360_hold_log_at: dict[str, float] = {}
+
+
+async def _s3360_hold_log(p: dict[str, Any]) -> None:
+    """The monitor runs every 3 seconds; write the 'waiting' note at most once
+    every 5 minutes per position so it stays visible without flooding the log."""
+    now = time.time()
+    if now - _s3360_hold_log_at.get(p["id"], 0.0) < 300:
+        return
+    _s3360_hold_log_at[p["id"]] = now
+    await log_reject(
+        p["symbol"], p.get("timeframe", "?"), "s3360",
+        "RSI al target ma prezzo sotto l'entrata: attendo il recupero",
     )
 
 
@@ -4719,7 +4796,15 @@ async def monitor_s3360_positions() -> None:
         if not hit:
             continue
 
-        gross_pnl = (cur - p.get("fill_price", p["entry"])) * p["quantity"]
+        fill = p.get("fill_price", p["entry"])
+        if cfg.s3360_hold_below_entry and cur < fill * (1 + cfg.s3360_min_exit_gain_pct / 100.0):
+            # RSI reached the target but closing now would lock in a loss (or
+            # less than the fees): keep waiting. Both conditions must be true
+            # together — RSI at the target AND the price above the entry.
+            await _s3360_hold_log(p)
+            continue
+
+        gross_pnl = (cur - fill) * p["quantity"]
         exit_notional = cur * p["quantity"]
         fees = (p["notional"] + exit_notional) * S3360_FEE_PCT
         pnl = gross_pnl - fees
@@ -4816,6 +4901,62 @@ async def s3360_portfolio() -> dict[str, Any]:
         "closed_count": len(closed_docs),
         "win_rate": round(wins / (wins + losses) * 100, 1) if (wins + losses) else 0.0,
     }
+
+
+_RISE_BUCKETS = ["sotto 0%", "0-1%", "1-2%", "2-3%", "3-6%", "oltre 6%"]
+
+
+def _rise_bucket(rise: float) -> str:
+    if rise < 0:
+        return "sotto 0%"
+    if rise < 1:
+        return "0-1%"
+    if rise < 2:
+        return "1-2%"
+    if rise < 3:
+        return "2-3%"
+    if rise < 6:
+        return "3-6%"
+    return "oltre 6%"
+
+
+def summarize_by_daily_rise(closed: list[dict[str, Any]]) -> dict[str, Any]:
+    """Groups closed trades by how much the coin had already risen that UTC day
+    when the trade was opened. Trades opened before this data was recorded are
+    counted separately instead of being guessed."""
+    buckets: dict[str, dict[str, float]] = {}
+    without = 0
+    for p in closed:
+        rise = p.get("daily_rise_pct")
+        if rise is None:
+            without += 1
+            continue
+        b = buckets.setdefault(_rise_bucket(rise), {"n": 0, "wins": 0, "pnl": 0.0, "pct": 0.0})
+        pnl = p.get("pnl_usdt") or 0.0
+        notional = p.get("notional") or 0.0
+        b["n"] += 1
+        b["wins"] += 1 if pnl > 0 else 0
+        b["pnl"] += pnl
+        b["pct"] += (pnl / notional * 100.0) if notional else 0.0
+    rows = []
+    for name in _RISE_BUCKETS:
+        b = buckets.get(name)
+        if not b:
+            continue
+        rows.append({
+            "fascia": name,
+            "operazioni": int(b["n"]),
+            "vinte_pct": round(100.0 * b["wins"] / b["n"], 1),
+            "guadagno_medio_pct": round(b["pct"] / b["n"], 2),
+            "guadagno_totale_usd": round(b["pnl"], 2),
+        })
+    return {"con_dato": sum(r["operazioni"] for r in rows), "senza_dato": without, "fasce": rows}
+
+
+@api.get("/s3360/analysis")
+async def s3360_analysis() -> dict[str, Any]:
+    closed = await db.s3360_positions.find({"status": "closed"}, {"_id": 0}).to_list(5000)
+    return summarize_by_daily_rise(closed)
 
 
 @api.post("/s3360/reset")
