@@ -67,8 +67,6 @@ CANDLE_LIMIT = 200  # candles fetched per pair/tf
 class Config(BaseModel):
     scan_interval_minutes: int = 1
     timeframes: list[str] = Field(default_factory=lambda: DEFAULT_TIMEFRAMES.copy())  # kept for backward compatibility with old stored configs — no longer read directly by the scan loop, see the three per-strategy lists below
-    counter_trend_timeframes: list[str] = Field(default_factory=lambda: DEFAULT_TIMEFRAMES.copy())
-    fvg_reversal_timeframes: list[str] = Field(default_factory=lambda: DEFAULT_TIMEFRAMES.copy())
     rsi_reversion_timeframes: list[str] = Field(default_factory=lambda: DEFAULT_TIMEFRAMES.copy())
     quote_filter: str = "USDC,EUR"  # Bybit EU spot quotes (comma-separated)
     min_24h_volume_usdt: float = 100_000.0
@@ -104,19 +102,19 @@ class Config(BaseModel):
     partial_close_r: float = 1.0
     partial_close_pct: float = 35.0  # % of position closed at partial_close_r
     liq_min_distance_pct: float = 25.0  # leverage: min distance from liquidation (%)
-    # --- Consolidation-breakout params (shared by counter_trend) ---
+    # --- LEGACY (Rev Pre-FVG was removed; fields kept so the Settings screen and stored configs keep working) ---
     consolidation_min_candles: int = 3
     consolidation_max_atr: float = 1.5  # channel width <= this * ATR
     tp1_pct: float = 65.0  # % closed at TP1
-    # --- Counter-trend strategy RSI filters ---
+    # --- LEGACY counter-trend RSI filters (strategy removed; kept for compatibility) ---
     rsi_high_tf_ob: float = 80.0  # higher-TF overbought (short)
     rsi_high_tf_os: float = 20.0  # higher-TF oversold (long)
     trailing_pct_from_entry: float = 1.0  # counter-trend trailing distance %
     post_tp1_advance_pct: float = 0.5  # % beyond TP1 before moving SL to TP1 (net fees)
     # --- Parallel strategy selection ---
-    enabled_strategies: list[str] = Field(default_factory=list)  # empty = ["counter_trend", "fvg_reversal"]
-    live_strategies: list[str] = Field(default_factory=list)  # which of the 8 strategies currently trade with REAL money via Bybit — empty means ALL of them are in paper mode (the safe default). No trading logic reads this yet; it's wired strategy-by-strategy as each one gets connected to real order placement.
-    # --- FVG Reversal strategy (independent params, contro-trend on retracement) ---
+    enabled_strategies: list[str] = Field(default_factory=list)  # only "rsi_reversion" is acted upon here (the other names are ignored); empty = ["rsi_reversion"]
+    live_strategies: list[str] = Field(default_factory=list)  # which strategies currently trade with REAL money via Bybit — empty means ALL of them are in paper mode (the safe default). No trading logic reads this yet; it's wired strategy-by-strategy as each one gets connected to real order placement.
+    # --- LEGACY FVG Reversal params (strategy removed; kept for compatibility) ---
     fvgr_rsi_high_tf_ob: float = 80.0
     fvgr_rsi_high_tf_os: float = 20.0
     fvgr_tp1_pct: float = 65.0
@@ -148,31 +146,11 @@ class Config(BaseModel):
     rsi_rev_min_rr_ratio: float = 1.5  # was 3.0 — zero trades fired in days at that bar; still requires a genuinely favorable setup (reward at least 1.5x the risk), just not an extreme one that almost never occurs naturally
     rsi_rev_trailing_atr_mult: float = 3.0  # wide trailing once in profit — only to catch a genuine sudden reversal, not to lock in small moves
     rsi_rev_trailing_activation_margin_pct: float = 0.5  # trailing now activates only once profit clears an ESTIMATED round-trip fee cost plus this extra % — not at the very first cent of profit, which was too easy to trigger on pure noise
-    # --- Top 10 Long (multi-setup: pullback / breakout-retest / momentum / mean-reversion) ---
-    top10_enabled: bool = True
+    # --- Shared BTC market regime (built for the removed Top 10 Long strategy; kept on purpose because 33/60 and the position-size trim read it) ---
     top10_universe_size: int = 10  # how many coins to consider each scan, ranked by 24h volume (proxy for market cap)
-    top10_risk_pct: float = 0.75  # % of wallet cash risked per trade (spec range: 0.5-1%)
-    top10_min_setup_score: float = 75.0  # composite score (0-100) required to auto-open
-    top10_min_rr: float = 2.0  # minimum reward:risk to TP1
-    top10_timeframe: str = "1h"  # kept for backward compatibility with old stored configs — no longer read directly, see top10_timeframes below
-    top10_timeframes: list[str] = Field(default_factory=lambda: ["1h"])
-    top10_tp1_pct: float = 2.0  # first take-profit, % above entry
-    top10_tp1_close_pct: float = 50.0  # % of position closed at TP1
-    top10_tp2_pct: float = 3.0  # second take-profit, % above entry
-    top10_tp2_close_pct: float = 35.0  # % of ORIGINAL position closed at TP2 (remainder becomes the TP3 "runner")
-    top10_runner_trailing_atr_mult: float = 0.8  # was 2.0 — that was wider than many post-TP2 moves ever get, so the trailing level sat BELOW the breakeven stop and could never become the binding constraint, giving back the entire extra gain on the runner. Tighter now so it can actually lock in profit on modest continuations too.
-    top10_max_daily_losses: int = 2  # consecutive losing trades before pausing for the rest of the UTC day
-    top10_max_daily_loss_pct: float = 2.0  # cumulative daily loss (% of wallet) before pausing for the rest of the UTC day
-    top10_max_total_risk_pct: float = 2.0  # total risk allowed open at once across all Top10 positions combined
     top10_ema_fast: int = 20
     top10_ema_medium: int = 50
     top10_ema_slow: int = 200
-    top10_rsi_period: int = 14
-    top10_atr_period: int = 14
-    # --- RSI Rebound: RSI dips below a deep-oversold threshold, then closes
-    # back above it — long entry, stop below the recent structural low,
-    # trailing stop/target once in profit. ---
-    rsi_rebound_enabled: bool = True
     s3360_enabled: bool = True
     s3360_timeframes: list[str] = Field(default_factory=lambda: ["1h"])
     s3360_rsi_period: int = 14
@@ -188,22 +166,8 @@ class Config(BaseModel):
     xrp_acc_rsi_period: int = 14
     xrp_acc_low_threshold: float = 25.0  # entry: buy ALL trading capital when RSI drops to/below this
     xrp_acc_high_threshold: float = 60.0  # exit: sell everything when RSI rises to/above this
-    rsi_rebound_timeframe: str = "1h"  # kept for backward compatibility with old stored configs — no longer read directly, see rsi_rebound_timeframes below
-    rsi_rebound_timeframes: list[str] = Field(default_factory=lambda: ["1h"])
-    rsi_rebound_period: int = 14
-    rsi_rebound_oversold: float = 20.0
-    rsi_rebound_lookback: int = 10  # how many recent candles to check for the oversold dip
-    rsi_rebound_stop_lookback: int = 5  # candles used to find the recent structural low for the stop
-    rsi_rebound_risk_pct: float = 5.0  # % of wallet cash used as position notional per trade
-    rsi_rebound_tp_atr_mult: float = 2.0  # kept only as the informational "initial target" shown in the app — no longer a hard exit condition, see rsi_rebound_trailing_activation_margin_pct below
-    rsi_rebound_trailing_atr_mult: float = 0.6  # tightened from 1.2 — now protects the WHOLE trade from soon after entry, not just after a big move, so it needs to be tight
-    rsi_rebound_trailing_activation_margin_pct: float = 0.5  # trailing activates as soon as profit clears round-trip fees PLUS this extra %, instead of waiting for the full ATR-based target — lets a winning trade run uncapped once genuinely, safely in profit
-    rsi_rebound_max_open_positions: int = 5
 
-    regime_risk_reduction_pct: float = 50.0  # position size cut applied to Scalping/RSI Reversion/RSI Rebound whenever BTC's regime isn't clearly bullish (range or bearish) — trims risk during an uncertain/consolidating phase instead of sizing every trade the same
-
-
-
+    regime_risk_reduction_pct: float = 50.0  # position size cut applied to RSI Reversion and 33/60 whenever BTC's regime isn't clearly bullish (range or bearish) — trims risk during an uncertain/consolidating phase instead of sizing every trade the same
 
 
 class Signal(BaseModel):
@@ -220,7 +184,7 @@ class Signal(BaseModel):
     score: float = 0.0  # weighted confluence score
     max_score: float = 0.0  # max achievable score with active weights
     reversal_signals: list[str] = Field(default_factory=list)  # FVG reversal contributors
-    strategy: str = "counter_trend"  # "counter_trend" | "fvg_reversal"
+    strategy: str = "counter_trend"  # "counter_trend" | "fvg_reversal" | "rsi_reversion" (the first two only appear in old records)
     tp1: float = 0.0
     tp2: float = 0.0
     consolidation_high: float = 0.0
@@ -380,7 +344,6 @@ def rsi_wilder(closes: list[float], period: int = 14) -> list[Optional[float]]:
     return rsis
 
 
-
 def detect_pivots(series: list[float], window: int = 5) -> tuple[list[int], list[int]]:
     """Return (lows, highs) indices where index is a local pivot."""
     lows: list[int] = []
@@ -449,101 +412,6 @@ def atr_wilder(
     for tr in trs[period:]:
         atr = (atr * (period - 1) + tr) / period
     return atr
-
-
-def detect_trend_exhaustion(
-    opens: list[float],
-    highs: list[float],
-    lows: list[float],
-    closes: list[float],
-    volumes: list[float],
-    rsis: list[Optional[float]],
-    trend: str,  # "up" or "down"
-    cfg: Config,
-) -> dict[str, Any]:
-    """Trend Exhaustion Score (additive check, COUNTER-TREND strategies only:
-    "counter_trend" / Rev Pre-FVG and "fvg_reversal" / FVG Reversal). Measures
-    whether the trend is genuinely running out of steam, BEFORE the reversal
-    candle pattern is searched. Does not touch "scoring" or "impulse_fvg".
-
-    Checks 4 independent conditions over the last `cfg.exhaustion_lookback`
-    candles (1 point each), speculare for "up" (looking for bearish exhaustion)
-    and "down" (looking for bullish exhaustion):
-      1) Candles shrinking (avg body last 3 < avg body of the 3 before that).
-      2) Volume fading while price still advances in the trend direction.
-      3) RSI swings losing strength (lower highs on "up", higher lows on "down").
-      4) A long rejection wick against the trend on one of the last 2 candles.
-
-    Returns {"confirmed": bool, "score": float, "signals": [str]}.
-    """
-    signals: list[str] = []
-    n = len(closes)
-    lb = max(6, cfg.exhaustion_lookback)
-    if n < lb + 2:
-        return {"confirmed": False, "score": 0.0, "signals": signals}
-
-    w_opens = opens[-lb:]
-    w_highs = highs[-lb:]
-    w_lows = lows[-lb:]
-    w_closes = closes[-lb:]
-    w_vols = volumes[-lb:]
-    w_rsis = rsis[-lb:]
-
-    # 1) Candles shrinking: avg body of the last 3 vs the 3 candles before that.
-    bodies = [abs(w_closes[i] - w_opens[i]) for i in range(len(w_opens))]
-    if len(bodies) >= 6:
-        recent_avg = sum(bodies[-3:]) / 3
-        prior_avg = sum(bodies[-6:-3]) / 3
-        if prior_avg > 0 and recent_avg < prior_avg * 0.8:
-            signals.append("Candele in Contrazione")
-
-    # 2) Volume fading while price still advances in the trend direction.
-    if len(w_vols) >= 6 and len(w_closes) >= 4:
-        recent_vol_avg = sum(w_vols[-3:]) / 3
-        prior_vol_avg = sum(w_vols[-6:-3]) / 3
-        price_advancing = (
-            w_closes[-1] > w_closes[-4] if trend == "up" else w_closes[-1] < w_closes[-4]
-        )
-        if price_advancing and prior_vol_avg > 0 and recent_vol_avg < prior_vol_avg:
-            signals.append("Volume in Calo")
-
-    # 3) RSI swings losing strength: lower highs (up) / higher lows (down),
-    # reusing detect_pivots on the closes within this same window.
-    sub_window = max(2, min(cfg.pivot_window, lb // 2 - 1))
-    if sub_window >= 2 and len(w_closes) >= (2 * sub_window + 1):
-        lows_idx, highs_idx = detect_pivots(w_closes, sub_window)
-        if trend == "up" and len(highs_idx) >= 2:
-            i1, i2 = highs_idx[-2], highs_idx[-1]
-            r1, r2 = w_rsis[i1], w_rsis[i2]
-            if r1 is not None and r2 is not None and w_closes[i2] >= w_closes[i1] and r2 < r1:
-                signals.append("RSI Picchi Decrescenti")
-        elif trend == "down" and len(lows_idx) >= 2:
-            i1, i2 = lows_idx[-2], lows_idx[-1]
-            r1, r2 = w_rsis[i1], w_rsis[i2]
-            if r1 is not None and r2 is not None and w_closes[i2] <= w_closes[i1] and r2 > r1:
-                signals.append("RSI Minimi Crescenti")
-
-    # 4) Long rejection wick against the trend, on one of the last 2 candles.
-    ratio = cfg.reversal_rejection_wick_ratio
-    for i in range(max(0, len(w_opens) - 2), len(w_opens)):
-        o, h, l, c = w_opens[i], w_highs[i], w_lows[i], w_closes[i]
-        body = abs(c - o)
-        if body <= 0:
-            body = (h - l) * 0.25 or 1e-9
-        upper_wick = h - max(o, c)
-        lower_wick = min(o, c) - l
-        if trend == "up" and upper_wick >= ratio * body and upper_wick > lower_wick:
-            signals.append("Candela di Rifiuto")
-            break
-        if trend == "down" and lower_wick >= ratio * body and lower_wick > upper_wick:
-            signals.append("Candela di Rifiuto")
-            break
-
-    score = float(len(signals))
-    confirmed = score >= cfg.exhaustion_min_score
-    return {"confirmed": confirmed, "score": score, "signals": signals}
-
-
 
 
 # ---------------------------------------------------------------------------
@@ -701,8 +569,6 @@ class PriceFeed:
         for coll in (
             db.s3360_positions,
             db.xrp_acc_positions,
-            db.top10_positions,
-            db.rsi_rebound_positions,
         ):
             rows = await coll.find({"status": "open"}, {"symbol": 1, "_id": 0}).to_list(1000)
             symbols |= {d["symbol"] for d in rows}
@@ -817,7 +683,6 @@ class PriceFeed:
 price_feed = PriceFeed()
 
 
-
 # ---------------------------------------------------------------------------
 # Config helpers
 # ---------------------------------------------------------------------------
@@ -898,7 +763,7 @@ async def set_paper_cash(cash: float) -> None:
 # user allocates funds to a specific strategy, that strategy gets its own
 # isolated cash pool and stops touching the shared one, until deallocated.
 # ---------------------------------------------------------------------------
-STRATEGY_WALLET_NAMES = ("counter_trend", "fvg_reversal", "rsi_reversion")
+STRATEGY_WALLET_NAMES = ("rsi_reversion",)
 
 
 async def get_strategy_wallet(strategy: str) -> Optional[dict[str, Any]]:
@@ -1346,123 +1211,6 @@ async def maybe_partial_close(pos: dict[str, Any], price: float, cfg: Config) ->
     await _close_fraction(pos, price, cfg.partial_close_pct / 100, "partial")
 
 
-async def _last_closed_close(symbol: str, tf: str) -> Optional[float]:
-    """Close of the last FULLY closed candle (index -2) for close-confirmation."""
-    candles = await exchange.get_klines(symbol, tf)
-    if len(candles) < 2:
-        return None
-    return candles[-2][2]
-
-
-
-
-
-
-async def manage_counter_position(pos: dict[str, Any], price: float, cfg: Config) -> dict[str, Any]:
-    """Pre-FVG reversal execution: close tp1_pct at TP1 on candle-close; keep the
-    ORIGINAL ATR stop until price advances post_tp1_advance_pct beyond TP1, then
-    move the stop to TP1 (net of fees); TP2 closes the remainder."""
-    tf = pos.get("timeframe", "1h")
-    tp1 = float(pos.get("tp1") or 0)
-    tp2 = float(pos.get("tp2") or 0)
-    long = pos["side"] == "long"
-    last_close = await _last_closed_close(pos["symbol"], tf)
-    if last_close is None:
-        return pos
-
-    if not pos.get("partial_closed"):
-        hit_tp1 = last_close >= tp1 if long else last_close <= tp1
-        if tp1 > 0 and hit_tp1:
-            remain = await _close_fraction(pos, tp1, cfg.tp1_pct / 100, "tp1")
-            # Keep the ORIGINAL ATR stop (do NOT move to breakeven yet).
-            await db.paper_positions.update_one(
-                {"id": pos["id"]}, {"$set": {"quantity": round(remain, 8)}}
-            )
-            pos = {**pos, "partial_closed": True, "quantity": remain}
-        return pos
-
-    # After TP1: move the stop to TP1 (net fees) only after +post_tp1_advance_pct
-    # beyond TP1. If that advance never happens, the original ATR stop stays.
-    if not pos.get("breakeven_active"):
-        advance = tp1 * (cfg.post_tp1_advance_pct / 100)
-        reached = (price >= tp1 + advance) if long else (price <= tp1 - advance)
-        if reached:
-            maker, taker = await get_trade_fees(pos["symbol"], cfg)
-            fee_cost = tp1 * (maker + taker)
-            new_stop = tp1 + fee_cost if long else tp1 - fee_cost
-            await db.paper_positions.update_one(
-                {"id": pos["id"]},
-                {"$set": {"current_stop": round(new_stop, 8), "breakeven_active": True}},
-            )
-            pos = {**pos, "current_stop": new_stop, "breakeven_active": True}
-
-    # TP2 closes the remainder (also handled on live price in the monitor).
-    if tp2 > 0:
-        hit_tp2 = last_close >= tp2 if long else last_close <= tp2
-        if hit_tp2:
-            await close_paper_position(pos, tp2, "win")
-            return {**pos, "quantity": 0}
-    return pos
-
-
-
-
-async def manage_fvg_reversal_position(pos: dict[str, Any], price: float, cfg: Config) -> dict[str, Any]:
-    """FVG Reversal execution: TP1 (fvgr_tp1_pct) partial on candle close; keep
-    the structure stop until price advances fvgr_post_tp1_advance_pct beyond TP1,
-    then move stop to TP1 (net fees); trailing fvgr_trailing_pct once in profit;
-    TP2 closes the remainder."""
-    tf = pos.get("timeframe", "1h")
-    tp1 = float(pos.get("tp1") or 0)
-    tp2 = float(pos.get("tp2") or 0)
-    long = pos["side"] == "long"
-    last_close = await _last_closed_close(pos["symbol"], tf)
-    if last_close is None:
-        return pos
-
-    if not pos.get("partial_closed"):
-        hit = last_close >= tp1 if long else last_close <= tp1
-        if tp1 > 0 and hit:
-            remain = await _close_fraction(pos, tp1, cfg.fvgr_tp1_pct / 100, "tp1")
-            await db.paper_positions.update_one(
-                {"id": pos["id"]}, {"$set": {"quantity": round(remain, 8)}}
-            )
-            pos = {**pos, "partial_closed": True, "quantity": remain}
-    else:
-        if not pos.get("breakeven_active"):
-            adv = tp1 * (cfg.fvgr_post_tp1_advance_pct / 100)
-            reached = (price >= tp1 + adv) if long else (price <= tp1 - adv)
-            if reached:
-                maker, taker = await get_trade_fees(pos["symbol"], cfg)
-                fee = tp1 * (maker + taker)
-                ns = tp1 + fee if long else tp1 - fee
-                await db.paper_positions.update_one(
-                    {"id": pos["id"]},
-                    {"$set": {"current_stop": round(ns, 8), "breakeven_active": True}},
-                )
-                pos = {**pos, "current_stop": ns, "breakeven_active": True}
-
-    # Trailing stop fvgr_trailing_pct from price, active once in profit.
-    entry = float(pos.get("fill_price") or pos.get("entry") or 0)
-    in_profit = (price > entry) if long else (price < entry)
-    if entry > 0 and in_profit and cfg.fvgr_trailing_pct > 0:
-        cur = float(pos.get("current_stop") or pos.get("stop_loss") or 0)
-        trail = price * (1 - cfg.fvgr_trailing_pct / 100) if long else price * (1 + cfg.fvgr_trailing_pct / 100)
-        ns = max(cur, trail) if long else min(cur, trail)
-        if (long and ns > cur) or ((not long) and ns < cur):
-            await db.paper_positions.update_one(
-                {"id": pos["id"]}, {"$set": {"current_stop": round(ns, 8)}}
-            )
-            pos = {**pos, "current_stop": ns}
-
-    if tp2 > 0 and pos.get("partial_closed"):
-        hit2 = last_close >= tp2 if long else last_close <= tp2
-        if hit2:
-            await close_paper_position(pos, tp2, "win")
-            return {**pos, "quantity": 0}
-    return pos
-
-
 async def manage_rsi_reversion_position(pos: dict[str, Any], price: float, cfg: Config) -> dict[str, Any]:
     """RSI Reversion: intentionally no partial close, no breakeven, no
     timeout-to-breakeven — the whole premise is to wait for the rebalance
@@ -1525,12 +1273,6 @@ async def manage_open_position(pos: dict[str, Any], price: float, cfg: Config) -
     """Run the 3 additive managers + partial close. Returns the possibly-updated
     position dict (with fresh current_stop)."""
     updates: dict[str, Any] = {}
-    # Pre-FVG reversal strategy has its own TP1/TP2 + post-TP1 stop path.
-    if pos.get("strategy") == "counter_trend":
-        return await manage_counter_position(pos, price, cfg)
-    # FVG Reversal strategy: TP1/TP2 + post-TP1 stop + trailing.
-    if pos.get("strategy") == "fvg_reversal":
-        return await manage_fvg_reversal_position(pos, price, cfg)
     # RSI Reversion: plain SL/TP, no partial close, no timeout-to-breakeven —
     # only a wide profit-protecting trailing stop (see above).
     if pos.get("strategy") == "rsi_reversion":
@@ -1556,7 +1298,6 @@ async def manage_open_position(pos: dict[str, Any], price: float, cfg: Config) -
         await db.paper_positions.update_one({"id": pos["id"]}, {"$set": updates})
         pos = {**pos, **updates}
     return pos
-
 
 
 async def monitor_paper_positions() -> None:
@@ -1587,13 +1328,6 @@ async def monitor_paper_positions() -> None:
         # For impulse strategy the primary fixed target is TP2 (if any); the base
         # take_profit equals TP1 which the manager already handles on candle close.
         tp_check = pos["take_profit"]
-        if pos.get("strategy") in ("counter_trend", "fvg_reversal"):
-            # Fixed TP2 close only AFTER TP1 partial is taken; before that the
-            # manager handles TP1 on candle close. If no TP2, rely on trailing.
-            if pos.get("partial_closed") and float(pos.get("tp2") or 0) > 0:
-                tp_check = float(pos["tp2"])
-            else:
-                tp_check = 0
         if pos["side"] == "long":
             if price <= active_stop:
                 await close_paper_position(pos, active_stop, "loss")
@@ -1641,319 +1375,6 @@ def detect_market_structure(candles: list[list[float]], window: int, strict: boo
         if lh or ll:
             return "down"
     return "range"
-
-
-def detect_all_fvgs(highs: list[float], lows: list[float], closes: list[float], lookback: int) -> list[dict[str, Any]]:
-    """All still-open FVGs within lookback, each with kind/top/bottom/index/gap.
-    "Filled" is judged by CLOSE, not by wick — a candle that wicks into the
-    gap and rejects (closing back outside it) is exactly the reversal entry
-    this is meant to catch, so a mere wick touch must not disqualify the
-    zone; only a candle that actually CLOSES through it counts as truly
-    mitigated."""
-    n = len(highs)
-    start = max(2, n - lookback)
-    out: list[dict[str, Any]] = []
-    for i in range(start, n):
-        if highs[i - 2] < lows[i]:  # bullish gap
-            top, bottom = lows[i], highs[i - 2]
-            if not any(closes[j] <= bottom for j in range(i + 1, n)):
-                out.append({"kind": "bullish", "top": top, "bottom": bottom,
-                            "index": i, "gap": top - bottom})
-        if lows[i - 2] > highs[i]:  # bearish gap
-            top, bottom = lows[i - 2], highs[i]
-            if not any(closes[j] >= top for j in range(i + 1, n)):
-                out.append({"kind": "bearish", "top": top, "bottom": bottom,
-                            "index": i, "gap": top - bottom})
-    return out
-
-
-
-
-
-
-# ===========================================================================
-# STRATEGY 3: Counter-trend reversal at consolidation (spec-exact)
-# impulse -> FVG (with trend) -> consolidation -> reversal pattern AGAINST
-# trend -> enter AGAINST trend, target = impulse FVG edge. + strict RSI filters.
-# ===========================================================================
-def _higher_tf(tf: str) -> str:
-    return {"15m": "1h", "1h": "4h", "4h": "1d", "1d": "1d"}.get(tf, "1h")
-
-
-def find_recent_reversal_pattern(opens, highs, lows, closes, against: str, lookback: int = 5) -> Optional[str]:
-    """Scan the last `lookback` candles for a reversal pattern (classic or
-    stepped), not just the very last one. Both detectors only ever look at
-    the final 1-3 candles of whatever arrays they're given — checking only
-    the single most recent candle meant a genuine reversal that formed a
-    few candles before the actual breakout was being missed entirely just
-    because it wasn't the exact last bar checked."""
-    n = len(closes)
-    for end in range(n, max(2, n - lookback), -1):
-        pattern = detect_reversal_pattern(opens[:end], highs[:end], lows[:end], closes[:end], against)
-        if pattern:
-            return pattern
-        pattern = detect_stepped_rejection_pattern(opens[:end], highs[:end], lows[:end], closes[:end], against)
-        if pattern:
-            return pattern
-    return None
-
-
-def detect_reversal_pattern(opens, highs, lows, closes, against: str) -> Optional[str]:
-    """Detect engulfing or star pattern oriented `against` ('bearish'|'bullish')."""
-    if len(closes) < 3:
-        return None
-    o1, c1 = opens[-2], closes[-2]
-    o0, c0 = opens[-1], closes[-1]
-    if against == "bearish":  # trend up -> want bearish reversal
-        # Bearish engulfing — using "strong reversal candle" bounds (body at
-        # least as big as the prior one, closing past its midpoint) rather
-        # than requiring a textbook-perfect full engulf (both edges
-        # containing the prior body exactly). A real, significant reversal
-        # candle very often just misses that exact full-engulf requirement
-        # by a hair while still being a genuine, meaningful signal.
-        body1 = abs(c1 - o1)
-        body0 = abs(c0 - o0)
-        if c1 > o1 and c0 < o0 and body0 >= body1 and c0 < (o1 + c1) / 2:
-            return "Bearish Engulfing"
-        # Evening star (3 candles)
-        o2, c2 = opens[-3], closes[-3]
-        mid_small = abs(c1 - o1) < abs(c2 - o2) * 0.5
-        if c2 > o2 and mid_small and c0 < o0 and c0 < (o2 + c2) / 2:
-            return "Evening Star"
-    else:  # trend down -> want bullish reversal
-        body1 = abs(c1 - o1)
-        body0 = abs(c0 - o0)
-        if c1 < o1 and c0 > o0 and body0 >= body1 and c0 > (o1 + c1) / 2:
-            return "Bullish Engulfing"
-        o2, c2 = opens[-3], closes[-3]
-        mid_small = abs(c1 - o1) < abs(c2 - o2) * 0.5
-        if c2 < o2 and mid_small and c0 > o0 and c0 > (o2 + c2) / 2:
-            return "Morning Star"
-    return None
-
-
-def detect_stepped_rejection_pattern(opens, highs, lows, closes, against: str) -> Optional[str]:
-    """Alternative reversal signal (checked alongside detect_reversal_pattern,
-    not instead of it): the last 3 candles each show a genuine, long rejection
-    wick against the trend (sellers/buyers still pushing hard each time), BUT
-    each candle's extreme is less far than the last — higher lows during a
-    downtrend (bullish case) or lower highs during an uptrend (bearish case).
-    This is buyers/sellers stepping in progressively earlier each time, a
-    concrete footprint of strengthening opposition right before a reversal —
-    distinct from a pattern of merely shrinking wicks, which would also
-    accept fading effort with no clear directional structure."""
-    if len(closes) < 3:
-        return None
-    idx = (-3, -2, -1)
-    if against == "bearish":  # trend UP -> want LOWER HIGHS with long upper-wick rejection
-        extremes = [highs[i] for i in idx]
-        spikes = [highs[i] - max(opens[i], closes[i]) for i in idx]
-        bodies = [abs(closes[i] - opens[i]) for i in idx]
-        stepping = extremes[0] >= extremes[1] >= extremes[2]
-        label = "Massimi Decrescenti con Rifiuto"
-    else:  # trend DOWN -> want HIGHER LOWS with long lower-wick rejection
-        extremes = [lows[i] for i in idx]
-        spikes = [min(opens[i], closes[i]) - lows[i] for i in idx]
-        bodies = [abs(closes[i] - opens[i]) for i in idx]
-        stepping = extremes[0] <= extremes[1] <= extremes[2]
-        label = "Minimi Crescenti con Rifiuto"
-    # "long" wick = at least 80% of the candle's own body (avoids accepting
-    # doji-like candles with a barely-there wick as "rejection"; was a full
-    # 100% match required on all 3 candles, which proved too strict in
-    # practice — this keeps the spirit of a genuine rejection wick while
-    # tolerating the normal noise real candles have).
-    long_enough = all(s > 0 and s >= b * 0.8 for s, b in zip(spikes, bodies))
-    if stepping and long_enough:
-        return label
-    return None
-
-
-def _rsi_momentum_turn(rsis: list[Optional[float]], side: str, ob: float, os_: float) -> bool:
-    vals = [r for r in rsis[-4:] if r is not None]
-    if len(vals) < 2:
-        return False
-    prev, cur = vals[-2], vals[-1]
-    if side == "long":
-        return prev < os_ and cur > os_  # was <30, turning up
-    return prev > ob and cur < ob  # was >70, turning down
-
-
-async def analyze_pair_counter(symbol: str, tf: str, cfg: Config) -> Optional[Signal]:
-    """Pre-FVG reversal strategy (spec-exact, replaces old counter-trend).
-
-    Sequence: an impulse leaves an unfilled FVG -> price consolidates in a
-    tight box -> a reversal pattern (candlestick, OR three candles with
-    higher-lows/lower-highs + rejection wicks) forms at the end of the box.
-    Trade direction is AGAINST the higher-timeframe trend (same reasoning as
-    FVG Reversal) — the reversal pattern itself is the trigger; no separate
-    wait for price to close beyond the box is required anymore, since the
-    stepped-rejection pattern already IS the directional signal, and waiting
-    for an extra breakout candle on top of it was rarely satisfied.
-    Target = the OPPOSITE (far) edge of the FVG left behind by the impulse
-    the reversal contradicts. Confirmations: volume spike + RSI filters
-    (HTF extreme, momentum turn, divergence coherent with entry).
-    """
-    STRAT = "counter_trend"
-    candles = await exchange.get_klines(symbol, tf)
-    if len(candles) < 60:
-        await log_reject(symbol, tf, STRAT, "dati insufficienti")
-        return None
-    opens = [c[1] for c in candles]
-    closes = [c[2] for c in candles]
-    highs = [c[3] for c in candles]
-    lows = [c[4] for c in candles]
-    vols = [c[5] for c in candles]
-
-    atr = atr_wilder(highs, lows, closes, cfg.atr_period)
-    if not atr or atr <= 0:
-        await log_reject(symbol, tf, STRAT, "ATR non calcolabile")
-        return None
-
-    # Trend context from the HIGHER timeframe (same reasoning as FVG
-    # Reversal): the box's direction is judged one level up, not on the
-    # scanning timeframe itself, which reads as "range" far too often.
-    htf = _higher_tf(tf)
-    hcandles = await exchange.get_klines(symbol, htf)
-    if len(hcandles) < 20:
-        await log_reject(symbol, tf, STRAT, "dati insufficienti sul timeframe alto")
-        return None
-    structure = detect_market_structure(hcandles, cfg.pivot_window, strict=cfg.trend_structure_strict)
-    if cfg.trend_htf_check_enabled and structure == "range":
-        await log_reject(symbol, tf, STRAT, "trend non definito (mercato laterale)")
-        return None
-    trend = structure  # 'up' or 'down'
-    side = "short" if trend == "up" else "long"  # AGAINST the trend
-    if side == "short" and (await get_paper_config()).trading_mode == "spot":
-        await log_reject(symbol, tf, STRAT, "short non eseguibile in modalità spot")
-        return None
-
-    # Step 1: consolidation box = the last K candles (tightness context).
-    k = cfg.consolidation_min_candles
-    if len(candles) < k + 1:
-        await log_reject(symbol, tf, STRAT, "dati insufficienti")
-        return None
-    box = candles[-k:]
-    box_high = max(c[3] for c in box)
-    box_low = min(c[4] for c in box)
-    if (box_high - box_low) > cfg.consolidation_max_atr * atr:
-        await log_reject(symbol, tf, STRAT, "consolidamento troppo ampio")
-        return None
-
-    # --- Trend Exhaustion Score (additive, before the reversal-pattern search) ---
-    rsis = rsi_wilder(closes, cfg.rsi_period)
-    exhaustion = detect_trend_exhaustion(
-        opens, highs, lows, closes, vols, rsis, trend, cfg
-    )
-    if cfg.exhaustion_check_enabled and not exhaustion["confirmed"]:
-        await log_reject(symbol, tf, STRAT, "esaurimento trend non confermato")
-        return None
-
-    # Step 2: reversal pattern AT THE END OF the box — this is now the
-    # trigger itself, not a confirmation of an already-happened breakout.
-    # Either the classic candlestick pattern, OR three consecutive candles
-    # with higher-lows/lower-highs + a genuine rejection wick each time.
-    against = "bullish" if side == "long" else "bearish"
-    box_opens, box_highs = [c[1] for c in box], [c[3] for c in box]
-    box_lows, box_closes = [c[4] for c in box], [c[2] for c in box]
-    pattern = find_recent_reversal_pattern(box_opens, box_highs, box_lows, box_closes, against)
-    if pattern is None:
-        await log_reject(symbol, tf, STRAT, "pattern di inversione non trovato")
-        return None
-
-    # Step 3: the impulse FVG the reversal contradicts, in the trade direction.
-    #   long  -> a BEARISH FVG above  (impulse was down; price fills upward)
-    #   short -> a BULLISH FVG below  (impulse was up; price fills downward)
-    entry = closes[-1]
-    fvgs = detect_all_fvgs(highs, lows, closes, cfg.fvg_lookback)
-    if side == "long":
-        targets = [f for f in fvgs if f["kind"] == "bearish" and f["top"] > entry]
-        targets.sort(key=lambda f: f["top"])  # nearest far-edge first
-    else:
-        targets = [f for f in fvgs if f["kind"] == "bullish" and f["bottom"] < entry]
-        targets.sort(key=lambda f: -f["bottom"])
-    if not targets:
-        await log_reject(symbol, tf, STRAT, "nessuna FVG target trovata")
-        return None
-    target_fvg = targets[0]
-    far_edge = target_fvg["top"] if side == "long" else target_fvg["bottom"]
-    midpoint = (target_fvg["top"] + target_fvg["bottom"]) / 2
-
-    # TP2 = far (opposite) edge of the FVG; TP1 = an intermediate level inside it.
-    tp2 = far_edge
-    tp1 = midpoint
-    if side == "long":
-        if tp1 <= entry:
-            tp1 = entry + (tp2 - entry) * 0.5
-        if tp2 <= entry:
-            await log_reject(symbol, tf, STRAT, "target non valido")
-            return None
-    else:
-        if tp1 >= entry:
-            tp1 = entry - (entry - tp2) * 0.5
-        if tp2 >= entry:
-            await log_reject(symbol, tf, STRAT, "target non valido")
-            return None
-
-    # Step 4: stop beyond the consolidation box (ATR/structure buffer).
-    sl_buffer = max(cfg.atr_sl_multiplier * atr, entry * (cfg.sl_padding_pct / 100))
-    stop_loss = (box_low - sl_buffer) if side == "long" else (box_high + sl_buffer)
-    risk = abs(entry - stop_loss)
-    if risk <= 0:
-        await log_reject(symbol, tf, STRAT, "rischio non valido")
-        return None
-    est_rr = abs(tp2 - entry) / risk
-    if est_rr < cfg.min_rr_ratio:
-        await log_reject(symbol, tf, STRAT, "R:R insufficiente")
-        return None
-
-    # Step 5: confirmations — volume spike + RSI filters.
-    vol_ratio = volume_spike_ratio(vols, cfg.volume_ma_period)
-    if vol_ratio < cfg.volume_spike_multiplier:
-        await log_reject(symbol, tf, STRAT, "volume insufficiente")
-        return None
-    # (a) higher-TF extreme (oversold for long / overbought for short) —
-    # reuses the hcandles already fetched above for the trend read.
-    hrsis = rsi_wilder([c[2] for c in hcandles], cfg.rsi_period) if len(hcandles) > cfg.rsi_period else []
-    hval = next((r for r in reversed(hrsis) if r is not None), None)
-    if hval is None:
-        await log_reject(symbol, tf, STRAT, "RSI timeframe alto non disponibile")
-        return None
-    if side == "long" and hval > cfg.rsi_high_tf_os:
-        await log_reject(symbol, tf, STRAT, "RSI timeframe alto non in ipervenduto")
-        return None
-    if side == "short" and hval < cfg.rsi_high_tf_ob:
-        await log_reject(symbol, tf, STRAT, "RSI timeframe alto non in ipercomprato")
-        return None
-    # (b) momentum turn on the trade timeframe
-    if not _rsi_momentum_turn(rsis, side, cfg.rsi_overbought, cfg.rsi_oversold):
-        await log_reject(symbol, tf, STRAT, "RSI non in inversione di momentum")
-        return None
-    # (c) divergence coherent with the trade direction
-    div = detect_rsi_divergence(closes, rsis, cfg.pivot_window)
-    if cfg.rsi_divergence_check_enabled and (
-        (side == "long" and div != "bullish") or (side == "short" and div != "bearish")
-    ):
-        await log_reject(symbol, tf, STRAT, "divergenza RSI non coerente")
-        return None
-
-    return Signal(
-        symbol=symbol, timeframe=tf, side=side,
-        entry=round(entry, 8), stop_loss=round(stop_loss, 8),
-        take_profit=round(tp1, 8), rr_ratio=cfg.rr_ratio,
-        confirmations=["Box Ristretto", pattern, "Volume Spike",
-                       "RSI HTF Extreme", "RSI Momentum Turn", "RSI Divergence"]
-                       + exhaustion["signals"],
-        strength=6, score=0.0, max_score=0.0,
-        strategy="counter_trend",
-        tp1=round(tp1, 8), tp2=round(tp2, 8),
-        consolidation_high=round(box_high, 8),
-        consolidation_low=round(box_low, 8),
-        rsi_value=round(next((r for r in reversed(rsis) if r is not None), 0) or 0, 2),
-        volume_ratio=round(vol_ratio, 2),
-        created_at=datetime.now(timezone.utc).isoformat(),
-        fvg_top=round(target_fvg["top"], 8), fvg_bottom=round(target_fvg["bottom"], 8),
-        atr=round(atr, 8), atr_multiplier=cfg.atr_sl_multiplier,
-    )
 
 
 async def log_reject(symbol: str, tf: str, strategy: str, reason: str) -> None:
@@ -2007,144 +1428,6 @@ async def log_prune_loop() -> None:
 
 
 scan_state = ScanState()
-
-
-async def analyze_pair_fvg_reversal(symbol: str, tf: str, cfg: Config) -> Optional[Signal]:
-    """FVG Reversal (independent strategy): the FVG forms WITH the trend from a
-    strong impulse; the bot trades AGAINST the trend on the retracement back
-    toward that FVG. Entry = a reversal candle pattern during the retracement;
-    target = inside the trend FVG. Uses its own `fvgr_*` parameters.
-
-    Trend context is read from the HIGHER timeframe (e.g. scanning on 1h ->
-    trend judged on 4h), not the scanning timeframe itself: on a short
-    timeframe the market reads as "range" far more often even when there is
-    a real trend one step up, which was starving this strategy of setups."""
-    STRAT = "fvg_reversal"
-    candles = await exchange.get_klines(symbol, tf)
-    if len(candles) < 60:
-        await log_reject(symbol, tf, STRAT, "dati insufficienti")
-        return None
-    opens = [c[1] for c in candles]
-    closes = [c[2] for c in candles]
-    highs = [c[3] for c in candles]
-    lows = [c[4] for c in candles]
-
-    # Fetch the higher-timeframe candles once, upfront — used both for the
-    # trend read below AND the RSI HTF filters further down.
-    htf = _higher_tf(tf)
-    hcandles = await exchange.get_klines(symbol, htf)
-    if len(hcandles) < 20:
-        await log_reject(symbol, tf, STRAT, "dati insufficienti sul timeframe alto")
-        return None
-
-    structure = detect_market_structure(hcandles, cfg.pivot_window, strict=cfg.trend_structure_strict)
-    if cfg.trend_htf_check_enabled and structure == "range":
-        await log_reject(symbol, tf, STRAT, "trend non definito (mercato laterale)")
-        return None
-    trend = structure  # 'up' or 'down'
-    entry_side = "short" if trend == "up" else "long"  # AGAINST the trend
-    if entry_side == "short" and (await get_paper_config()).trading_mode == "spot":
-        await log_reject(symbol, tf, STRAT, "short non eseguibile in modalità spot")
-        return None
-
-    atr = atr_wilder(highs, lows, closes, cfg.atr_period)
-    if not atr or atr <= 0:
-        await log_reject(symbol, tf, STRAT, "ATR non calcolabile")
-        return None
-
-    # Impulse FVG in the TREND direction (most significant = largest gap).
-    fvgs = detect_all_fvgs(highs, lows, closes, cfg.fvg_lookback)
-    trend_kind = "bullish" if trend == "up" else "bearish"
-    impulse_fvgs = [f for f in fvgs if f["kind"] == trend_kind]
-    if not impulse_fvgs:
-        await log_reject(symbol, tf, STRAT, "nessuna FVG di impulso trovata")
-        return None
-    origin = max(impulse_fvgs, key=lambda f: f["gap"])
-
-    # --- Trend Exhaustion Score (additive, before the reversal-pattern search) ---
-    rsis = rsi_wilder(closes, cfg.rsi_period)
-    exhaustion = detect_trend_exhaustion(
-        opens, highs, lows, closes, [c[5] for c in candles], rsis, trend, cfg
-    )
-    if cfg.exhaustion_check_enabled and not exhaustion["confirmed"]:
-        await log_reject(symbol, tf, STRAT, "esaurimento trend non confermato")
-        return None
-
-    # Reversal pattern AGAINST the trend during the retracement — either the
-    # classic candlestick pattern, or three consecutive shrinking wicks
-    # against the trend (fading momentum), same as Rev Pre-FVG.
-    against = "bearish" if trend == "up" else "bullish"
-    pattern = find_recent_reversal_pattern(opens, highs, lows, closes, against)
-    if pattern is None:
-        await log_reject(symbol, tf, STRAT, "pattern di inversione non trovato")
-        return None
-
-    # RSI filters (independent thresholds) — reuses the HTF candles fetched above.
-    hrsis = rsi_wilder([c[2] for c in hcandles], cfg.rsi_period) if len(hcandles) > cfg.rsi_period else []
-    hval = next((r for r in reversed(hrsis) if r is not None), None)
-    if hval is None:
-        await log_reject(symbol, tf, STRAT, "RSI timeframe alto non disponibile")
-        return None
-    if entry_side == "long" and hval > cfg.fvgr_rsi_high_tf_os:
-        await log_reject(symbol, tf, STRAT, "RSI timeframe alto non in ipervenduto")
-        return None
-    if entry_side == "short" and hval < cfg.fvgr_rsi_high_tf_ob:
-        await log_reject(symbol, tf, STRAT, "RSI timeframe alto non in ipercomprato")
-        return None
-    if not _rsi_momentum_turn(rsis, entry_side, cfg.rsi_overbought, cfg.rsi_oversold):
-        await log_reject(symbol, tf, STRAT, "RSI non in inversione di momentum")
-        return None
-    div = detect_rsi_divergence(closes, rsis, cfg.pivot_window)
-    if cfg.rsi_divergence_check_enabled and (
-        (entry_side == "long" and div != "bullish") or (entry_side == "short" and div != "bearish")
-    ):
-        await log_reject(symbol, tf, STRAT, "divergenza RSI non coerente")
-        return None
-
-    entry = closes[-1]
-    # SL beyond the IMPULSE EXTREME (never before the FVG zone).
-    i = origin["index"]
-    seg_hi = max(highs[max(0, i - 2):i + 1])
-    seg_lo = min(lows[max(0, i - 2):i + 1])
-    sl_buffer = max(cfg.fvgr_atr_sl_multiplier * atr, entry * (cfg.sl_padding_pct / 100))
-    mid = (origin["top"] + origin["bottom"]) / 2  # internal FVG sub-zone
-    if entry_side == "long":
-        stop_loss = seg_lo - sl_buffer
-        tp1 = origin["bottom"]  # near edge (first touch of the FVG)
-        tp2 = mid               # deeper internal sub-zone
-    else:
-        stop_loss = seg_hi + sl_buffer
-        tp1 = origin["top"]
-        tp2 = mid
-    risk = abs(entry - stop_loss)
-    if risk <= 0:
-        await log_reject(symbol, tf, STRAT, "rischio non valido")
-        return None
-    if (entry_side == "long" and tp1 <= entry) or (entry_side == "short" and tp1 >= entry):
-        await log_reject(symbol, tf, STRAT, "target non valido")
-        return None
-    est_rr = abs(tp1 - entry) / risk
-    if est_rr < cfg.fvgr_min_rr_ratio:
-        await log_reject(symbol, tf, STRAT, "R:R insufficiente")
-        return None
-
-    vol_ratio = volume_spike_ratio([c[5] for c in candles], cfg.volume_ma_period)
-    return Signal(
-        symbol=symbol, timeframe=tf, side=entry_side,
-        entry=round(entry, 8), stop_loss=round(stop_loss, 8),
-        take_profit=round(tp1, 8), rr_ratio=cfg.rr_ratio,
-        confirmations=["FVG Reversal", pattern, "RSI HTF Extreme",
-                       "RSI Momentum Turn", "RSI Divergence"] + exhaustion["signals"],
-        strength=5, score=0.0, max_score=0.0,
-        strategy="fvg_reversal",
-        tp1=round(tp1, 8), tp2=round(tp2, 8),
-        consolidation_high=0.0, consolidation_low=0.0,
-        rsi_value=round(next((r for r in reversed(rsis) if r is not None), 0) or 0, 2),
-        volume_ratio=round(vol_ratio, 2),
-        created_at=datetime.now(timezone.utc).isoformat(),
-        fvg_top=round(origin["top"], 8), fvg_bottom=round(origin["bottom"], 8),
-        atr=round(atr, 8), atr_multiplier=cfg.fvgr_atr_sl_multiplier,
-    )
 
 
 # ===========================================================================
@@ -2285,11 +1568,13 @@ async def analyze_pair_rsi_reversion(symbol: str, tf: str, cfg: Config) -> Optio
 
 def active_strategies(cfg: Config) -> set[str]:
     """Set of strategies to run this scan, via `enabled_strategies`. Empty
-    defaults to both counter-trend strategies ("counter_trend", "fvg_reversal")
-    — the "scoring" and "impulse_fvg" strategies were removed."""
+    defaults to RSI Reversion — the only strategy left in this pipeline (Rev
+    Pre-FVG, FVG Reversal, "scoring" and "impulse_fvg" were removed)."""
     if cfg.enabled_strategies:
-        return set(cfg.enabled_strategies)
-    return {"counter_trend", "fvg_reversal", "rsi_reversion"}
+        # The stored list may still name the strategies that were removed
+        # (Rev Pre-FVG, FVG Reversal): only RSI Reversion is acted upon.
+        return {"rsi_reversion"} & set(cfg.enabled_strategies)
+    return {"rsi_reversion"}
 
 
 async def run_scan() -> dict[str, Any]:
@@ -2339,21 +1624,13 @@ async def run_scan() -> dict[str, Any]:
         pairs = [p for p in pairs if await is_volume_stable(p, cfg)]
 
         active = active_strategies(cfg)
-        all_tfs = sorted(set(cfg.counter_trend_timeframes) | set(cfg.fvg_reversal_timeframes) | set(cfg.rsi_reversion_timeframes))
+        all_tfs = sorted(set(cfg.rsi_reversion_timeframes))
         logger.info("Scanning %d pairs across %s", len(pairs), all_tfs)
         signals_found: list[Signal] = []
 
         async def process(sym: str) -> None:
             for tf in all_tfs:
                 try:
-                    if "counter_trend" in active and tf in cfg.counter_trend_timeframes:
-                        sig3 = await analyze_pair_counter(sym, tf, cfg)
-                        if sig3:
-                            signals_found.append(sig3)
-                    if "fvg_reversal" in active and tf in cfg.fvg_reversal_timeframes:
-                        sig4 = await analyze_pair_fvg_reversal(sym, tf, cfg)
-                        if sig4:
-                            signals_found.append(sig4)
                     if "rsi_reversion" in active and tf in cfg.rsi_reversion_timeframes:
                         sig5 = await analyze_pair_rsi_reversion(sym, tf, cfg)
                         if sig5:
@@ -2458,8 +1735,6 @@ async def scheduler_loop() -> None:
         try:
             await expire_stale_signals(cfg)
             await run_scan()
-            await run_top10_scan()
-            await run_rsi_rebound_scan()
             await run_s3360_scan()
         except Exception as e:  # noqa: BLE001
             logger.exception("Scan loop error: %s", e)
@@ -2474,30 +1749,6 @@ async def paper_monitor_loop() -> None:
             await monitor_paper_positions()
         except Exception as e:  # noqa: BLE001
             logger.exception("Paper monitor error: %s", e)
-        await asyncio.sleep(3)
-
-
-async def top10_monitor_loop() -> None:
-    """Check Top10 SL/TP1/TP2/runner trailing every 3s using the real-time
-    WS price cache — same reasoning as the other monitors."""
-    await asyncio.sleep(8)
-    while True:
-        try:
-            await monitor_top10_positions()
-        except Exception as e:  # noqa: BLE001
-            logger.exception("Top10 monitor error: %s", e)
-        await asyncio.sleep(3)
-
-
-async def rsi_rebound_monitor_loop() -> None:
-    """Check RSI Rebound stop/trailing every 3s using the real-time WS
-    price cache — same reasoning as the other monitors."""
-    await asyncio.sleep(8)
-    while True:
-        try:
-            await monitor_rsi_rebound_positions()
-        except Exception as e:  # noqa: BLE001
-            logger.exception("RSI Rebound monitor error: %s", e)
         await asyncio.sleep(3)
 
 
@@ -2664,8 +1915,6 @@ async def lifespan(_app: FastAPI):
     await get_paper_config()  # sync exchange.category from trading_mode
     scan_task = asyncio.create_task(scheduler_loop())
     monitor_task = asyncio.create_task(paper_monitor_loop())
-    top10_monitor_task = asyncio.create_task(top10_monitor_loop())
-    rsi_rebound_monitor_task = asyncio.create_task(rsi_rebound_monitor_loop())
     s3360_monitor_task = asyncio.create_task(s3360_monitor_loop())
     xrp_acc_monitor_task = asyncio.create_task(xrp_acc_monitor_loop())
     ws_task = asyncio.create_task(price_feed.run())
@@ -2709,11 +1958,10 @@ async def update_config(cfg: Config) -> Config:
 
 @api.get("/events")
 async def get_events(limit: int = 100) -> dict[str, Any]:
-    """Unified chronological feed of open/close events across ALL five
-    sections (the 3 traditional strategies sharing paper_positions/
-    paper_trades) — powers the app's single 'Eventi'
-    screen so the person doesn't have to check five separate sections to
-    see what just happened."""
+    """Unified chronological feed of open/close events for the strategies
+    sharing paper_positions/paper_trades (today only RSI Reversion; older
+    entries from the removed strategies are still listed) — powers the
+    app's single 'Eventi' screen."""
     events: list[dict[str, Any]] = []
 
     opens = await db.paper_positions.find({}, {"_id": 0}).sort("opened_at", -1).to_list(limit)
@@ -2772,7 +2020,6 @@ async def clear_signals() -> dict[str, Any]:
     signal generation, Portfolio, or Settings."""
     res = await db.signals.delete_many({})
     return {"ok": True, "deleted": res.deleted_count}
-
 
 
 @api.get("/signals")
@@ -3542,73 +2789,11 @@ def _ema(values: list[float], period: int) -> list[float]:
     return out
 
 
-def _macd(closes: list[float], fast: int = 12, slow: int = 26, signal: int = 9):
-    """Returns (macd_line, signal_line) as lists aligned with `closes`."""
-    ema_fast = _ema(closes, fast)
-    ema_slow = _ema(closes, slow)
-    macd_line = [f - s for f, s in zip(ema_fast, ema_slow)]
-    signal_line = _ema(macd_line, signal)
-    return macd_line, signal_line
-
-
-def _vwap(highs, lows, closes, volumes) -> float:
-    num = 0.0
-    den = 0.0
-    for h, l, c, v in zip(highs, lows, closes, volumes):
-        tp = (h + l + c) / 3
-        num += tp * v
-        den += v
-    return num / den if den else closes[-1]
-
-
-
 # ============================================================================
-# TOP 10 LONG — multi-setup strategy (Pullback / Breakout-Retest / Momentum /
-# Mean-Reversion) over the top coins by 24h volume (proxy for market cap).
-# Long-only, spot. Own isolated wallet, own position lifecycle, independent
-# of the 3 traditional strategies.
+# SHARED BTC MARKET REGIME — built for the removed Top 10 Long strategy and
+# kept on purpose: 33/60 and the position-size trim read it through
+# get_regime_size_multiplier(). Do NOT delete the "top10" helpers below.
 # ============================================================================
-
-TOP10_WALLET_ID = "top10_wallet_singleton"
-TOP10_FEE_PCT = 0.001
-
-
-async def get_top10_wallet() -> dict[str, Any]:
-    doc = await db.top10_wallet.find_one({"_id": TOP10_WALLET_ID}, {"_id": 0})
-    if not doc:
-        doc = {"cash": 0.0, "total_transferred_in": 0.0, "reset_seq": 0}
-        await db.top10_wallet.update_one(
-            {"_id": TOP10_WALLET_ID}, {"$set": doc}, upsert=True
-        )
-    doc.setdefault("reset_seq", 0)
-    return doc
-
-
-async def get_top10_daily_state() -> dict[str, Any]:
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    doc = await db.top10_daily_state.find_one({"_id": today}, {"_id": 0})
-    if not doc:
-        doc = {"date": today, "consecutive_losses": 0, "daily_pnl_usdt": 0.0}
-        await db.top10_daily_state.update_one({"_id": today}, {"$set": doc}, upsert=True)
-    doc.setdefault("consecutive_losses", 0)
-    doc.setdefault("daily_pnl_usdt", 0.0)
-    return doc
-
-
-async def record_top10_trade_outcome(pnl_usdt: float) -> None:
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    if pnl_usdt < 0:
-        await db.top10_daily_state.update_one(
-            {"_id": today},
-            {"$inc": {"daily_pnl_usdt": pnl_usdt, "consecutive_losses": 1}, "$set": {"date": today}},
-            upsert=True,
-        )
-    else:
-        await db.top10_daily_state.update_one(
-            {"_id": today},
-            {"$inc": {"daily_pnl_usdt": pnl_usdt}, "$set": {"date": today, "consecutive_losses": 0}},
-            upsert=True,
-        )
 
 
 EXCLUDED_STABLE_BASES = ("USDC", "USDT", "BUSD", "DAI", "TUSD", "USDE", "FDUSD", "USDP", "GUSD")  # stablecoin base assets to skip — a stablecoin-vs-stablecoin pair has near-zero volatility and is useless for any of these strategies.
@@ -3633,10 +2818,11 @@ _shared_regime_cache: dict[str, Any] = {"regime": None, "at": 0.0}
 
 
 async def get_shared_market_regime(cfg: Config) -> str:
-    """BTC's regime (bullish/range/bearish) on 1h — shared across Scalping,
-    RSI Reversion and RSI Rebound so position sizing can be trimmed during
-    an uncertain/consolidating phase, not just an outright downtrend.
-    Reuses the same trend-score computation Top10 already relies on.
+    """BTC's regime (bullish/range/bearish) on 1h — shared by RSI Reversion
+    and 33/60 so position sizing can be trimmed during an
+    uncertain/consolidating phase, not just an outright downtrend. The
+    helpers it builds on still carry the "top10" name because they were
+    written for the (removed) Top 10 Long strategy — they are kept on purpose.
     Cached for 5 minutes so every position-open across every strategy
     doesn't each trigger a fresh BTC candle fetch."""
     now = time.time()
@@ -3759,779 +2945,6 @@ async def compute_top10_trend_score(symbol: str, cfg: Config) -> tuple[float, di
     return score, {"momentum_pct": momentum, "structure": structure}
 
 
-def detect_top10_pullback(cfg: Config, h1_candles: list[list[float]]) -> Optional[dict[str, Any]]:
-    """Trend + impulse + orderly pullback with declining volume, confirmation
-    candle near EMA20/support with rising volume on the reentry."""
-    closes = [c[2] for c in h1_candles]
-    highs = [c[3] for c in h1_candles]
-    lows = [c[4] for c in h1_candles]
-    opens = [c[1] for c in h1_candles]
-    volumes = [c[5] for c in h1_candles]
-    if len(closes) < 30:
-        return None
-    ema20 = _ema(closes, 20)
-    recent_high = max(highs[-15:-2])
-    pulled_back = closes[-2] < recent_high * 0.99
-    near_support = abs(closes[-1] - ema20[-1]) / closes[-1] < 0.015
-    vol_avg = sum(volumes[-10:-1]) / max(1, len(volumes[-10:-1]))
-    pullback_vol_declining = volumes[-2] < vol_avg
-    confirm_candle = closes[-1] > opens[-1]
-    confirm_volume_up = volumes[-1] > vol_avg
-    if pulled_back and near_support and confirm_candle and confirm_volume_up:
-        quality = 20 if pullback_vol_declining else 12
-        stop = min(lows[-5:]) * 0.995  # was lows[-3:] * 0.998 — too tight, easily shaken out by ordinary 1h wick noise rather than a genuine invalidation of the pullback
-        return {"type": "PULLBACK", "entry": closes[-1], "stop": stop, "quality": quality}
-    return None
-
-
-def detect_top10_breakout_retest(cfg: Config, h1_candles: list[list[float]]) -> Optional[dict[str, Any]]:
-    """A resistance broken on above-average volume with a real close (not a
-    wick), then a retest of that level as support, still holding above it."""
-    closes = [c[2] for c in h1_candles]
-    highs = [c[3] for c in h1_candles]
-    lows = [c[4] for c in h1_candles]
-    volumes = [c[5] for c in h1_candles]
-    if len(closes) < 30:
-        return None
-    resistance = max(highs[-25:-5])
-    vol_avg = sum(volumes[-20:]) / 20
-    breakout_idx = None
-    for i in range(-5, 0):
-        if closes[i] > resistance and volumes[i] > vol_avg * 1.2:
-            breakout_idx = i
-            break
-    if breakout_idx is None or closes[-1] < resistance:
-        return None
-    retested = min(lows[breakout_idx:]) <= resistance * 1.01
-    not_too_extended = (closes[-1] - resistance) / resistance < 0.03
-    if retested and not_too_extended:
-        stop = resistance * 0.99
-        return {"type": "BREAKOUT_RETEST", "entry": closes[-1], "stop": stop, "quality": 20}
-    return None
-
-
-def detect_top10_momentum(cfg: Config, h1_candles: list[list[float]], btc_perf_24h: float) -> Optional[dict[str, Any]]:
-    """Relatively stronger than BTC, still rising, not parabolically extended."""
-    closes = [c[2] for c in h1_candles]
-    lows = [c[4] for c in h1_candles]
-    if len(closes) < 30:
-        return None
-    perf_24h = (closes[-1] - closes[-25]) / closes[-25] * 100 if len(closes) > 25 and closes[-25] else 0.0
-    relative_strength = perf_24h - btc_perf_24h
-    low_20 = min(lows[-20:])
-    extended = (closes[-1] - low_20) / low_20 > 0.20 if low_20 else True
-    if relative_strength > 2 and perf_24h > 0 and not extended:
-        stop = min(lows[-5:]) * 0.99
-        return {"type": "MOMENTUM", "entry": closes[-1], "stop": stop, "quality": min(20, 10 + relative_strength)}
-    return None
-
-
-def detect_top10_mean_reversion(cfg: Config, h1_candles: list[list[float]], trend_score: float) -> Optional[dict[str, Any]]:
-    """Only away from a strong 4H downtrend: RSI extremely oversold, selling
-    volume exhausting into a significant support, reversal candle."""
-    if trend_score < 30:
-        return None
-    closes = [c[2] for c in h1_candles]
-    lows = [c[4] for c in h1_candles]
-    opens = [c[1] for c in h1_candles]
-    volumes = [c[5] for c in h1_candles]
-    if len(closes) < 40:
-        return None
-    rsi_vals = rsi_wilder(closes, cfg.top10_rsi_period)
-    rsi_now = rsi_vals[-1] if rsi_vals else None
-    if rsi_now is None or rsi_now > 25:
-        return None
-    strong_support = min(lows[-40:-2])
-    near_support = closes[-1] <= strong_support * 1.02
-    selling_exhausting = volumes[-1] < (sum(volumes[-6:-1]) / 5)
-    reversal_candle = closes[-1] > opens[-1]
-    if near_support and selling_exhausting and reversal_candle:
-        stop = strong_support * 0.985
-        return {"type": "MEAN_REVERSION", "entry": closes[-1], "stop": stop, "quality": 18}
-    return None
-
-
-async def run_top10_scan() -> dict[str, Any]:
-    cfg = await get_config()
-    if not cfg.top10_enabled:
-        return {"skipped": True, "reason": "top10 disabled"}
-
-    daily = await get_top10_daily_state()
-    wallet = await get_top10_wallet()
-    if daily["consecutive_losses"] >= cfg.top10_max_daily_losses:
-        return {"skipped": True, "reason": "daily consecutive loss limit reached"}
-    reference_capital = wallet.get("total_transferred_in") or wallet.get("cash", 0.0)
-    if reference_capital > 0:
-        loss_limit = -abs(cfg.top10_max_daily_loss_pct) / 100 * reference_capital
-        if daily["daily_pnl_usdt"] <= loss_limit:
-            return {"skipped": True, "reason": "daily loss limit reached"}
-
-    open_count = await db.top10_positions.count_documents({"status": "open"})
-    max_concurrent = max(1, int(cfg.top10_max_total_risk_pct / max(0.01, cfg.top10_risk_pct)))
-    if open_count >= max_concurrent:
-        return {"skipped": True, "reason": "total risk cap reached"}
-
-    universe = await get_top10_universe(cfg)
-    if not universe:
-        return {"opened": False, "reason": "empty universe"}
-
-    btc_symbol = next((s for s in universe if s.startswith("BTC")), universe[0])
-    btc_trend_score, btc_meta = await compute_top10_trend_score(btc_symbol, cfg)
-    btc_perf_24h = btc_meta.get("momentum_pct", 0.0)
-    regime = "bullish" if btc_trend_score >= 65 else ("bearish" if btc_trend_score < 40 else "range")
-
-    candidates: list[dict[str, Any]] = []
-    for symbol in universe:
-        if await db.top10_positions.find_one({"symbol": symbol, "status": "open"}):
-            continue
-        trend_score, trend_meta = await compute_top10_trend_score(symbol, cfg)
-        if regime == "bearish" and trend_score < 50:
-            await log_reject(
-                symbol, cfg.top10_timeframes[0], "top10",
-                f"regime ribassista su BTC ({btc_symbol} punteggio={btc_trend_score:.0f}), trend debole ({trend_score:.0f})",
-            )
-            continue
-
-        for tf in cfg.top10_timeframes:
-            h1_candles = await exchange.get_klines(symbol, tf)
-            if len(h1_candles) < 40:
-                await log_reject(symbol, tf, "top10", "dati insufficienti")
-                continue
-
-            setup = None
-            if trend_score >= 50:
-                setup = detect_top10_pullback(cfg, h1_candles)
-                if not setup:
-                    setup = detect_top10_breakout_retest(cfg, h1_candles)
-                if not setup:
-                    setup = detect_top10_momentum(cfg, h1_candles, btc_perf_24h)
-            if not setup:
-                setup = detect_top10_mean_reversion(cfg, h1_candles, trend_score)
-            if not setup:
-                await log_reject(symbol, tf, "top10", "nessun setup valido")
-                continue
-
-            entry = setup["entry"]
-            stop = setup["stop"]
-            if entry <= stop:
-                continue
-            tp1 = entry * (1 + cfg.top10_tp1_pct / 100)
-            rr = (tp1 - entry) / (entry - stop)
-            if rr < cfg.top10_min_rr:
-                await log_reject(symbol, tf, "top10", "R:R insufficiente")
-                continue
-
-            structure_component = 20 if trend_meta.get("structure") == "up" else (10 if trend_meta.get("structure") == "range" else 0)
-            momentum_component = min(10, max(0, trend_meta.get("momentum_pct", 0.0)))
-            rr_component = min(10, (rr / cfg.top10_min_rr) * 5)
-            volume_component = 15 if setup.get("quality", 0) >= 15 else 8
-            setup_component = min(20, setup.get("quality", 10))
-            trend_component = trend_score / 100 * 25
-            setup_score = min(100.0, trend_component + structure_component + volume_component + setup_component + momentum_component + rr_component)
-
-            if setup_score < cfg.top10_min_setup_score:
-                await log_reject(symbol, tf, "top10", f"punteggio insufficiente ({round(setup_score)}/100)")
-                continue
-
-            candidates.append({
-                "symbol": symbol, "timeframe": tf, "setup": setup, "entry": entry, "stop": stop,
-                "tp1": tp1, "rr": rr, "score": setup_score,
-            })
-            break
-
-    if not candidates:
-        return {"opened": False, "reason": "no qualifying setup"}
-
-    candidates.sort(key=lambda c: c["score"], reverse=True)
-    best = candidates[0]
-    await open_top10_position(best, cfg)
-    return {"opened": True, "symbol": best["symbol"], "setup": best["setup"]["type"], "score": best["score"]}
-
-
-async def open_top10_position(candidate: dict[str, Any], cfg: Config) -> None:
-    wallet = await get_top10_wallet()
-    cash = wallet.get("cash", 0.0)
-    if cash <= 1.0:
-        return
-    symbol = candidate["symbol"]
-    entry = candidate["entry"]
-    stop = candidate["stop"]
-    # Same staleness guard used elsewhere: the signal was built from the
-    # last CLOSED candle, so real price may already have moved well past
-    # the stop by the time we get here — opening at the stale entry would
-    # just create a position that's already underwater and gets stopped
-    # out almost immediately, without ever having a real chance.
-    live_price = price_feed.get(symbol) or await price_feed.price_or_rest(symbol)
-    if live_price and live_price <= stop:
-        await log_reject(symbol, candidate.get("timeframe", "?"), "top10", "prezzo già oltre lo stop, segnale scaduto")
-        return
-    entry = live_price or entry
-    risk_usdt = cash * cfg.top10_risk_pct / 100
-    stop_dist_pct = (entry - stop) / entry
-    if stop_dist_pct <= 0:
-        return
-    notional = min(risk_usdt / stop_dist_pct, cash)
-    if notional < 1.0:
-        return
-    quantity = notional / entry
-
-    tf = candidate.get("timeframe") or cfg.top10_timeframes[0]
-    h1_candles = await exchange.get_klines(symbol, tf)
-    highs = [c[3] for c in h1_candles]
-    lows = [c[4] for c in h1_candles]
-    closes = [c[2] for c in h1_candles]
-    atr_val = atr_wilder(highs, lows, closes, cfg.top10_atr_period) or 0.0
-
-    doc = {
-        "id": str(uuid.uuid4()),
-        "symbol": symbol,
-        "timeframe": tf,
-        "side": "long",
-        "setup_type": candidate["setup"]["type"],
-        "entry": entry,
-        "stop_loss": stop,
-        "current_stop": stop,
-        "tp1": candidate["tp1"],
-        "tp2": entry * (1 + cfg.top10_tp2_pct / 100),
-        "quantity": quantity,
-        "notional": notional,
-        "risk_usdt": risk_usdt,
-        "atr": atr_val,
-        "score": candidate["score"],
-        "tp1_hit": False,
-        "tp2_hit": False,
-        "runner_active": False,
-        "peak_price": None,
-        "realized_partial_pnl": 0.0,
-        "status": "open",
-        "opened_at": datetime.now(timezone.utc).isoformat(),
-    }
-    await db.top10_positions.insert_one(dict(doc))
-    await db.top10_wallet.update_one(
-        {"_id": TOP10_WALLET_ID}, {"$inc": {"cash": -notional}}, upsert=True
-    )
-
-
-async def monitor_top10_positions() -> None:
-    cfg = await get_config()
-    open_positions = await db.top10_positions.find({"status": "open"}, {"_id": 0}).to_list(200)
-    for pos in open_positions:
-        cur = price_feed.get(pos["symbol"])
-        if not cur:
-            cur = await price_feed.price_or_rest(pos["symbol"])
-        if not cur or cur <= 0:
-            continue
-
-        active_stop = pos.get("current_stop", pos["stop_loss"])
-        close_reason_if_stopped = "runner" if pos.get("realized_partial_pnl", 0.0) > 0 else "stop_loss"
-        if pos.get("runner_active"):
-            peak = max(pos.get("peak_price") or cur, cur)
-            if peak != pos.get("peak_price"):
-                await db.top10_positions.update_one({"id": pos["id"]}, {"$set": {"peak_price": peak}})
-            trail_level = peak - cfg.top10_runner_trailing_atr_mult * (pos.get("atr") or 0)
-            if trail_level > active_stop:
-                active_stop = trail_level
-                close_reason_if_stopped = "trailing_stop"
-        if cur <= active_stop:
-            qty = pos["quantity"]
-            notional_portion = pos["entry"] * qty
-            fees = (notional_portion + cur * qty) * TOP10_FEE_PCT
-            pnl = (cur - pos["entry"]) * qty - fees
-            await db.top10_wallet.update_one(
-                {"_id": TOP10_WALLET_ID}, {"$inc": {"cash": notional_portion + pnl}}, upsert=True
-            )
-            total_pnl = pnl + pos.get("realized_partial_pnl", 0.0)
-            await db.top10_positions.update_one(
-                {"id": pos["id"]},
-                {"$set": {
-                    "status": "closed", "close_price": cur, "close_reason": close_reason_if_stopped,
-                    "pnl_usdt": round(total_pnl, 4),
-                    "closed_at": datetime.now(timezone.utc).isoformat(),
-                }},
-            )
-            await record_top10_trade_outcome(total_pnl)
-            continue
-
-        if not pos.get("tp1_hit") and cur >= pos["tp1"]:
-            close_qty = pos["quantity"] * (cfg.top10_tp1_close_pct / 100)
-            remaining_qty = pos["quantity"] - close_qty
-            notional_portion = pos["entry"] * close_qty
-            fees = (notional_portion + cur * close_qty) * TOP10_FEE_PCT
-            pnl = (cur - pos["entry"]) * close_qty - fees
-            await db.top10_wallet.update_one(
-                {"_id": TOP10_WALLET_ID}, {"$inc": {"cash": notional_portion + pnl}}, upsert=True
-            )
-            await db.top10_positions.update_one(
-                {"id": pos["id"]},
-                {"$set": {
-                    "quantity": remaining_qty,
-                    "tp1_hit": True,
-                    "current_stop": pos["entry"],
-                    "realized_partial_pnl": pos.get("realized_partial_pnl", 0.0) + pnl,
-                }},
-            )
-            continue
-
-        if pos.get("tp1_hit") and not pos.get("tp2_hit") and cur >= pos["tp2"]:
-            original_qty = pos["notional"] / pos["entry"]
-            close_qty = min(pos["quantity"], original_qty * (cfg.top10_tp2_close_pct / 100))
-            remaining_qty = pos["quantity"] - close_qty
-            notional_portion = pos["entry"] * close_qty
-            fees = (notional_portion + cur * close_qty) * TOP10_FEE_PCT
-            pnl = (cur - pos["entry"]) * close_qty - fees
-            await db.top10_wallet.update_one(
-                {"_id": TOP10_WALLET_ID}, {"$inc": {"cash": notional_portion + pnl}}, upsert=True
-            )
-            if remaining_qty * cur < 1.0:
-                notional_r = pos["entry"] * remaining_qty
-                fees_r = (notional_r + cur * remaining_qty) * TOP10_FEE_PCT
-                pnl_r = (cur - pos["entry"]) * remaining_qty - fees_r
-                await db.top10_wallet.update_one(
-                    {"_id": TOP10_WALLET_ID}, {"$inc": {"cash": notional_r + pnl_r}}, upsert=True
-                )
-                total_pnl = pnl + pnl_r + pos.get("realized_partial_pnl", 0.0)
-                await db.top10_positions.update_one(
-                    {"id": pos["id"]},
-                    {"$set": {
-                        "status": "closed", "close_price": cur, "close_reason": "take_profit",
-                        "pnl_usdt": round(total_pnl, 4),
-                        "closed_at": datetime.now(timezone.utc).isoformat(),
-                    }},
-                )
-                await record_top10_trade_outcome(total_pnl)
-            else:
-                await db.top10_positions.update_one(
-                    {"id": pos["id"]},
-                    {"$set": {
-                        "quantity": remaining_qty,
-                        "tp2_hit": True,
-                        "runner_active": True,
-                        "peak_price": cur,
-                        "realized_partial_pnl": pos.get("realized_partial_pnl", 0.0) + pnl,
-                    }},
-                )
-            continue
-
-
-class Top10TransferRequest(BaseModel):
-    amount: float
-
-
-@api.post("/top10/deposit")
-async def top10_deposit(req: Top10TransferRequest) -> dict[str, Any]:
-    amount = req.amount
-    if amount <= 0:
-        raise HTTPException(status_code=400, detail="L'importo deve essere positivo")
-    main_cash = await get_paper_cash()
-    if amount > main_cash:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Fondi insufficienti nel portafoglio principale (disponibili: {round(main_cash, 2)})",
-        )
-    await set_paper_cash(main_cash - amount)
-    updated = await db.top10_wallet.find_one_and_update(
-        {"_id": TOP10_WALLET_ID},
-        {"$inc": {"cash": amount, "total_transferred_in": amount}},
-        upsert=True,
-        return_document=ReturnDocument.AFTER,
-    )
-    return {"ok": True, "top10_cash": updated.get("cash", amount), "main_cash": main_cash - amount}
-
-
-@api.post("/top10/withdraw")
-async def top10_withdraw(req: Top10TransferRequest) -> dict[str, Any]:
-    amount = req.amount
-    if amount <= 0:
-        raise HTTPException(status_code=400, detail="L'importo deve essere positivo")
-    w = await get_top10_wallet()
-    available = w.get("cash", 0.0)
-    if amount > available and (amount - available) <= 0.01:
-        amount = available
-    updated = await db.top10_wallet.find_one_and_update(
-        {"_id": TOP10_WALLET_ID, "cash": {"$gte": amount}},
-        {"$inc": {"cash": -amount}},
-        return_document=ReturnDocument.AFTER,
-    )
-    if not updated:
-        raise HTTPException(status_code=400, detail="Fondi insufficienti nel portafoglio Top10")
-    main_cash = await get_paper_cash()
-    await set_paper_cash(main_cash + amount)
-    return {"ok": True, "top10_cash": updated.get("cash", 0.0), "main_cash": main_cash + amount}
-
-
-@api.get("/top10/portfolio")
-async def top10_portfolio() -> dict[str, Any]:
-    wallet = await get_top10_wallet()
-    open_docs = await db.top10_positions.find({"status": "open"}, {"_id": 0}).to_list(200)
-    closed_docs = await db.top10_positions.find({"status": "closed"}, {"_id": 0}).sort("closed_at", -1).to_list(500)
-
-    unrealized = 0.0
-    open_out = []
-    open_value = 0.0
-    for pos in open_docs:
-        cur = price_feed.get(pos["symbol"]) or await price_feed.price_or_rest(pos["symbol"]) or pos["entry"]
-        upnl = (cur - pos["entry"]) * pos["quantity"] + pos.get("realized_partial_pnl", 0.0)
-        unrealized += upnl
-        open_value += cur * pos["quantity"]
-        open_out.append({**pos, "current_price": cur, "unrealized_pnl": round(upnl, 4)})
-
-    realized = sum(c.get("pnl_usdt", 0.0) for c in closed_docs)
-    equity = wallet.get("cash", 0.0) + open_value
-    wins = sum(1 for c in closed_docs if c.get("pnl_usdt", 0.0) > 0)
-    losses = sum(1 for c in closed_docs if c.get("pnl_usdt", 0.0) <= 0)
-    return {
-        "cash": round(wallet.get("cash", 0.0), 4),
-        "equity": round(equity, 4),
-        "total_transferred_in": wallet.get("total_transferred_in", 0.0),
-        "unrealized_pnl": round(unrealized, 4),
-        "realized_pnl": round(realized, 4),
-        "open_positions": open_out,
-        "closed_positions": closed_docs[:100],
-        "open_count": len(open_docs),
-        "closed_count": len(closed_docs),
-        "win_rate": round(wins / (wins + losses) * 100, 1) if (wins + losses) else 0.0,
-    }
-
-
-@api.post("/top10/reset")
-async def top10_reset() -> dict[str, Any]:
-    await db.top10_positions.delete_many({})
-    await db.top10_wallet.update_one(
-        {"_id": TOP10_WALLET_ID},
-        {"$set": {"cash": 0.0, "total_transferred_in": 0.0}, "$inc": {"reset_seq": 1}},
-        upsert=True,
-    )
-    return {"ok": True}
-
-
-
-# ============================================================================
-# RSI REBOUND — RSI dips below a deep-oversold threshold, then closes back
-# above it: long entry. Stop below the recent structural low, ATR-based
-# trailing target once in profit (same mechanic as Scalping). Own isolated
-# wallet, own position lifecycle.
-# ============================================================================
-
-RSI_REBOUND_WALLET_ID = "rsi_rebound_wallet_singleton"
-RSI_REBOUND_FEE_PCT = 0.001
-
-
-async def get_rsi_rebound_wallet() -> dict[str, Any]:
-    doc = await db.rsi_rebound_wallet.find_one({"_id": RSI_REBOUND_WALLET_ID}, {"_id": 0})
-    if not doc:
-        doc = {"cash": 0.0, "total_transferred_in": 0.0, "reset_seq": 0}
-        await db.rsi_rebound_wallet.update_one(
-            {"_id": RSI_REBOUND_WALLET_ID}, {"$set": doc}, upsert=True
-        )
-    doc.setdefault("reset_seq", 0)
-    return doc
-
-
-def detect_rsi_rebound_signal(candles: list[list[float]], cfg: Config) -> tuple[Optional[dict[str, Any]], str]:
-    """RSI dipped below `rsi_rebound_oversold` at some point in the last
-    `rsi_rebound_lookback` candles, and the latest CLOSED candle has RSI
-    back above that threshold with a bullish (green) close — the recovery
-    confirmation candle. Returns (signal_or_None, reason) so the caller can
-    log exactly which stage failed, instead of one catch-all message."""
-    closes = [c[2] for c in candles]
-    opens = [c[1] for c in candles]
-    lows = [c[4] for c in candles]
-    if len(closes) < cfg.rsi_rebound_period + cfg.rsi_rebound_lookback + 2:
-        return None, "dati insufficienti"
-    rsis = rsi_wilder(closes, cfg.rsi_rebound_period)
-    if rsis[-1] is None:
-        return None, "RSI non calcolabile"
-    if rsis[-1] < cfg.rsi_rebound_oversold:
-        return None, "RSI ancora sotto soglia, non ancora rientrato"
-    lookback_window = rsis[-(cfg.rsi_rebound_lookback + 1):-1]
-    was_oversold = any(r is not None and r < cfg.rsi_rebound_oversold for r in lookback_window)
-    if not was_oversold:
-        return None, "nessun ipervenduto recente sotto soglia"
-    if closes[-1] <= opens[-1]:
-        return None, "candela di conferma non rialzista"
-    stop = min(lows[-cfg.rsi_rebound_stop_lookback:]) * 0.998
-    entry = closes[-1]
-    if entry <= stop:
-        return None, "stop non valido rispetto all'entrata"
-    return {"entry": entry, "stop": stop, "rsi": rsis[-1], "candle_t": candles[-1][0]}, "ok"
-
-
-_rsi_rebound_last_candle: dict[tuple[str, str], float] = {}  # per (symbol, timeframe): timestamp of the last candle a position was actually attempted on — blocks retrying the SAME candle every scan cycle, while still allowing a genuinely new candle to trigger a fresh attempt even minutes later
-
-
-async def run_rsi_rebound_scan() -> None:
-    cfg = await get_config()
-    if not cfg.rsi_rebound_enabled:
-        return
-
-    open_count = await db.rsi_rebound_positions.count_documents({"status": "open"})
-    if open_count >= cfg.rsi_rebound_max_open_positions:
-        return
-
-    wallet = await get_rsi_rebound_wallet()
-    cash = wallet.get("cash", 0.0)
-    if cash <= 1.0:
-        return
-
-    tickers = await exchange.get_tickers()
-    vol_map: dict[str, float] = {}
-    for t in tickers:
-        try:
-            vol_map[t["symbol"]] = float(t.get("volValue") or 0)
-        except (TypeError, ValueError):
-            continue
-    symbols = await exchange.get_symbols()
-    quotes = {q.strip() for q in (cfg.quote_filter or "").split(",") if q.strip()}
-    candidates: list[str] = []
-    for s in symbols:
-        if not s.get("enableTrading"):
-            continue
-        sym = s.get("symbol")
-        if not sym:
-            continue
-        if quotes and s.get("quoteCurrency") not in quotes:
-            continue
-        if any(sym.upper().startswith(base) for base in EXCLUDED_STABLE_BASES):
-            continue
-        if cfg.excluded_pairs and sym in cfg.excluded_pairs:
-            continue
-        if cfg.enabled_pairs and sym not in cfg.enabled_pairs:
-            continue
-        if vol_map.get(sym, 0) < cfg.min_24h_volume_usdt:
-            continue
-        candidates.append(sym)
-    candidates.sort(key=lambda s: vol_map.get(s, 0), reverse=True)
-    candidates = candidates[:30]
-    candidates = [c for c in candidates if await is_volume_stable(c, cfg)]
-
-    for symbol in candidates:
-        if open_count >= cfg.rsi_rebound_max_open_positions:
-            break
-        if await db.rsi_rebound_positions.find_one({"symbol": symbol, "status": "open"}):
-            continue
-        for tf in cfg.rsi_rebound_timeframes:
-            candles = await exchange.get_klines(symbol, tf)
-            if len(candles) < cfg.rsi_rebound_period + cfg.rsi_rebound_lookback + 2:
-                await log_reject(symbol, tf, "rsi_rebound", "dati insufficienti")
-                continue
-            signal, reason = detect_rsi_rebound_signal(candles, cfg)
-            if not signal:
-                await log_reject(symbol, tf, "rsi_rebound", reason)
-                continue
-            if _rsi_rebound_last_candle.get((symbol, tf)) == signal["candle_t"]:
-                await log_reject(symbol, tf, "rsi_rebound", "stessa candela già tentata")
-                continue
-            _rsi_rebound_last_candle[(symbol, tf)] = signal["candle_t"]
-            await open_rsi_rebound_position(symbol, tf, signal, cfg)
-            open_count += 1
-            break
-
-
-async def open_rsi_rebound_position(symbol: str, tf: str, signal: dict[str, Any], cfg: Config) -> None:
-    wallet = await get_rsi_rebound_wallet()
-    cash = wallet.get("cash", 0.0)
-    if cash <= 1.0:
-        return
-    entry = signal["entry"]
-    # The signal is built from the last CLOSED candle — on a 1h timeframe,
-    # real price can already have moved well past the stop by the time we
-    # get here. Check the live price before committing: if it's already
-    # through the stop, the setup is stale and would just open a position
-    # doomed to close again within seconds (this is what caused the
-    # rapid-fire repeated entries on the same symbol).
-    live_price = price_feed.get(symbol) or await price_feed.price_or_rest(symbol)
-    if live_price and live_price <= signal["stop"]:
-        await log_reject(symbol, tf, "rsi_rebound", "prezzo già oltre lo stop, segnale scaduto")
-        return
-    fill_price = live_price or entry  # real execution price when available
-    notional = min(cash * cfg.rsi_rebound_risk_pct / 100 * await get_regime_size_multiplier(cfg), cash)
-    if notional < 1.0:
-        return
-    quantity = notional / fill_price
-
-    candles = await exchange.get_klines(symbol, tf)
-    highs = [c[3] for c in candles]
-    lows = [c[4] for c in candles]
-    closes = [c[2] for c in candles]
-    atr = atr_wilder(highs, lows, closes, cfg.rsi_rebound_period) or 0.0
-
-    doc = {
-        "id": str(uuid.uuid4()),
-        "symbol": symbol,
-        "timeframe": tf,
-        "side": "long",
-        "entry": entry,
-        "fill_price": fill_price,
-        "stop_loss": signal["stop"],
-        "take_profit": fill_price + cfg.rsi_rebound_tp_atr_mult * atr,
-        "quantity": quantity,
-        "notional": notional,
-        "atr": atr,
-        "rsi_at_entry": signal.get("rsi"),
-        "trailing_active": False,
-        "peak_price": None,
-        "status": "open",
-        "opened_at": datetime.now(timezone.utc).isoformat(),
-    }
-    await db.rsi_rebound_positions.insert_one(dict(doc))
-    await db.rsi_rebound_wallet.update_one(
-        {"_id": RSI_REBOUND_WALLET_ID}, {"$inc": {"cash": -notional}}, upsert=True
-    )
-
-
-async def monitor_rsi_rebound_positions() -> None:
-    cfg = await get_config()
-    open_positions = await db.rsi_rebound_positions.find({"status": "open"}, {"_id": 0}).to_list(200)
-    for p in open_positions:
-        cur = price_feed.get(p["symbol"])
-        if not cur:
-            cur = await price_feed.price_or_rest(p["symbol"])
-        if not cur or cur <= 0:
-            continue
-
-        if p.get("trailing_active"):
-            atr = p.get("atr") or 0.0
-            peak = p.get("peak_price") or cur
-            new_peak = max(peak, cur)
-            trail_level = new_peak - cfg.rsi_rebound_trailing_atr_mult * atr
-            if new_peak != peak:
-                await db.rsi_rebound_positions.update_one(
-                    {"id": p["id"]}, {"$set": {"peak_price": new_peak}}
-                )
-            if cur > trail_level:
-                continue
-            hit = "trailing_stop"
-        else:
-            hit = None
-            if cur <= p["stop_loss"]:
-                hit = "stop_loss"
-            else:
-                # Activate the tight trailing stop as soon as profit clears
-                # round-trip fees plus a small safety margin — not at a
-                # fixed ATR-based target. From here the trade runs
-                # uncapped, protected only by the trailing distance below
-                # its peak, instead of being boxed in by a fixed target.
-                gross_pnl_so_far = (cur - p.get("fill_price", p["entry"])) * p["quantity"]
-                exit_notional_now = cur * p["quantity"]
-                fees_now = (p["notional"] + exit_notional_now) * RSI_REBOUND_FEE_PCT
-                margin_now = p["notional"] * cfg.rsi_rebound_trailing_activation_margin_pct / 100
-                if gross_pnl_so_far > fees_now + margin_now:
-                    await db.rsi_rebound_positions.update_one(
-                        {"id": p["id"]},
-                        {"$set": {"trailing_active": True, "peak_price": cur}},
-                    )
-                continue
-
-        gross_pnl = (cur - p.get("fill_price", p["entry"])) * p["quantity"]
-        exit_notional = cur * p["quantity"]
-        fees = (p["notional"] + exit_notional) * RSI_REBOUND_FEE_PCT
-        pnl = gross_pnl - fees
-        await db.rsi_rebound_wallet.update_one(
-            {"_id": RSI_REBOUND_WALLET_ID},
-            {"$inc": {"cash": p["notional"] + pnl}},
-            upsert=True,
-        )
-        await db.rsi_rebound_positions.update_one(
-            {"id": p["id"]},
-            {"$set": {
-                "status": "closed", "close_price": cur, "close_reason": hit,
-                "pnl_usdt": round(pnl, 4),
-                "closed_at": datetime.now(timezone.utc).isoformat(),
-            }},
-        )
-
-
-class RsiReboundTransferRequest(BaseModel):
-    amount: float
-
-
-@api.post("/rsi-rebound/deposit")
-async def rsi_rebound_deposit(req: RsiReboundTransferRequest) -> dict[str, Any]:
-    amount = req.amount
-    if amount <= 0:
-        raise HTTPException(status_code=400, detail="L'importo deve essere positivo")
-    main_cash = await get_paper_cash()
-    if amount > main_cash:
-        raise HTTPException(
-            status_code=400,
-            detail=f"Fondi insufficienti nel portafoglio principale (disponibili: {round(main_cash, 2)})",
-        )
-    await set_paper_cash(main_cash - amount)
-    updated = await db.rsi_rebound_wallet.find_one_and_update(
-        {"_id": RSI_REBOUND_WALLET_ID},
-        {"$inc": {"cash": amount, "total_transferred_in": amount}},
-        upsert=True,
-        return_document=ReturnDocument.AFTER,
-    )
-    return {"ok": True, "rsi_rebound_cash": updated.get("cash", amount), "main_cash": main_cash - amount}
-
-
-@api.post("/rsi-rebound/withdraw")
-async def rsi_rebound_withdraw(req: RsiReboundTransferRequest) -> dict[str, Any]:
-    amount = req.amount
-    if amount <= 0:
-        raise HTTPException(status_code=400, detail="L'importo deve essere positivo")
-    w = await get_rsi_rebound_wallet()
-    available = w.get("cash", 0.0)
-    if amount > available and (amount - available) <= 0.01:
-        amount = available
-    updated = await db.rsi_rebound_wallet.find_one_and_update(
-        {"_id": RSI_REBOUND_WALLET_ID, "cash": {"$gte": amount}},
-        {"$inc": {"cash": -amount}},
-        return_document=ReturnDocument.AFTER,
-    )
-    if not updated:
-        raise HTTPException(status_code=400, detail="Fondi insufficienti nel portafoglio RSI Rebound")
-    main_cash = await get_paper_cash()
-    await set_paper_cash(main_cash + amount)
-    return {"ok": True, "rsi_rebound_cash": updated.get("cash", 0.0), "main_cash": main_cash + amount}
-
-
-@api.get("/rsi-rebound/portfolio")
-async def rsi_rebound_portfolio() -> dict[str, Any]:
-    wallet = await get_rsi_rebound_wallet()
-    open_docs = await db.rsi_rebound_positions.find({"status": "open"}, {"_id": 0}).to_list(200)
-    closed_docs = await db.rsi_rebound_positions.find({"status": "closed"}, {"_id": 0}).sort("closed_at", -1).to_list(500)
-
-    unrealized = 0.0
-    open_out = []
-    open_value = 0.0
-    for p in open_docs:
-        cur = price_feed.get(p["symbol"]) or await price_feed.price_or_rest(p["symbol"]) or p["entry"]
-        upnl = (cur - p["entry"]) * p["quantity"]
-        unrealized += upnl
-        open_value += cur * p["quantity"]
-        open_out.append({**p, "current_price": cur, "unrealized_pnl": round(upnl, 4)})
-
-    realized = sum(c.get("pnl_usdt", 0.0) for c in closed_docs)
-    equity = wallet.get("cash", 0.0) + open_value
-    wins = sum(1 for c in closed_docs if c.get("pnl_usdt", 0.0) > 0)
-    losses = sum(1 for c in closed_docs if c.get("pnl_usdt", 0.0) <= 0)
-    return {
-        "cash": round(wallet.get("cash", 0.0), 4),
-        "equity": round(equity, 4),
-        "total_transferred_in": wallet.get("total_transferred_in", 0.0),
-        "unrealized_pnl": round(unrealized, 4),
-        "realized_pnl": round(realized, 4),
-        "open_positions": open_out,
-        "closed_positions": closed_docs[:100],
-        "open_count": len(open_docs),
-        "closed_count": len(closed_docs),
-        "win_rate": round(wins / (wins + losses) * 100, 1) if (wins + losses) else 0.0,
-    }
-
-
-@api.post("/rsi-rebound/reset")
-async def rsi_rebound_reset() -> dict[str, Any]:
-    await db.rsi_rebound_positions.delete_many({})
-    await db.rsi_rebound_wallet.update_one(
-        {"_id": RSI_REBOUND_WALLET_ID},
-        {"$set": {"cash": 0.0, "total_transferred_in": 0.0}, "$inc": {"reset_seq": 1}},
-        upsert=True,
-    )
-    return {"ok": True}
-
-
 # ============================================================================
 # Strategy "33/60" — buy when RSI crosses down through 35 (a fresh dip into
 # oversold-adjacent territory), exit once RSI recovers up to 60. Backtested
@@ -4540,9 +2953,9 @@ async def rsi_rebound_reset() -> dict[str, Any]:
 # ones that did — none went negative among the ones that reached target.
 # The other 29% never got there within the window; those exit on the
 # timeout below instead of being held indefinitely. This is a genuinely
-# different entry rule from RSI Rebound (which waits for a confirmed
-# bullish reversal candle) — here entry fires the moment RSI first dips
-# below the threshold, no confirmation candle required.
+# different entry rule from a reversal-candle strategy — here entry fires
+# the moment RSI first dips below the threshold, no confirmation candle
+# required.
 # ============================================================================
 
 S3360_WALLET_ID = "s3360_wallet_singleton"
@@ -5228,10 +3641,6 @@ async def xrp_acc_reset() -> dict[str, Any]:
         upsert=True,
     )
     return {"ok": True}
-
-
-
-
 
 
 app.include_router(api)

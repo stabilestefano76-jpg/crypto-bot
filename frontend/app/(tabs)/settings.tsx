@@ -133,11 +133,7 @@ export default function SettingsScreen() {
 
   const toggleTimeframeFor = (
     field:
-      | "counter_trend_timeframes"
-      | "fvg_reversal_timeframes"
       | "rsi_reversion_timeframes"
-      | "rsi_rebound_timeframes"
-      | "top10_timeframes"
       | "s3360_timeframes"
       | "xrp_acc_timeframes",
     t: string
@@ -159,7 +155,7 @@ export default function SettingsScreen() {
   const enabledStrategies: string[] =
     cfg.enabled_strategies && cfg.enabled_strategies.length
       ? cfg.enabled_strategies
-      : ["counter_trend", "fvg_reversal", "rsi_reversion"];
+      : ["rsi_reversion"];
   const stratOn = (val: string): boolean => enabledStrategies.includes(val);
 
   return (
@@ -243,11 +239,7 @@ export default function SettingsScreen() {
               semplicemente ferma finché non la riaccendi.
             </Text>
             {([
-              ["counter_trend", "Rev Pre-FVG"],
-              ["fvg_reversal", "FVG Reversal"],
               ["rsi_reversion", "RSI Reversion"],
-              ["top10", "Top 10 Long"],
-              ["rsi_rebound", "RSI Rebound"],
               ["s3360", "33/60"],
               ["xrp_acc", "XRP Accumulation"],
             ] as const).map(([key, label]) => {
@@ -305,29 +297,18 @@ export default function SettingsScreen() {
 
           <Section title="Motori attivi (tutte le sezioni)">
             {(() => {
-              // Le 3 strategie tradizionali sono un array multi-selezione
-              // (enabled_strategies); le altre strategie hanno invece un
+              // RSI Reversion si accende/spegne tramite l'array
+              // enabled_strategies; 33/60 e XRP Accumulation hanno invece un
               // proprio interruttore booleano indipendente — questa
               // funzione unifica entrambe le logiche in un solo gruppo di
-              // bottoni, così ogni sezione del bot si accende/spegne da un
-              // unico pannello (utile per incanalare il budget quando si
-              // passerà al reale).
+              // bottoni, così ogni strategia si accende/spegne da un unico
+              // pannello.
               const isActive = (val: string): boolean => {
-                if (val === "top10") return cfg.top10_enabled;
-                if (val === "rsi_rebound") return cfg.rsi_rebound_enabled;
                 if (val === "s3360") return cfg.s3360_enabled;
                 if (val === "xrp_acc") return cfg.xrp_acc_enabled;
                 return stratOn(val);
               };
               const toggle = (val: string) => {
-                if (val === "top10") {
-                  update({ top10_enabled: !cfg.top10_enabled });
-                  return;
-                }
-                if (val === "rsi_rebound") {
-                  update({ rsi_rebound_enabled: !cfg.rsi_rebound_enabled });
-                  return;
-                }
                 if (val === "s3360") {
                   update({ s3360_enabled: !cfg.s3360_enabled });
                   return;
@@ -339,16 +320,16 @@ export default function SettingsScreen() {
                 const set = new Set(enabledStrategies);
                 if (set.has(val)) set.delete(val);
                 else set.add(val);
-                update({ enabled_strategies: Array.from(set) });
+                // Per il bot un elenco VUOTO significa "usa il predefinito"
+                // (= RSI Reversion acceso): spegnere l'unica strategia
+                // dell'elenco deve quindi lasciare un segnaposto non vuoto,
+                // altrimenti il bot la riaccenderebbe da solo.
+                update({ enabled_strategies: set.size ? Array.from(set) : ["none"] });
               };
               return (
                 <View style={styles.stratRow}>
                   {([
-                    ["counter_trend", "Rev Pre-FVG"],
-                    ["fvg_reversal", "FVG Reversal"],
                     ["rsi_reversion", "RSI Reversion"],
-                    ["top10", "Top 10 Long"],
-                    ["rsi_rebound", "RSI Rebound"],
                     ["s3360", "33/60"],
                     ["xrp_acc", "XRP Accumulation"],
                   ] as const).map(([val, label]) => {
@@ -372,107 +353,16 @@ export default function SettingsScreen() {
               );
             })()}
             <Text style={styles.scoreHintText}>
-              Ogni bottone accende/spegne quella sezione del bot in modo
-              indipendente. Rev Pre-FVG, FVG Reversal, RSI Reversion girano in
-              parallelo a capitale condiviso (a meno di allocare fondi
-              dedicati dalla schermata Strategie). Rev Pre-FVG = breakout del
-              consolidamento verso il fill FVG. FVG Reversal = contro-trend
-              sul ritracciamento verso la FVG (parametri indipendenti). RSI
-              Reversion = rientro da ipercomprato/ipervenduto confermato da
-              divergenza. Le altre strategie hanno ciascuna un portafoglio
-              proprio separato — qui puoi anche fermarle del tutto, utile per
-              decidere quali motori usare quando si passerà al reale.
+              Ogni bottone accende/spegne quella strategia in modo
+              indipendente. RSI Reversion = rientro da
+              ipercomprato/ipervenduto confermato da divergenza; usa il
+              capitale condiviso a meno di allocare fondi dedicati dalla
+              schermata Strategie. 33/60 e XRP Accumulation hanno ciascuna un
+              portafoglio proprio separato. Qui puoi anche fermarle del
+              tutto, utile per decidere quali strategie usare quando si
+              passerà al reale.
             </Text>
           </Section>
-
-          {stratOn("counter_trend") && (
-            <Section title="Reversal Pre-FVG Strategy">
-              <NumRow
-                label="Min. candele consolidamento"
-                value={cfg.consolidation_min_candles}
-                onChange={(v) => update({ consolidation_min_candles: v })}
-                testID="input-ct-consol-min"
-              />
-              <NumRow
-                label="Max ampiezza box (×ATR)"
-                value={cfg.consolidation_max_atr}
-                onChange={(v) => update({ consolidation_max_atr: v })}
-                step={0.1}
-                testID="input-ct-consol-atr"
-              />
-              <NumRow
-                label="Quota TP1 (%)"
-                value={cfg.tp1_pct}
-                onChange={(v) => update({ tp1_pct: v })}
-                testID="input-ct-tp1-pct"
-              />
-              <NumRow
-                label="Avanzamento post-TP1 (%)"
-                value={cfg.post_tp1_advance_pct}
-                onChange={(v) => update({ post_tp1_advance_pct: v })}
-                step={0.1}
-                testID="input-ct-post-tp1"
-              />
-              <Text style={styles.scoreHintText}>
-                Dopo TP1 chiude {cfg.tp1_pct}%; quando il prezzo avanza di{" "}
-                {cfg.post_tp1_advance_pct}% oltre TP1, lo stop del residuo si
-                sposta a TP1 (netto commissioni). Altrimenti resta lo stop ATR.
-                Il resto (TP2) chiude sul bordo opposto della FVG.
-              </Text>
-            </Section>
-          )}
-
-          {stratOn("fvg_reversal") && (
-            <Section title="FVG Reversal Strategy">
-              <NumRow
-                label="Quota TP1 (%)"
-                value={cfg.fvgr_tp1_pct}
-                onChange={(v) => update({ fvgr_tp1_pct: v })}
-                testID="input-fvgr-tp1"
-              />
-              <NumRow
-                label="Quota TP2 (%)"
-                value={cfg.fvgr_tp2_pct}
-                onChange={(v) => update({ fvgr_tp2_pct: v })}
-                testID="input-fvgr-tp2"
-              />
-              <NumRow
-                label="Avanzamento post-TP1 (%)"
-                value={cfg.fvgr_post_tp1_advance_pct}
-                onChange={(v) => update({ fvgr_post_tp1_advance_pct: v })}
-                step={0.1}
-                testID="input-fvgr-post-tp1"
-              />
-              <NumRow
-                label="Trailing stop (%)"
-                value={cfg.fvgr_trailing_pct}
-                onChange={(v) => update({ fvgr_trailing_pct: v })}
-                step={0.1}
-                testID="input-fvgr-trailing"
-              />
-              <NumRow
-                label="SL ATR multiplier"
-                value={cfg.fvgr_atr_sl_multiplier}
-                onChange={(v) => update({ fvgr_atr_sl_multiplier: v })}
-                step={0.1}
-                testID="input-fvgr-atr"
-              />
-              <NumRow
-                label="Min R:R"
-                value={cfg.fvgr_min_rr_ratio}
-                onChange={(v) => update({ fvgr_min_rr_ratio: v })}
-                step={0.1}
-                testID="input-fvgr-rr"
-              />
-              <Text style={styles.scoreHintText}>
-                Contro-trend sul ritracciamento verso la FVG di impulso. Entrata
-                sul pattern di reversal; target dentro la FVG. Dopo TP1 chiude{" "}
-                {cfg.fvgr_tp1_pct}%; oltre +{cfg.fvgr_post_tp1_advance_pct}% da TP1
-                lo stop va a TP1 (netto fee); trailing {cfg.fvgr_trailing_pct}% in
-                profitto. Parametri indipendenti dalle altre strategie.
-              </Text>
-            </Section>
-          )}
 
           {stratOn("rsi_reversion") && (
             <Section title="RSI Reversion Strategy">
@@ -560,39 +450,8 @@ export default function SettingsScreen() {
             </Section>
           )}
 
-          {(stratOn("counter_trend") || stratOn("fvg_reversal") || stratOn("rsi_reversion")) && (
-            <Section title="Rilevamento Trend & Esaurimento (condiviso)">
-              <ToggleRow
-                label="Rilevamento trend rigido"
-                value={cfg.trend_structure_strict}
-                onChange={(v) => update({ trend_structure_strict: v })}
-                testID="toggle-trend-strict"
-              />
-              <NumRow
-                label="Punteggio minimo esaurimento (0-4)"
-                value={cfg.exhaustion_min_score}
-                onChange={(v) => update({ exhaustion_min_score: v })}
-                step={1}
-                testID="input-exhaustion-min"
-              />
-              <NumRow
-                label="Finestra di ricerca esaurimento (candele)"
-                value={cfg.exhaustion_lookback}
-                onChange={(v) => update({ exhaustion_lookback: v })}
-                testID="input-exhaustion-lookback"
-              />
-              <ToggleRow
-                label="Controllo trend timeframe superiore attivo"
-                value={cfg.trend_htf_check_enabled}
-                onChange={(v) => update({ trend_htf_check_enabled: v })}
-                testID="toggle-trend-htf-check"
-              />
-              <ToggleRow
-                label="Controllo esaurimento trend attivo"
-                value={cfg.exhaustion_check_enabled}
-                onChange={(v) => update({ exhaustion_check_enabled: v })}
-                testID="toggle-exhaustion-check"
-              />
+          {stratOn("rsi_reversion") && (
+            <Section title="Divergenza RSI (RSI Reversion)">
               <ToggleRow
                 label="Ricerca divergenza RSI attiva"
                 value={cfg.rsi_divergence_check_enabled}
@@ -600,231 +459,11 @@ export default function SettingsScreen() {
                 testID="toggle-rsi-divergence-check"
               />
               <Text style={styles.scoreHintText}>
-                Usati sia da Rev Pre-FVG che da FVG Reversal. Rigido spento
-                (default): basta massimi crescenti OPPURE minimi crescenti
-                (non entrambi) per riconoscere un trend — molto più
-                permissivo. Accendilo per tornare alla definizione rigorosa
-                (entrambi insieme). Punteggio esaurimento: su 4 condizioni
-                possibili (candele che si accorciano, volume in calo, RSI
-                meno estremo, ombra di rifiuto), quante ne servono almeno —
-                default 1 (basta una sola). Finestra di ricerca: quante
-                candele indietro vengono analizzate per queste 4 condizioni —
-                default 20 (una finestra troppo piccola lasciava pochissimo
-                spazio a trovare i due picchi RSI richiesti dalla condizione
-                RSI). I tre interruttori sopra disattivano completamente
-                ciascun controllo (invece di solo allentarlo): trend
-                timeframe superiore (usato anche da RSI Reversion solo per
-                la divergenza, non per il trend), esaurimento trend, e
-                divergenza RSI — utile per capire quanto ciascun filtro
-                stia davvero limitando i segnali.
-              </Text>
-            </Section>
-          )}
-
-          {cfg.top10_enabled && (
-            <Section title="Top 10 Long">
-              <Text style={styles.fieldLabel}>Timeframe</Text>
-              <View style={styles.chipsRow}>
-                {TIMEFRAMES.map((t) => {
-                  const active = cfg.top10_timeframes.includes(t);
-                  return (
-                    <Pressable
-                      key={t}
-                      onPress={() => toggleTimeframeFor("top10_timeframes", t)}
-                      style={[styles.chip, active && styles.chipActive]}
-                      testID={`tf-select-top10-${t}`}
-                    >
-                      <Text style={[styles.chipText, active && styles.chipTextActive]}>
-                        {t}
-                      </Text>
-                    </Pressable>
-                  );
-                })}
-              </View>
-              <NumRow
-                label="Numero coppie in universo"
-                value={cfg.top10_universe_size}
-                onChange={(v) => update({ top10_universe_size: v })}
-                testID="input-top10-universe"
-              />
-              <NumRow
-                label="Rischio per operazione (%)"
-                value={cfg.top10_risk_pct}
-                onChange={(v) => update({ top10_risk_pct: v })}
-                step={0.05}
-                testID="input-top10-risk"
-              />
-              <NumRow
-                label="Punteggio minimo (0-100)"
-                value={cfg.top10_min_setup_score}
-                onChange={(v) => update({ top10_min_setup_score: v })}
-                testID="input-top10-score"
-              />
-              <NumRow
-                label="R:R minimo"
-                value={cfg.top10_min_rr}
-                onChange={(v) => update({ top10_min_rr: v })}
-                step={0.1}
-                testID="input-top10-rr"
-              />
-              <NumRow
-                label="TP1 (%)"
-                value={cfg.top10_tp1_pct}
-                onChange={(v) => update({ top10_tp1_pct: v })}
-                step={0.1}
-                testID="input-top10-tp1"
-              />
-              <NumRow
-                label="Quota chiusa a TP1 (%)"
-                value={cfg.top10_tp1_close_pct}
-                onChange={(v) => update({ top10_tp1_close_pct: v })}
-                testID="input-top10-tp1-close"
-              />
-              <NumRow
-                label="TP2 (%)"
-                value={cfg.top10_tp2_pct}
-                onChange={(v) => update({ top10_tp2_pct: v })}
-                step={0.1}
-                testID="input-top10-tp2"
-              />
-              <NumRow
-                label="Quota chiusa a TP2 (%)"
-                value={cfg.top10_tp2_close_pct}
-                onChange={(v) => update({ top10_tp2_close_pct: v })}
-                testID="input-top10-tp2-close"
-              />
-              <NumRow
-                label="Trailing residuo post-TP2 (×ATR)"
-                value={cfg.top10_runner_trailing_atr_mult}
-                onChange={(v) => update({ top10_runner_trailing_atr_mult: v })}
-                step={0.1}
-                testID="input-top10-runner-trail"
-              />
-              <NumRow
-                label="Stop dopo perdite consecutive"
-                value={cfg.top10_max_daily_losses}
-                onChange={(v) => update({ top10_max_daily_losses: v })}
-                testID="input-top10-max-losses"
-              />
-              <NumRow
-                label="Stop dopo perdita giornaliera (%)"
-                value={cfg.top10_max_daily_loss_pct}
-                onChange={(v) => update({ top10_max_daily_loss_pct: v })}
-                step={0.1}
-                testID="input-top10-max-daily-loss"
-              />
-              <NumRow
-                label="Rischio totale simultaneo massimo (%)"
-                value={cfg.top10_max_total_risk_pct}
-                onChange={(v) => update({ top10_max_total_risk_pct: v })}
-                step={0.1}
-                testID="input-top10-max-total-risk"
-              />
-              <Text style={styles.scoreHintText}>
-                Long-only, su spot. Ad ogni scansione: controlla il regime di
-                mercato guardando BTC, poi cerca — in ordine — Pullback,
-                Breakout+Retest, Momentum o Mean Reversion sulle{" "}
-                {cfg.top10_universe_size} coppie con più volume (proxy della
-                capitalizzazione). Apre solo il miglior segnale trovato, se il
-                punteggio composito supera la soglia. Dopo TP1 chiude una
-                quota e sposta lo stop a pareggio; dopo TP2 ne chiude
-                un&apos;altra e lascia correre il resto con un trailing
-                largo (approssima il TP3 &quot;prossima resistenza&quot;).
-                Dopo {cfg.top10_max_daily_losses} perdite consecutive, o una
-                perdita giornaliera oltre il {cfg.top10_max_daily_loss_pct}%,
-                si ferma fino al giorno seguente.
-              </Text>
-            </Section>
-          )}
-
-          {cfg.rsi_rebound_enabled && (
-            <Section title="RSI Rebound">
-              <Text style={styles.fieldLabel}>Timeframe</Text>
-              <View style={styles.chipsRow}>
-                {TIMEFRAMES.map((t) => {
-                  const active = cfg.rsi_rebound_timeframes.includes(t);
-                  return (
-                    <Pressable
-                      key={t}
-                      onPress={() => toggleTimeframeFor("rsi_rebound_timeframes", t)}
-                      style={[styles.chip, active && styles.chipActive]}
-                      testID={`tf-select-rsi-rebound-${t}`}
-                    >
-                      <Text style={[styles.chipText, active && styles.chipTextActive]}>
-                        {t}
-                      </Text>
-                    </Pressable>
-                  );
-                })}
-              </View>
-              <NumRow
-                label="Soglia ipervenduto RSI"
-                value={cfg.rsi_rebound_oversold}
-                onChange={(v) => update({ rsi_rebound_oversold: v })}
-                testID="input-rsi-rebound-oversold"
-              />
-              <NumRow
-                label="Finestra ricerca ipervenduto (candele)"
-                value={cfg.rsi_rebound_lookback}
-                onChange={(v) => update({ rsi_rebound_lookback: v })}
-                testID="input-rsi-rebound-lookback"
-              />
-              <NumRow
-                label="Candele per il minimo strutturale (stop)"
-                value={cfg.rsi_rebound_stop_lookback}
-                onChange={(v) => update({ rsi_rebound_stop_lookback: v })}
-                testID="input-rsi-rebound-stop-lookback"
-              />
-              <NumRow
-                label="Rischio per operazione (% portafoglio)"
-                value={cfg.rsi_rebound_risk_pct}
-                onChange={(v) => update({ rsi_rebound_risk_pct: v })}
-                step={0.5}
-                testID="input-rsi-rebound-risk"
-              />
-              <NumRow
-                label="Target iniziale (×ATR, solo informativo)"
-                value={cfg.rsi_rebound_tp_atr_mult}
-                onChange={(v) => update({ rsi_rebound_tp_atr_mult: v })}
-                step={0.1}
-                testID="input-rsi-rebound-tp"
-              />
-              <NumRow
-                label="Margine attivazione trailing (% oltre le commissioni)"
-                value={cfg.rsi_rebound_trailing_activation_margin_pct}
-                onChange={(v) => update({ rsi_rebound_trailing_activation_margin_pct: v })}
-                step={0.1}
-                testID="input-rsi-rebound-trailing-margin"
-              />
-              <NumRow
-                label="Distanza trailing (×ATR)"
-                value={cfg.rsi_rebound_trailing_atr_mult}
-                onChange={(v) => update({ rsi_rebound_trailing_atr_mult: v })}
-                step={0.1}
-                testID="input-rsi-rebound-trailing"
-              />
-              <NumRow
-                label="Massimo posizioni aperte"
-                value={cfg.rsi_rebound_max_open_positions}
-                onChange={(v) => update({ rsi_rebound_max_open_positions: v })}
-                testID="input-rsi-rebound-max-positions"
-              />
-              <Text style={styles.scoreHintText}>
-                Su timeframe {cfg.rsi_rebound_timeframe}: cerca un RSI che è
-                sceso sotto {cfg.rsi_rebound_oversold} in una delle ultime{" "}
-                {cfg.rsi_rebound_lookback} candele e che ora, sulla candela
-                appena chiusa, è tornato sopra quella soglia con una chiusura
-                rialzista — quella è la candela di conferma per l&apos;ingresso
-                long. Stop sotto il minimo delle ultime{" "}
-                {cfg.rsi_rebound_stop_lookback} candele. Il trailing si attiva
-                appena il guadagno supera le commissioni di andata e ritorno
-                più un margine di sicurezza del{" "}
-                {cfg.rsi_rebound_trailing_activation_margin_pct}% — non più a
-                un target fisso. Da quel momento l&apos;operazione corre senza
-                un tetto massimo, protetta solo dal trailing a{" "}
-                {cfg.rsi_rebound_trailing_atr_mult}×ATR dal massimo raggiunto.
-                Il target iniziale sopra resta solo informativo, mostrato
-                nell&apos;app.
+                Con l&apos;interruttore acceso, RSI Reversion entra in long
+                solo se RSI e prezzo mostrano una divergenza rialzista: un
+                semplice rientro dentro le bande non basta. Spento, il filtro
+                non c&apos;è e il bot entra anche senza divergenza, quindi con
+                più segnali ma meno selettivi.
               </Text>
             </Section>
           )}
@@ -1008,10 +647,9 @@ export default function SettingsScreen() {
               testID="input-regime-reduction"
             />
             <Text style={styles.scoreHintText}>
-              Guarda il regime di BTC su 1h (lo stesso calcolo già usato da Top
-              10 Long): se non è chiaramente rialzista (fase laterale o
-              ribassista), la taglia delle nuove operazioni di RSI
-              Reversion e RSI Rebound viene ridotta del{" "}
+              Guarda il regime di BTC su 1h: se non è chiaramente rialzista
+              (fase laterale o ribassista), la taglia delle nuove operazioni
+              di RSI Reversion e 33/60 viene ridotta del{" "}
               {cfg.regime_risk_reduction_pct}% — meno esposizione quando il
               mercato è incerto, piena taglia solo quando il quadro è
               chiaramente favorevole.
@@ -1074,57 +712,7 @@ export default function SettingsScreen() {
               onChange={(v) => update({ signal_validity_candles: v })}
               testID="input-validity-window"
             />
-            <NumRow
-              label="FVG lookback (candele)"
-              value={cfg.fvg_lookback}
-              onChange={(v) => update({ fvg_lookback: v })}
-              testID="input-fvg-lookback"
-            />
           </Section>
-
-          {stratOn("counter_trend") && (
-            <Section title="Timeframes — Rev Pre-FVG">
-              <View style={styles.chipsRow}>
-                {TIMEFRAMES.map((t) => {
-                  const active = cfg.counter_trend_timeframes.includes(t);
-                  return (
-                    <Pressable
-                      key={t}
-                      onPress={() => toggleTimeframeFor("counter_trend_timeframes", t)}
-                      style={[styles.chip, active && styles.chipActive]}
-                      testID={`tf-chip-counter-trend-${t}`}
-                    >
-                      <Text style={[styles.chipText, active && styles.chipTextActive]}>
-                        {t}
-                      </Text>
-                    </Pressable>
-                  );
-                })}
-              </View>
-            </Section>
-          )}
-
-          {stratOn("fvg_reversal") && (
-            <Section title="Timeframes — FVG Reversal">
-              <View style={styles.chipsRow}>
-                {TIMEFRAMES.map((t) => {
-                  const active = cfg.fvg_reversal_timeframes.includes(t);
-                  return (
-                    <Pressable
-                      key={t}
-                      onPress={() => toggleTimeframeFor("fvg_reversal_timeframes", t)}
-                      style={[styles.chip, active && styles.chipActive]}
-                      testID={`tf-chip-fvg-reversal-${t}`}
-                    >
-                      <Text style={[styles.chipText, active && styles.chipTextActive]}>
-                        {t}
-                      </Text>
-                    </Pressable>
-                  );
-                })}
-              </View>
-            </Section>
-          )}
 
           {stratOn("rsi_reversion") && (
             <Section title="Timeframes — RSI Reversion">
@@ -1154,7 +742,7 @@ export default function SettingsScreen() {
             </Section>
           )}
 
-          <Section title="RSI (condiviso tra le strategie)">
+          <Section title="RSI (RSI Reversion)">
             <NumRow
               label="Period"
               value={cfg.rsi_period}
@@ -1167,18 +755,6 @@ export default function SettingsScreen() {
               onChange={(v) => update({ pivot_window: v })}
               testID="input-pivot-window"
             />
-            <NumRow
-              label="Overbought (Rev Pre-FVG/FVG Reversal)"
-              value={cfg.rsi_overbought}
-              onChange={(v) => update({ rsi_overbought: v })}
-              testID="input-rsi-ob"
-            />
-            <NumRow
-              label="Oversold (Rev Pre-FVG/FVG Reversal)"
-              value={cfg.rsi_oversold}
-              onChange={(v) => update({ rsi_oversold: v })}
-              testID="input-rsi-os"
-            />
           </Section>
 
           <Section title="Volume">
@@ -1188,49 +764,14 @@ export default function SettingsScreen() {
               onChange={(v) => update({ volume_ma_period: v })}
               testID="input-vol-period"
             />
-            <NumRow
-              label="Volume spike multiplier"
-              value={cfg.volume_spike_multiplier}
-              onChange={(v) => update({ volume_spike_multiplier: v })}
-              step={0.1}
-              testID="input-vol-mult"
-            />
           </Section>
 
           <Section title="Risk">
-            <NumRow
-              label="R:R ratio (1 : x)"
-              value={cfg.rr_ratio}
-              onChange={(v) => update({ rr_ratio: v })}
-              step={0.1}
-              testID="input-rr"
-            />
-            <NumRow
-              label="SL padding beyond FVG (%)"
-              value={cfg.sl_padding_pct}
-              onChange={(v) => update({ sl_padding_pct: v })}
-              step={0.05}
-              testID="input-sl-padding"
-            />
             <NumRow
               label="ATR period"
               value={cfg.atr_period}
               onChange={(v) => update({ atr_period: v })}
               testID="input-atr-period"
-            />
-            <NumRow
-              label="ATR SL multiplier"
-              value={cfg.atr_sl_multiplier}
-              onChange={(v) => update({ atr_sl_multiplier: v })}
-              step={0.1}
-              testID="input-atr-sl-mult"
-            />
-            <NumRow
-              label="Min R:R (Rev Pre-FVG)"
-              value={cfg.min_rr_ratio}
-              onChange={(v) => update({ min_rr_ratio: v })}
-              step={0.1}
-              testID="input-min-rr"
             />
           </Section>
 

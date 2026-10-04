@@ -14,20 +14,6 @@ type StrategyEntry = {
 
 const STRATEGIES: StrategyEntry[] = [
   {
-    key: "counter_trend",
-    title: "Rev Pre-FVG",
-    subtitle: "Rottura pre-FVG in contro-tendenza",
-    icon: "return-down-back",
-    route: "/strategy/counter_trend",
-  },
-  {
-    key: "fvg_reversal",
-    title: "FVG Reversal",
-    subtitle: "Ritracciamento verso la FVG del trend",
-    icon: "swap-vertical",
-    route: "/strategy/fvg_reversal",
-  },
-  {
     key: "rsi_reversion",
     title: "RSI Reversion",
     subtitle: "Rientro da ipercomprato / ipervenduto",
@@ -35,18 +21,18 @@ const STRATEGIES: StrategyEntry[] = [
     route: "/strategy/rsi_reversion",
   },
   {
-    key: "scalping",
-    title: "Scalping Bot",
-    subtitle: "VWAP + RSI(9) + Bollinger + EMA9/21 · 5m",
-    icon: "flash",
-    route: "/scalping",
+    key: "s3360",
+    title: "33/60",
+    subtitle: "Compra al primo calo dell'RSI, vende quando risale",
+    icon: "trending-up",
+    route: "/s3360",
   },
   {
-    key: "grid",
-    title: "Grid Bot",
-    subtitle: "Griglia larga su ATR · mercati laterali",
-    icon: "grid",
-    route: "/grid",
+    key: "xrp_acc",
+    title: "XRP Accumulation",
+    subtitle: "Compra XRP con RSI basso, il profitto resta in XRP",
+    icon: "diamond",
+    route: "/xrp-accumulation",
   },
 ];
 

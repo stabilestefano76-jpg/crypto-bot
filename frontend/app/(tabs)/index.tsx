@@ -135,28 +135,6 @@ export default function SignalsScreen() {
             <Ionicons name="school" size={16} color={colors.brand} />
           </Pressable>
           <Pressable
-            onPress={() => router.push("/top10")}
-            style={({ pressed }) => [
-              styles.scanBtn,
-              { backgroundColor: colors.surfaceTertiary },
-              pressed && { opacity: 0.6 },
-            ]}
-            testID="top10-button"
-          >
-            <Ionicons name="trophy" size={16} color={colors.brand} />
-          </Pressable>
-          <Pressable
-            onPress={() => router.push("/rsi-rebound")}
-            style={({ pressed }) => [
-              styles.scanBtn,
-              { backgroundColor: colors.surfaceTertiary },
-              pressed && { opacity: 0.6 },
-            ]}
-            testID="rsi-rebound-button"
-          >
-            <Ionicons name="pulse" size={16} color={colors.brand} />
-          </Pressable>
-          <Pressable
             onPress={() => router.push("/rsi-reversion")}
             style={({ pressed }) => [
               styles.scanBtn,
