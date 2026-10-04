@@ -51,11 +51,12 @@ BYBIT_WS_PUBLIC = "wss://stream.bybit.eu/v5/public"
 TF_MAP = {
  "5m": "5",
     "15m": "15",
+    "30m": "30",
     "1h": "60",
     "4h": "240",
     "1d": "D",
 }
-TF_SECONDS = {"5m": 300, "15m": 900, "1h": 3600, "4h": 14400, "1d": 86400}
+TF_SECONDS = {"5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400, "1d": 86400}
 DEFAULT_TIMEFRAMES = ["1h", "4h"]
 PAPER_FEE_PCT = 0.001  # 0.10% Bybit spot fee per side (open + close = 0.20% round trip) — same real-world assumption as SCALPING_FEE_PCT/RSI_REBOUND_FEE_PCT, used here only to estimate a safe trailing-activation margin for the traditional strategies (their booked PnL itself doesn't model fees)
 CANDLE_LIMIT = 200  # candles fetched per pair/tf

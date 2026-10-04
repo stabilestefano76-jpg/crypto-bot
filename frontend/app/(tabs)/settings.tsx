@@ -21,6 +21,9 @@ type ExchangeStatus = Awaited<ReturnType<typeof api.exchangeStatus>>;
 import { colors, font, radius, spacing } from "@/src/theme";
 
 const TIMEFRAMES = ["5m", "15m", "1h", "4h", "1d"];
+// 30m is offered only to the two independent strategies that were extended
+// to support it (33/60 and XRP Accumulation); the others stay as they were.
+const TIMEFRAMES_30M = ["5m", "15m", "30m", "1h", "4h", "1d"];
 
 export default function SettingsScreen() {
   const insets = useSafeAreaInsets();
@@ -830,7 +833,7 @@ export default function SettingsScreen() {
             <Section title="33/60">
               <Text style={styles.fieldLabel}>Timeframe</Text>
               <View style={styles.chipsRow}>
-                {TIMEFRAMES.map((t) => {
+                {TIMEFRAMES_30M.map((t) => {
                   const active = cfg.s3360_timeframes.includes(t);
                   return (
                     <Pressable
@@ -946,7 +949,7 @@ export default function SettingsScreen() {
             <Section title="XRP Accumulation">
               <Text style={styles.fieldLabel}>Timeframe</Text>
               <View style={styles.chipsRow}>
-                {TIMEFRAMES.map((t) => {
+                {TIMEFRAMES_30M.map((t) => {
                   const active = cfg.xrp_acc_timeframes.includes(t);
                   return (
                     <Pressable
