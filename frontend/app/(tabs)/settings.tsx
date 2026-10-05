@@ -618,6 +618,19 @@ export default function SettingsScreen() {
                 step={1}
                 testID="input-xrp-acc-high"
               />
+              <ToggleRow
+                label="Non vendere sotto il prezzo di entrata"
+                value={cfg.xrp_acc_hold_below_entry}
+                onChange={(v) => update({ xrp_acc_hold_below_entry: v })}
+                testID="toggle-xrp-acc-hold-below-entry"
+              />
+              <NumRow
+                label="Margine minimo sopra l'entrata per vendere (%)"
+                value={cfg.xrp_acc_min_exit_gain_pct}
+                onChange={(v) => update({ xrp_acc_min_exit_gain_pct: v })}
+                step={0.05}
+                testID="input-xrp-acc-min-exit-gain"
+              />
               <Text style={styles.scoreHintText}>
                 Strategia dedicata solo a XRPUSDC, con un obiettivo diverso
                 dalle altre: non il guadagno in dollari, ma possedere più XRP
@@ -630,10 +643,20 @@ export default function SettingsScreen() {
                 successivo, e SOLO il profitto viene convertito subito in XRP
                 e tenuto per sempre — così il capitale di trading non si
                 gonfia mai restando bloccato in USDC, e la riserva di XRP
-                cresce ad ogni ciclo vincente. Se una vendita chiude in
-                perdita, il capitale di trading torna in cassa ridotto (non
-                c&apos;è uno stop a proteggerlo), ma la riserva di XRP già
-                accumulata non si tocca mai.
+                cresce ad ogni ciclo vincente. Con l&apos;interruttore
+                &quot;Non vendere sotto il prezzo di entrata&quot; acceso, se
+                l&apos;RSI arriva al target ma il prezzo è ancora sotto
+                l&apos;entrata (più il margine), il bot aspetta e non vende:
+                vende solo quando le due condizioni sono vere insieme. Il
+                margine copre le commissioni di andata e ritorno (0,2%) con un
+                po&apos; di spazio, così una vendita non è mai in perdita
+                netta. Attenzione: XRP investe tutto il capitale in una sola
+                operazione, quindi se il prezzo non recupera, tutto il
+                capitale resta fermo finché non torna sopra l&apos;entrata e
+                il bot non può aprire altre operazioni. Con l&apos;interruttore
+                spento vende al target anche in perdita: il capitale torna in
+                cassa ridotto, ma la riserva di XRP già accumulata non si
+                tocca mai.
               </Text>
             </Section>
           )}

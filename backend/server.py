@@ -166,6 +166,8 @@ class Config(BaseModel):
     xrp_acc_rsi_period: int = 14
     xrp_acc_low_threshold: float = 25.0  # entry: buy ALL trading capital when RSI drops to/below this
     xrp_acc_high_threshold: float = 60.0  # exit: sell everything when RSI rises to/above this
+    xrp_acc_hold_below_entry: bool = True  # exit rule: when RSI reaches the target but the price is still below the entry (plus the margin below), keep the position open instead of selling at a loss
+    xrp_acc_min_exit_gain_pct: float = 0.4  # how far above the entry price the exit must be (0.4 = round-trip fees 0.2% plus a cushion, so a sale is never a net loss); only used with hold_below_entry
 
     regime_risk_reduction_pct: float = 50.0  # position size cut applied to RSI Reversion and 33/60 whenever BTC's regime isn't clearly bullish (range or bearish) — trims risk during an uncertain/consolidating phase instead of sizing every trade the same
 
@@ -3505,6 +3507,22 @@ async def run_xrp_acc_scan() -> None:
         break
 
 
+_xrp_acc_hold_log_at: dict[str, float] = {}
+
+
+async def _xrp_acc_hold_log(p: dict[str, Any]) -> None:
+    """The monitor runs every 3 seconds; write the 'waiting' note at most once
+    every 5 minutes per position so it stays visible without flooding the log."""
+    now = time.time()
+    if now - _xrp_acc_hold_log_at.get(p["id"], 0.0) < 300:
+        return
+    _xrp_acc_hold_log_at[p["id"]] = now
+    await log_reject(
+        p["symbol"], p.get("timeframe", "?"), "xrp_acc",
+        "RSI al target ma prezzo sotto l'entrata: attendo il recupero",
+    )
+
+
 async def monitor_xrp_acc_positions() -> None:
     cfg = await get_config()
     open_positions = await db.xrp_acc_positions.find({"status": "open"}, {"_id": 0}).to_list(5)
@@ -3521,16 +3539,26 @@ async def monitor_xrp_acc_positions() -> None:
         if not (rsis and rsis[-1] >= cfg.xrp_acc_high_threshold):
             continue
 
+        fill = p.get("fill_price", p["entry"])
+        if cfg.xrp_acc_hold_below_entry and cur < fill * (1 + cfg.xrp_acc_min_exit_gain_pct / 100.0):
+            # RSI reached the target but selling now would lock in a loss (or
+            # less than the fees): keep waiting. Both conditions must be true
+            # together — RSI at the target AND the price above the entry. All
+            # the trading capital sits in this one position, so while it waits
+            # no new entry can open.
+            await _xrp_acc_hold_log(p)
+            continue
+
         proceeds = cur * p["quantity"]
         fees = (p["notional"] + proceeds) * XRP_ACC_FEE_PCT
         net_proceeds = proceeds - fees
         profit_usdt = net_proceeds - p["notional"]
         # Original trading capital goes back to cash for the next cycle;
         # only the profit (if any) converts to XRP and joins the permanent
-        # stash. If this cycle lost money, cash gets back less than it
-        # started with — the permanent stash never goes backwards, but the
-        # trading capital can shrink on a losing round since there's no
-        # stop protecting it (matches the pure-accumulation, no-stop design).
+        # stash. With the hold-below-entry rule on, a sale is never a net
+        # loss; with it off, cash gets back less than it started with — the
+        # permanent stash never goes backwards, but the trading capital can
+        # shrink on a losing round (there is no stop).
         cash_back = min(net_proceeds, p["notional"])
         profit_xrp = max(0.0, profit_usdt) / cur
         await db.xrp_acc_wallet.update_one(

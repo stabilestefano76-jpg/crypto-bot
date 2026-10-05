@@ -112,6 +112,8 @@ export type Config = {
   xrp_acc_rsi_period: number;
   xrp_acc_low_threshold: number;
   xrp_acc_high_threshold: number;
+  xrp_acc_hold_below_entry: boolean;
+  xrp_acc_min_exit_gain_pct: number;
   regime_risk_reduction_pct: number;
   live_strategies: string[];
 };
