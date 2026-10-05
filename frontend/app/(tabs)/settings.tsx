@@ -661,6 +661,37 @@ export default function SettingsScreen() {
             </Section>
           )}
 
+          <Section title="Simulazione prezzi reali (33/60 e XRP)">
+            <ToggleRow
+              label="Compra e vendi ai prezzi veri di Bybit"
+              value={cfg.sim_realistic_fills}
+              onChange={(v) => update({ sim_realistic_fills: v })}
+              testID="toggle-sim-realistic-fills"
+            />
+            <NumRow
+              label="Scarto di riserva se il libro non risponde (%)"
+              value={cfg.sim_fallback_slippage_pct}
+              onChange={(v) => update({ sim_fallback_slippage_pct: v })}
+              step={0.01}
+              testID="input-sim-fallback-slippage"
+            />
+            <Text style={styles.scoreHintText}>
+              Con l&apos;interruttore acceso, le operazioni di prova di 33/60
+              e di XRP Accumulation non usano più l&apos;ultimo prezzo
+              scambiato, ma i prezzi veri del libro ordini di Bybit: compri
+              al prezzo di vendita più basso disponibile e vendi al prezzo di
+              acquisto più alto, scendendo di livello se il tuo ordine è più
+              grande del primo. Così i risultati di prova includono lo scarto
+              tra i due prezzi (spread) e sono più vicini a quelli veri. Il
+              controllo &quot;non chiudere sotto il prezzo di entrata&quot;
+              guarda il prezzo di vendita vero, non l&apos;ultimo. Se il
+              libro non si legge (o è troppo sottile per l&apos;ordine) il bot
+              usa l&apos;ultimo prezzo peggiorato dello scarto di riserva.
+              Vale solo per le operazioni nuove: quelle già aperte o chiuse
+              non cambiano. Spento, tutto torna come prima.
+            </Text>
+          </Section>
+
           <Section title="Regime di mercato condiviso">
             <NumRow
               label="Riduzione taglia fuori da regime rialzista (%)"

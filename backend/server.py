@@ -168,6 +168,8 @@ class Config(BaseModel):
     xrp_acc_high_threshold: float = 60.0  # exit: sell everything when RSI rises to/above this
     xrp_acc_hold_below_entry: bool = True  # exit rule: when RSI reaches the target but the price is still below the entry (plus the margin below), keep the position open instead of selling at a loss
     xrp_acc_min_exit_gain_pct: float = 0.4  # how far above the entry price the exit must be (0.4 = round-trip fees 0.2% plus a cushion, so a sale is never a net loss); only used with hold_below_entry
+    sim_realistic_fills: bool = True  # paper fills of 33/60 and XRP Accumulation use the REAL order book (buy at the ask side, sell at the bid side, walking the depth) instead of the last traded price
+    sim_fallback_slippage_pct: float = 0.05  # when the order book cannot be read (or is too thin for the order), the fill is the last price made worse by this % per side
 
     regime_risk_reduction_pct: float = 50.0  # position size cut applied to RSI Reversion and 33/60 whenever BTC's regime isn't clearly bullish (range or bearish) — trims risk during an uncertain/consolidating phase instead of sizing every trade the same
 
@@ -2948,6 +2950,102 @@ async def compute_top10_trend_score(symbol: str, cfg: Config) -> tuple[float, di
 
 
 # ============================================================================
+# SIMULATED FILLS (paper) — buy at the real ask, sell at the real bid.
+# Used by 33/60 and XRP Accumulation. A paper trade used to fill exactly at the
+# last traded price, which is optimistic: a real market order pays the spread
+# and, when it is bigger than the best level, walks deeper into the book.
+# ============================================================================
+BOOK_DEPTH = 10  # order-book levels read per fill (a single request)
+_book_checked_at: dict[str, float] = {}
+
+
+def book_recheck_due(key: str, seconds: float = 10.0) -> bool:
+    """True at most once every `seconds` for the same key. The monitors tick
+    every 3s and must not hammer the order-book endpoint while a sale is
+    waiting for the real bid to clear the margin."""
+    now = time.time()
+    if now - _book_checked_at.get(key, 0.0) < seconds:
+        return False
+    _book_checked_at[key] = now
+    return True
+
+
+async def get_order_book(symbol: str, depth: int = BOOK_DEPTH) -> Optional[tuple[list[list[float]], list[list[float]]]]:
+    """Top `depth` levels of the Bybit order book as (bids, asks), each a list
+    of [price, size] with the best level first. None when it cannot be read or
+    looks broken (empty or crossed) — callers then use a safe fallback."""
+    try:
+        data = await exchange._get(
+            "/v5/market/orderbook",
+            params={"category": exchange.category, "symbol": symbol, "limit": depth},
+        )
+        if not data or data.get("retCode") != 0:
+            return None
+        res = data.get("result") or {}
+        bids = [[float(row[0]), float(row[1])] for row in res.get("b", [])]
+        asks = [[float(row[0]), float(row[1])] for row in res.get("a", [])]
+        if not bids or not asks or bids[0][0] <= 0 or asks[0][0] < bids[0][0]:
+            return None
+        return bids, asks
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def walk_book(
+    levels: list[list[float]], *, quote_budget: Optional[float] = None, base_qty: Optional[float] = None
+) -> Optional[float]:
+    """Average price of a market order that eats `levels` (best first).
+    quote_budget: spend this much quote currency (a buy). base_qty: sell this
+    much base currency. None when the visible depth is not enough."""
+    if quote_budget is not None:
+        spent = got = 0.0
+        for price, size in levels:
+            take = min(quote_budget - spent, price * size)
+            got += take / price
+            spent += take
+            if spent >= quote_budget - 1e-9:
+                return spent / got
+        return None
+    if base_qty:
+        remaining, proceeds = base_qty, 0.0
+        for price, size in levels:
+            take = min(remaining, size)
+            proceeds += take * price
+            remaining -= take
+            if remaining <= 1e-12:
+                return proceeds / base_qty
+    return None
+
+
+async def simulate_fill(
+    symbol: str, side: str, ref_price: float, cfg: Config,
+    *, quote_budget: Optional[float] = None, base_qty: Optional[float] = None,
+) -> tuple[float, dict[str, Any]]:
+    """Price a market order would really get. side "buy" spends `quote_budget`,
+    side "sell" sells `base_qty`. Returns (price, info); info.fill_model is
+    "last" (simulation off, no request), "book" (real order book) or
+    "fallback" (book unreadable / too thin: last price made worse by
+    `sim_fallback_slippage_pct`); info.cost_pct is how much WORSE than the
+    last price the fill is (positive = it costs money)."""
+    if not cfg.sim_realistic_fills:
+        return ref_price, {"fill_model": "last", "cost_pct": 0.0}
+    book = await get_order_book(symbol)
+    if book:
+        bids, asks = book
+        if side == "buy":
+            avg = walk_book(asks, quote_budget=quote_budget)
+        else:
+            avg = walk_book(bids, base_qty=base_qty)
+        if avg:
+            spread_pct = (asks[0][0] / bids[0][0] - 1.0) * 100.0
+            cost = (avg / ref_price - 1.0) * 100.0 if side == "buy" else (1.0 - avg / ref_price) * 100.0
+            return avg, {"fill_model": "book", "spread_pct": round(spread_pct, 4), "cost_pct": round(cost, 4)}
+    haircut = cfg.sim_fallback_slippage_pct / 100.0
+    price = ref_price * (1.0 + haircut) if side == "buy" else ref_price * (1.0 - haircut)
+    return price, {"fill_model": "fallback", "cost_pct": round(cfg.sim_fallback_slippage_pct, 4)}
+
+
+# ============================================================================
 # Strategy "33/60" — buy when RSI crosses down through 35 (a fresh dip into
 # oversold-adjacent territory), exit once RSI recovers up to 60. Backtested
 # on ~41 days of BTC 1h data: 14 dips found, 10/14 (71%) reached RSI 60
@@ -3126,7 +3224,7 @@ async def open_s3360_position(symbol: str, tf: str, signal: dict[str, Any], cfg:
         return
     entry = signal["entry"]
     live_price = price_feed.get(symbol) or await price_feed.price_or_rest(symbol)
-    fill_price = live_price or entry
+    ref_price = live_price or entry
     # Size each trade as a fixed share of TOTAL equity (cash + value of
     # currently open positions), not just the free cash — so "N slots"
     # always means "1/N of total capital per trade" regardless of how many
@@ -3141,6 +3239,9 @@ async def open_s3360_position(symbol: str, tf: str, signal: dict[str, Any], cfg:
     notional = min((equity / slots) * await get_regime_size_multiplier(cfg), cash)
     if notional < 1.0:
         return
+    # Paper fill at the real ask (walking the book if the order is bigger than
+    # the first level) instead of the last traded price.
+    fill_price, fill_info = await simulate_fill(symbol, "buy", ref_price, cfg, quote_budget=notional)
     quantity = notional / fill_price
 
     candles = await exchange.get_klines(symbol, tf)
@@ -3156,6 +3257,9 @@ async def open_s3360_position(symbol: str, tf: str, signal: dict[str, Any], cfg:
         "side": "long",
         "entry": entry,
         "fill_price": fill_price,
+        "fill_model": fill_info["fill_model"],
+        "entry_cost_pct": fill_info["cost_pct"],
+        "spread_pct": fill_info.get("spread_pct"),
         "rsi_at_entry": signal.get("rsi"),
         "daily_rise_pct": (
             None if signal.get("daily_rise_pct") is None else round(signal["daily_rise_pct"], 2)
@@ -3213,15 +3317,26 @@ async def monitor_s3360_positions() -> None:
             continue
 
         fill = p.get("fill_price", p["entry"])
-        if cfg.s3360_hold_below_entry and cur < fill * (1 + cfg.s3360_min_exit_gain_pct / 100.0):
+        margin_price = fill * (1 + cfg.s3360_min_exit_gain_pct / 100.0)
+        if cfg.s3360_hold_below_entry and cur < margin_price:
             # RSI reached the target but closing now would lock in a loss (or
             # less than the fees): keep waiting. Both conditions must be true
             # together — RSI at the target AND the price above the entry.
             await _s3360_hold_log(p)
             continue
 
-        gross_pnl = (cur - fill) * p["quantity"]
-        exit_notional = cur * p["quantity"]
+        # The last price clears the margin; now ask what a market sell would
+        # REALLY get (best bid / depth). With the simulation off this is `cur`
+        # and costs no request. The book is read at most every 10s per position.
+        if cfg.sim_realistic_fills and not book_recheck_due(p["id"]):
+            continue
+        sell_price, sell_info = await simulate_fill(p["symbol"], "sell", cur, cfg, base_qty=p["quantity"])
+        if cfg.s3360_hold_below_entry and sell_price < margin_price:
+            await _s3360_hold_log(p)  # the price we would really get is still too low
+            continue
+
+        gross_pnl = (sell_price - fill) * p["quantity"]
+        exit_notional = sell_price * p["quantity"]
         fees = (p["notional"] + exit_notional) * S3360_FEE_PCT
         pnl = gross_pnl - fees
         await db.s3360_wallet.update_one(
@@ -3232,7 +3347,11 @@ async def monitor_s3360_positions() -> None:
         await db.s3360_positions.update_one(
             {"id": p["id"]},
             {"$set": {
-                "status": "closed", "close_price": cur, "close_reason": hit,
+                "status": "closed", "close_price": sell_price, "close_reason": hit,
+                "close_last_price": cur,
+                "exit_fill_model": sell_info["fill_model"],
+                "exit_cost_pct": sell_info["cost_pct"],
+                "exit_spread_pct": sell_info.get("spread_pct"),
                 "pnl_usdt": round(pnl, 4),
                 "closed_at": datetime.now(timezone.utc).isoformat(),
             }},
@@ -3486,14 +3605,20 @@ async def run_xrp_acc_scan() -> None:
             continue
         _xrp_acc_last_candle[tf] = forming_candle_t
 
-        quantity = cash / live_price
+        # Paper fill at the real ask (walking the book if needed) instead of
+        # the last traded price.
+        fill_price, fill_info = await simulate_fill(XRP_ACC_SYMBOL, "buy", live_price, cfg, quote_budget=cash)
+        quantity = cash / fill_price
         doc = {
             "id": str(uuid.uuid4()),
             "symbol": XRP_ACC_SYMBOL,
             "timeframe": tf,
             "side": "long",
             "entry": live_price,
-            "fill_price": live_price,
+            "fill_price": fill_price,
+            "fill_model": fill_info["fill_model"],
+            "entry_cost_pct": fill_info["cost_pct"],
+            "spread_pct": fill_info.get("spread_pct"),
             "rsi_at_entry": live_rsi,
             "quantity": quantity,
             "notional": cash,
@@ -3540,7 +3665,8 @@ async def monitor_xrp_acc_positions() -> None:
             continue
 
         fill = p.get("fill_price", p["entry"])
-        if cfg.xrp_acc_hold_below_entry and cur < fill * (1 + cfg.xrp_acc_min_exit_gain_pct / 100.0):
+        margin_price = fill * (1 + cfg.xrp_acc_min_exit_gain_pct / 100.0)
+        if cfg.xrp_acc_hold_below_entry and cur < margin_price:
             # RSI reached the target but selling now would lock in a loss (or
             # less than the fees): keep waiting. Both conditions must be true
             # together — RSI at the target AND the price above the entry. All
@@ -3549,7 +3675,17 @@ async def monitor_xrp_acc_positions() -> None:
             await _xrp_acc_hold_log(p)
             continue
 
-        proceeds = cur * p["quantity"]
+        # The last price clears the margin; now ask what a market sell would
+        # REALLY get (best bid / depth). With the simulation off this is `cur`
+        # and costs no request. The book is read at most every 10s.
+        if cfg.sim_realistic_fills and not book_recheck_due(p["id"]):
+            continue
+        sell_price, sell_info = await simulate_fill(p["symbol"], "sell", cur, cfg, base_qty=p["quantity"])
+        if cfg.xrp_acc_hold_below_entry and sell_price < margin_price:
+            await _xrp_acc_hold_log(p)  # the price we would really get is still too low
+            continue
+
+        proceeds = sell_price * p["quantity"]
         fees = (p["notional"] + proceeds) * XRP_ACC_FEE_PCT
         net_proceeds = proceeds - fees
         profit_usdt = net_proceeds - p["notional"]
@@ -3569,7 +3705,11 @@ async def monitor_xrp_acc_positions() -> None:
         await db.xrp_acc_positions.update_one(
             {"id": p["id"]},
             {"$set": {
-                "status": "closed", "close_price": cur, "close_reason": "target_rsi_raggiunto",
+                "status": "closed", "close_price": sell_price, "close_reason": "target_rsi_raggiunto",
+                "close_last_price": cur,
+                "exit_fill_model": sell_info["fill_model"],
+                "exit_cost_pct": sell_info["cost_pct"],
+                "exit_spread_pct": sell_info.get("spread_pct"),
                 "profit_usdt": round(profit_usdt, 4),
                 "profit_xrp": round(profit_xrp, 6),
                 "closed_at": datetime.now(timezone.utc).isoformat(),
