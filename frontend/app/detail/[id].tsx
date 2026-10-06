@@ -248,16 +248,9 @@ export default function DetailScreen() {
             setExecuting(true);
             setExecuteMsg(null);
             try {
-              const res = await fetch(
-                `${process.env.EXPO_PUBLIC_BACKEND_URL}/api/paper/execute/${signal.id}`,
-                { method: "POST" }
-              );
-              if (!res.ok) {
-                const err = await res.json().catch(() => ({}));
-                setExecuteMsg(err.detail || `Failed (${res.status})`);
-              } else {
-                setExecuteMsg("Position opened in paper portfolio");
-              }
+              // Goes through the shared request helper so the access code is sent.
+              await api.paperExecute(signal.id);
+              setExecuteMsg("Position opened in paper portfolio");
             } catch (e: any) {
               setExecuteMsg(e.message || "Network error");
             } finally {

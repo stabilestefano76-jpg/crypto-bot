@@ -1,10 +1,21 @@
+import { getAccessKey, handleUnauthorized } from "./auth";
+
 const BASE = process.env.EXPO_PUBLIC_BACKEND_URL || "";
 
 async function req<T>(path: string, opts: RequestInit = {}): Promise<T> {
+  const accessKey = await getAccessKey();
   const res = await fetch(`${BASE}/api${path}`, {
-    headers: { "Content-Type": "application/json", ...(opts.headers || {}) },
     ...opts,
+    headers: {
+      "Content-Type": "application/json",
+      ...(accessKey ? { "X-Access-Key": accessKey } : {}),
+      ...((opts.headers as Record<string, string>) || {}),
+    },
   });
+  if (res.status === 401) {
+    // Access code missing or no longer valid: forget it and open the login.
+    await handleUnauthorized();
+  }
   if (!res.ok) {
     let msg = `HTTP ${res.status}`;
     try {

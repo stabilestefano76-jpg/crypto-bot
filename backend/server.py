@@ -21,7 +21,8 @@ from typing import Any, Optional
 import httpx
 from cryptography.fernet import Fernet, InvalidToken
 from dotenv import load_dotenv
-from fastapi import APIRouter, FastAPI, HTTPException, Query
+from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
 from motor.motor_asyncio import AsyncIOMotorClient
 from pydantic import BaseModel, Field
 from pymongo import ReturnDocument
@@ -1936,7 +1937,13 @@ async def lifespan(_app: FastAPI):
     client.close()
 
 
-app = FastAPI(lifespan=lifespan)
+# Optional access code for the whole API. Active ONLY when the BOT_ACCESS_KEY
+# variable is set on Railway, so deploying this code changes nothing until a
+# code is chosen. With a code set, the auto-generated API pages (/docs, /redoc,
+# /openapi.json) are hidden too: they would list every endpoint to a stranger.
+BOT_ACCESS_KEY = os.environ.get("BOT_ACCESS_KEY", "").strip()
+_HIDE_DOCS = {"docs_url": None, "redoc_url": None, "openapi_url": None} if BOT_ACCESS_KEY else {}
+app = FastAPI(lifespan=lifespan, **_HIDE_DOCS)
 api = APIRouter(prefix="/api")
 
 
@@ -2769,6 +2776,77 @@ async def exchange_connect(req: ExchangeConnectRequest) -> dict[str, Any]:
 async def exchange_disconnect() -> dict[str, Any]:
     await db.exchange_creds.delete_one({"_id": "bybit"})
     return {"ok": True}
+
+
+# --- ACCESS GUARD START ---
+# The app sends the code in the X-Access-Key header; for opening links in a
+# browser it can also be passed as ?key=CODE. 10 wrong codes from one address
+# in 15 minutes lock that address out for the rest of the window.
+_AUTH_WINDOW_SEC = 15 * 60
+_AUTH_MAX_FAILS = 10
+_auth_fails: dict[str, list[float]] = {}
+_AUTH_OPEN_PATHS = ("/api", "/api/")  # bare health answer ({"status": "ok"}): left open for Railway's checks
+
+
+def _client_ip(request: Request) -> str:
+    real = request.headers.get("x-real-ip")
+    if real:
+        return real.strip()
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        # The LAST entry is the one added by the nearest proxy; the first ones
+        # are written by the client and can be faked.
+        return fwd.split(",")[-1].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def install_access_guard(application: FastAPI, access_key: str) -> None:
+    @application.middleware("http")
+    async def access_guard(request: Request, call_next):
+        if (
+            not access_key
+            or request.method == "OPTIONS"
+            or not request.url.path.startswith("/api")
+            or request.url.path in _AUTH_OPEN_PATHS
+        ):
+            return await call_next(request)
+        ip = _client_ip(request)
+        now = time.time()
+        recent = [t for t in _auth_fails.get(ip, []) if now - t < _AUTH_WINDOW_SEC]
+        if recent:
+            _auth_fails[ip] = recent
+        else:
+            _auth_fails.pop(ip, None)
+        if len(recent) >= _AUTH_MAX_FAILS:
+            return JSONResponse(
+                {"detail": "Troppi tentativi sbagliati. Riprova tra qualche minuto."},
+                status_code=429,
+            )
+        provided = request.headers.get("x-access-key") or request.query_params.get("key") or ""
+        if not provided:
+            # A missing code is not a guess, so it does not count as a failure.
+            return JSONResponse({"detail": "Codice di accesso richiesto"}, status_code=401)
+        if not hmac.compare_digest(provided.encode(), access_key.encode()):
+            if len(_auth_fails) > 5000:
+                _auth_fails.clear()
+            _auth_fails.setdefault(ip, []).append(now)
+            logger.warning("Access refused: wrong code from %s (%d in the last 15 min)", ip, len(recent) + 1)
+            return JSONResponse({"detail": "Codice di accesso errato"}, status_code=401)
+        return await call_next(request)
+# --- ACCESS GUARD END ---
+
+
+# Registered BEFORE the CORS middleware on purpose: the last one added is the
+# outermost, so CORS wraps this guard and its 401/429 answers still carry the
+# CORS headers a browser needs.
+install_access_guard(app, BOT_ACCESS_KEY)
+
+
+@api.get("/auth/check")
+async def auth_check() -> dict[str, Any]:
+    """Reaching this point means the access code (if one is required) was
+    accepted — the login screen uses it to validate what the user typed."""
+    return {"ok": True, "protected": bool(BOT_ACCESS_KEY)}
 
 
 app.add_middleware(

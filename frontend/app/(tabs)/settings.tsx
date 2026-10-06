@@ -16,6 +16,8 @@ import {
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
 import { api, Config, PaperConfig } from "@/src/api";
+import { router } from "expo-router";
+import { clearAccessKey } from "@/src/auth";
 
 type ExchangeStatus = Awaited<ReturnType<typeof api.exchangeStatus>>;
 import { colors, font, radius, spacing } from "@/src/theme";
@@ -228,6 +230,24 @@ export default function SettingsScreen() {
               passaggio salva solo le credenziali: quale strategia opera
               davvero in reale si decide qui sotto, una alla volta.
             </Text>
+          </Section>
+
+          <Section title="Accesso">
+            <Text style={styles.scoreHintText}>
+              Il codice di accesso è salvato su questo dispositivo, in un
+              archivio cifrato. Se cambi telefono, o vuoi che il codice venga
+              richiesto di nuovo, tocca Esci.
+            </Text>
+            <Pressable
+              style={({ pressed }) => [styles.disconnectBtn, pressed && { opacity: 0.7 }]}
+              onPress={async () => {
+                await clearAccessKey();
+                router.replace("/login");
+              }}
+              testID="button-logout"
+            >
+              <Text style={styles.disconnectBtnText}>Esci da questo dispositivo</Text>
+            </Pressable>
           </Section>
 
           <Section title="Modalità operativa (Paper / Reale)">
