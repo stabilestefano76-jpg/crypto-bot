@@ -34,6 +34,13 @@ function money(n?: number): string {
   return `$${n.toFixed(2)}`;
 }
 
+// Price with enough decimals for cheap coins too (0.0097, not 0.0097 rounded).
+function px(n?: number | null): string {
+  if (n === undefined || n === null || isNaN(n)) return "-";
+  const d = n >= 100 ? 2 : n >= 1 ? 4 : n >= 0.01 ? 5 : 7;
+  return n.toFixed(d);
+}
+
 export default function S3360Screen() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
@@ -119,14 +126,28 @@ export default function S3360Screen() {
           </Text>
           {p.rsi_at_entry !== undefined && (
             <View style={styles.setupBadge}>
-              <Text style={styles.setupBadgeText}>RSI {p.rsi_at_entry.toFixed(0)} → 60</Text>
+              <Text style={styles.setupBadgeText}>
+                RSI {p.rsi_at_entry.toFixed(0)}
+                {portfolio?.rsi_target !== undefined ? ` → ${portfolio.rsi_target}` : ""}
+              </Text>
             </View>
           )}
         </View>
         <Text style={styles.posMeta}>
-          Entrata {p.entry.toFixed(4)}
-          {!closed && p.current_price ? `  ·  Attuale ${p.current_price.toFixed(4)}` : ""}
+          Entrata {px(p.fill_price ?? p.entry)}
+          {!closed && p.current_price ? `  ·  Attuale ${px(p.current_price)}` : ""}
+          {closed && p.close_price ? `  ·  Uscita ${px(p.close_price)}` : ""}
         </Text>
+        {!closed && p.exit_level !== undefined && (
+          <Text style={styles.posMeta}>
+            Chiude con RSI ≥ {portfolio?.rsi_target ?? ""} e vendita ≥ {px(p.exit_level)}
+            {p.pct_to_exit_level !== undefined && p.pct_to_exit_level !== null
+              ? p.pct_to_exit_level > 0
+                ? `  ·  mancano ${p.pct_to_exit_level.toFixed(2)}%`
+                : "  ·  livello raggiunto"
+              : ""}
+          </Text>
+        )}
         <View style={styles.posFooter}>
           <Text style={[styles.posPnl, { color: pnlColor }]}>
             {pnl >= 0 ? "+" : ""}
@@ -151,7 +172,12 @@ export default function S3360Screen() {
         <View style={{ width: 26 }} />
       </View>
       <Text style={styles.subtitle}>
-        RSI scende sotto 35, esce quando risale a 60
+        {portfolio?.rsi_low_threshold !== undefined && portfolio?.rsi_target !== undefined
+          ? `Compra con RSI sotto ${portfolio.rsi_low_threshold}, vende con RSI sopra ${portfolio.rsi_target}` +
+            (portfolio.hold_below_entry
+              ? ` e solo sopra l'entrata di almeno +${portfolio.min_exit_gain_pct}%`
+              : "")
+          : "Compra quando l'RSI scende sotto la soglia, vende quando risale al target"}
       </Text>
       <SwipeDots index={index} total={total} />
 

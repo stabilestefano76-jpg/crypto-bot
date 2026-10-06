@@ -418,6 +418,14 @@ export type S3360Position = {
   close_reason?: string;
   pnl_usdt?: number;
   closed_at?: string;
+  fill_price?: number;
+  fill_model?: string;
+  entry_cost_pct?: number | null;
+  spread_pct?: number | null;
+  exit_level?: number;
+  pct_to_exit_level?: number | null;
+  close_last_price?: number;
+  exit_cost_pct?: number | null;
 };
 
 export type S3360Portfolio = {
@@ -431,6 +439,10 @@ export type S3360Portfolio = {
   open_count: number;
   closed_count: number;
   win_rate: number;
+  rsi_low_threshold?: number;
+  rsi_target?: number;
+  hold_below_entry?: boolean;
+  min_exit_gain_pct?: number;
 };
 
 export const s3360Api = {
@@ -470,6 +482,14 @@ export type XrpAccPosition = {
   profit_usdt?: number;
   profit_xrp?: number;
   closed_at?: string;
+  fill_price?: number;
+  fill_model?: string;
+  entry_cost_pct?: number | null;
+  spread_pct?: number | null;
+  exit_level?: number;
+  pct_to_exit_level?: number | null;
+  close_last_price?: number;
+  exit_cost_pct?: number | null;
 };
 
 export type XrpAccPortfolio = {
@@ -484,6 +504,10 @@ export type XrpAccPortfolio = {
   closed_positions: XrpAccPosition[];
   open_count: number;
   closed_count: number;
+  rsi_low_threshold?: number;
+  rsi_target?: number;
+  hold_below_entry?: boolean;
+  min_exit_gain_pct?: number;
 };
 
 export const xrpAccApi = {

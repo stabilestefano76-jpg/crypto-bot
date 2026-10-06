@@ -3406,6 +3406,7 @@ async def s3360_withdraw(req: S3360TransferRequest) -> dict[str, Any]:
 
 @api.get("/s3360/portfolio")
 async def s3360_portfolio() -> dict[str, Any]:
+    cfg = await get_config()
     wallet = await get_s3360_wallet()
     open_docs = await db.s3360_positions.find({"status": "open"}, {"_id": 0}).to_list(200)
     closed_docs = await db.s3360_positions.find({"status": "closed"}, {"_id": 0}).sort("closed_at", -1).to_list(500)
@@ -3415,10 +3416,18 @@ async def s3360_portfolio() -> dict[str, Any]:
     open_value = 0.0
     for p in open_docs:
         cur = price_feed.get(p["symbol"]) or await price_feed.price_or_rest(p["symbol"]) or p["entry"]
-        upnl = (cur - p["entry"]) * p["quantity"]
+        # What the bot REALLY paid (the real ask) — the same basis its exit rule
+        # uses. `entry` is only the last price seen when the signal fired.
+        basis = p.get("fill_price", p["entry"])
+        upnl = (cur - basis) * p["quantity"]
         unrealized += upnl
         open_value += cur * p["quantity"]
-        open_out.append({**p, "current_price": cur, "unrealized_pnl": round(upnl, 4)})
+        item = {**p, "current_price": cur, "unrealized_pnl": round(upnl, 4)}
+        if cfg.s3360_hold_below_entry:
+            level = basis * (1 + cfg.s3360_min_exit_gain_pct / 100.0)
+            item["exit_level"] = level  # the real SELL price needed to close (with RSI at the target)
+            item["pct_to_exit_level"] = round((level / cur - 1.0) * 100.0, 2) if cur else None
+        open_out.append(item)
 
     realized = sum(c.get("pnl_usdt", 0.0) for c in closed_docs)
     equity = wallet.get("cash", 0.0) + open_value
@@ -3435,6 +3444,11 @@ async def s3360_portfolio() -> dict[str, Any]:
         "open_count": len(open_docs),
         "closed_count": len(closed_docs),
         "win_rate": round(wins / (wins + losses) * 100, 1) if (wins + losses) else 0.0,
+        # The app shows these instead of numbers written by hand in its text.
+        "rsi_low_threshold": cfg.s3360_low_threshold,
+        "rsi_target": cfg.s3360_high_threshold,
+        "hold_below_entry": cfg.s3360_hold_below_entry,
+        "min_exit_gain_pct": cfg.s3360_min_exit_gain_pct,
     }
 
 
@@ -3768,6 +3782,7 @@ async def xrp_acc_withdraw(req: XrpAccTransferRequest) -> dict[str, Any]:
 
 @api.get("/xrp-accumulation/portfolio")
 async def xrp_acc_portfolio() -> dict[str, Any]:
+    cfg = await get_config()
     wallet = await get_xrp_acc_wallet()
     open_docs = await db.xrp_acc_positions.find({"status": "open"}, {"_id": 0}).to_list(5)
     closed_docs = await db.xrp_acc_positions.find({"status": "closed"}, {"_id": 0}).sort("closed_at", -1).to_list(500)
@@ -3778,7 +3793,13 @@ async def xrp_acc_portfolio() -> dict[str, Any]:
     for p in open_docs:
         cur = price_feed.get(p["symbol"]) or p["entry"]
         open_quantity += p["quantity"]
-        open_out.append({**p, "current_price": cur, "unrealized_pnl": round((cur - p["entry"]) * p["quantity"], 4)})
+        basis = p.get("fill_price", p["entry"])  # what the bot REALLY paid (real ask)
+        item = {**p, "current_price": cur, "unrealized_pnl": round((cur - basis) * p["quantity"], 4)}
+        if cfg.xrp_acc_hold_below_entry:
+            level = basis * (1 + cfg.xrp_acc_min_exit_gain_pct / 100.0)
+            item["exit_level"] = level  # the real SELL price needed to close (with RSI at the target)
+            item["pct_to_exit_level"] = round((level / cur - 1.0) * 100.0, 2) if cur else None
+        open_out.append(item)
 
     permanent_xrp = wallet.get("permanent_xrp", 0.0)
     total_xrp = permanent_xrp + open_quantity
@@ -3797,6 +3818,10 @@ async def xrp_acc_portfolio() -> dict[str, Any]:
         "closed_positions": closed_docs[:100],
         "open_count": len(open_docs),
         "closed_count": len(closed_docs),
+        "rsi_low_threshold": cfg.xrp_acc_low_threshold,
+        "rsi_target": cfg.xrp_acc_high_threshold,
+        "hold_below_entry": cfg.xrp_acc_hold_below_entry,
+        "min_exit_gain_pct": cfg.xrp_acc_min_exit_gain_pct,
     }
 
 
