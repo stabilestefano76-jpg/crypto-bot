@@ -130,7 +130,11 @@ export default function XrpAccumulationScreen() {
     const pnl = closed ? p.profit_usdt ?? 0 : p.unrealized_pnl ?? 0;
     const pnlColor = pnl >= 0 ? colors.success : colors.error;
     return (
-      <View key={p.id} style={styles.posCard}>
+      <Pressable
+        key={p.id}
+        style={styles.posCard}
+        onPress={() => router.push({ pathname: "/operation", params: { kind: "xrp_acc", id: p.id } })}
+      >
         <View style={styles.posTop}>
           <Text style={styles.posSymbol}>
             {p.symbol}
@@ -181,7 +185,8 @@ export default function XrpAccumulationScreen() {
             {closed ? reasonLabel(p.close_reason) : "aperta"} · {timeAgo(closed ? p.closed_at : p.opened_at)}
           </Text>
         </View>
-      </View>
+        <Text style={styles.posMeta}>Tocca per vedere il percorso del prezzo ›</Text>
+      </Pressable>
     );
   };
 

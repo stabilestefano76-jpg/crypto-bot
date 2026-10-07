@@ -571,3 +571,55 @@ export const rsiReversionApi = {
   withdraw: (amount: number) => strategyWalletApi.withdraw(RSI_REVERSION_STRATEGY, amount),
   reset: () => strategyApi.reset(RSI_REVERSION_STRATEGY),
 };
+
+
+// ---------------------------------------------------------------------------
+// Dettaglio di una singola operazione (33/60 o XRP): percorso del prezzo
+// registrato dal bot, livelli di uscita, punto più basso e più alto.
+// ---------------------------------------------------------------------------
+export type PositionTrack = {
+  kind: string;
+  id: string;
+  symbol: string;
+  timeframe?: string | null;
+  status?: string;
+  opened_at?: string;
+  closed_at?: string | null;
+  entry: number;
+  fill_price: number;
+  quantity?: number;
+  notional?: number;
+  rsi_at_entry?: number;
+  current_price?: number | null;
+  pct_vs_entry?: number | null;
+  close_price?: number | null;
+  close_reason?: string | null;
+  pnl_usdt?: number | null;
+  profit_xrp?: number | null;
+  fee_pct?: number;
+  levels: {
+    entry: number;
+    break_even: number;
+    exit_level: number;
+    trailing_stop: number | null;
+    rsi_target: number;
+    peak_price?: number;
+  };
+  stats: {
+    min_price: number | null;
+    min_at?: string | null;
+    max_price: number | null;
+    max_at?: string | null;
+    max_drawdown_pct: number | null;
+    max_gain_pct: number | null;
+    time_below_entry_s: number;
+    age_s: number;
+    samples: number;
+  };
+  samples: [number, number][];
+};
+
+export const trackApi = {
+  get: (kind: string, id: string) =>
+    req<PositionTrack>(`/positions/${kind}/${encodeURIComponent(id)}/track`),
+};

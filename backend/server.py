@@ -2783,6 +2783,112 @@ async def exchange_disconnect() -> dict[str, Any]:
     return {"ok": True}
 
 
+def _downsample_track(samples: list[list[float]], n: int) -> list[list[float]]:
+    """At most `n` points, always keeping the lowest and highest ones so the
+    chart never hides how deep or how high the price went."""
+    if len(samples) <= n:
+        return samples
+    step = len(samples) / n
+    picked = {int(i * step) for i in range(n)} | {len(samples) - 1}
+    picked.add(min(range(len(samples)), key=lambda i: samples[i][1]))
+    picked.add(max(range(len(samples)), key=lambda i: samples[i][1]))
+    return [samples[i] for i in sorted(picked)]
+
+
+@api.get("/positions/{kind}/{position_id}/track")
+async def position_track(kind: str, position_id: str, max_points: int = 400) -> dict[str, Any]:
+    """Everything the position-detail screen needs: the operation, the price
+    path recorded while it was open, the lowest/highest points, how long it
+    spent under its entry price, and the levels the bot is waiting for."""
+    cfg = await get_config()
+    if kind == "s3360":
+        coll, pre = db.s3360_positions, "s3360"
+    elif kind == "xrp_acc":
+        coll, pre = db.xrp_acc_positions, "xrp_acc"
+    else:
+        raise HTTPException(status_code=404, detail="Tipo di operazione sconosciuto")
+    pos = await coll.find_one({"id": position_id}, {"_id": 0})
+    if not pos:
+        raise HTTPException(status_code=404, detail="Operazione non trovata")
+    track = await db.position_tracks.find_one({"_id": position_id}) or {}
+    samples = sorted(([float(a), float(b)] for a, b in track.get("samples", [])), key=lambda x: x[0])
+    fill = pos.get("fill_price", pos["entry"])
+    is_open = pos.get("status") == "open"
+    now_ts = time.time()
+    cur = None
+    if is_open:
+        cur = price_feed.get(pos["symbol"]) or await price_feed.price_or_rest(pos["symbol"]) or None
+    else:
+        cur = pos.get("close_price")
+
+    prices = [x[1] for x in samples] + ([cur] if cur else [])
+    lo_candidates = [v for v in (pos.get("min_price"), *prices) if v]
+    hi_candidates = [v for v in (pos.get("max_price"), *prices) if v]
+    lo = min(lo_candidates) if lo_candidates else None
+    hi = max(hi_candidates) if hi_candidates else None
+    below = 0.0
+    for (t0, p0), (t1, _p1) in zip(samples, samples[1:]):
+        if p0 < fill:
+            below += t1 - t0
+    if is_open and samples and samples[-1][1] < fill:
+        below += max(0.0, now_ts - samples[-1][0])
+    try:
+        opened_ts = datetime.fromisoformat(pos["opened_at"]).timestamp()
+    except Exception:  # noqa: BLE001
+        opened_ts = samples[0][0] if samples else now_ts
+    try:
+        end_ts = now_ts if is_open else datetime.fromisoformat(pos["closed_at"]).timestamp()
+    except Exception:  # noqa: BLE001
+        end_ts = now_ts
+
+    min_net = getattr(cfg, f"{pre}_min_net_profit_pct")
+    levels: dict[str, Any] = {
+        "entry": fill,
+        "break_even": required_exit_price(fill, 0.0, cfg.sim_fee_pct),
+        "exit_level": required_exit_price(fill, min_net, cfg.sim_fee_pct),
+        "trailing_stop": None,
+        "rsi_target": getattr(cfg, f"{pre}_high_threshold"),
+    }
+    if pos.get("trailing_active") and getattr(cfg, f"{pre}_trailing_enabled"):
+        peak = float(pos.get("peak_price") or cur or fill)
+        levels["trailing_stop"] = trailing_stop_price(fill, peak, getattr(cfg, f"{pre}_trailing_pct"), cfg.sim_fee_pct)
+        levels["peak_price"] = peak
+    return {
+        "kind": kind,
+        "id": position_id,
+        "symbol": pos["symbol"],
+        "timeframe": pos.get("timeframe"),
+        "status": pos.get("status"),
+        "opened_at": pos.get("opened_at"),
+        "closed_at": pos.get("closed_at"),
+        "entry": pos["entry"],
+        "fill_price": fill,
+        "quantity": pos.get("quantity"),
+        "notional": pos.get("notional"),
+        "rsi_at_entry": pos.get("rsi_at_entry"),
+        "current_price": cur,
+        "pct_vs_entry": round((cur / fill - 1.0) * 100.0, 3) if cur and fill else None,
+        "close_price": pos.get("close_price"),
+        "close_reason": pos.get("close_reason"),
+        "pnl_usdt": pos.get("pnl_usdt", pos.get("profit_usdt")),
+        "profit_xrp": pos.get("profit_xrp"),
+        "fee_pct": pos.get("fee_pct", cfg.sim_fee_pct),
+        "levels": levels,
+        "stats": {
+            "min_price": lo,
+            "min_at": pos.get("min_at"),
+            "max_price": hi,
+            "max_at": pos.get("max_at"),
+            "max_drawdown_pct": round((lo / fill - 1.0) * 100.0, 3) if lo and fill else None,
+            "max_gain_pct": round((hi / fill - 1.0) * 100.0, 3) if hi and fill else None,
+            "time_below_entry_s": round(below),
+            "age_s": round(max(0.0, end_ts - opened_ts)),
+            "samples": len(samples),
+        },
+        "samples": _downsample_track(samples, max(50, min(max_points, 1000))),
+    }
+
+
 # --- ACCESS GUARD START ---
 # The app sends the code in the X-Access-Key header; for opening links in a
 # browser it can also be passed as ?key=CODE. 10 wrong codes from one address
@@ -3135,6 +3241,83 @@ async def update_trailing_state(coll: Any, p: dict[str, Any], cur: float, activa
     return active, peak
 
 
+# ---- POSITION TRACKING: a "black box" for every open 33/60 and XRP operation ----
+TRACK_MAX_SAMPLES = 6000          # hard cap per operation (a few days at one sample a minute)
+TRACK_KEEP_DAYS = 60              # closed operations keep their path this long
+_track_last_at: dict[str, float] = {}
+_track_ext_at: dict[str, float] = {}
+_track_cleanup_at: float = 0.0
+
+
+def _track_interval(age_s: float) -> float:
+    """Seconds between price samples: one a minute on the first day, then
+    sparser as the operation ages, so a long one stays small."""
+    if age_s <= 86400:
+        return 60.0
+    if age_s <= 7 * 86400:
+        return 300.0
+    return 900.0
+
+
+async def record_track(kind: str, coll: Any, p: dict[str, Any], cur: float) -> None:
+    """Called by the monitors every 3s for each open operation. Writes at most
+    one price sample per interval into `position_tracks`, and keeps the lowest
+    and highest price seen on the operation itself. Never raises: a tracking
+    problem must not get in the way of a trade."""
+    global _track_cleanup_at
+    try:
+        now = time.time()
+        pid = p["id"]
+        iso = datetime.fromtimestamp(now, timezone.utc).isoformat()
+        lo = float(p.get("min_price") or 0.0)
+        hi = float(p.get("max_price") or 0.0)
+        upd: dict[str, Any] = {}
+        if lo == 0.0 or cur < lo * 0.9999:
+            upd["min_price"], upd["min_at"] = cur, iso
+        if hi == 0.0 or cur > hi * 1.0001:
+            upd["max_price"], upd["max_at"] = cur, iso
+        if upd and now - _track_ext_at.get(pid, 0.0) >= 10.0:
+            _track_ext_at[pid] = now
+            await coll.update_one({"id": pid}, {"$set": upd})
+        try:
+            age = now - datetime.fromisoformat(p["opened_at"]).timestamp()
+        except Exception:  # noqa: BLE001
+            age = 0.0
+        if now - _track_last_at.get(pid, 0.0) >= _track_interval(age):
+            _track_last_at[pid] = now
+            await db.position_tracks.update_one(
+                {"_id": pid},
+                {
+                    "$setOnInsert": {"kind": kind, "symbol": p.get("symbol"), "opened_at": p.get("opened_at")},
+                    "$push": {"samples": {"$each": [[round(now, 1), cur]], "$slice": -TRACK_MAX_SAMPLES}},
+                },
+                upsert=True,
+            )
+        if now - _track_cleanup_at > 3600:
+            _track_cleanup_at = now
+            cutoff = datetime.fromtimestamp(now - TRACK_KEEP_DAYS * 86400, timezone.utc).isoformat()
+            await db.position_tracks.delete_many({"closed_at": {"$lt": cutoff}})
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Position tracking skipped: %s", e)
+
+
+async def close_track(pid: str, last_price: float) -> None:
+    """Final price point and closing time: the path stays available for review."""
+    try:
+        now = time.time()
+        await db.position_tracks.update_one(
+            {"_id": pid},
+            {
+                "$set": {"closed_at": datetime.fromtimestamp(now, timezone.utc).isoformat()},
+                "$push": {"samples": {"$each": [[round(now, 1), last_price]], "$slice": -TRACK_MAX_SAMPLES}},
+            },
+        )
+        _track_last_at.pop(pid, None)
+        _track_ext_at.pop(pid, None)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Closing the position track failed: %s", e)
+
+
 async def simulate_fill(
     symbol: str, side: str, ref_price: float, cfg: Config,
     *, quote_budget: Optional[float] = None, base_qty: Optional[float] = None,
@@ -3418,6 +3601,7 @@ async def monitor_s3360_positions() -> None:
             cur = await price_feed.price_or_rest(p["symbol"])
         if not cur or cur <= 0:
             continue
+        await record_track("s3360", db.s3360_positions, p, cur)
 
         hit = None
         tf = p.get("timeframe", "1h")
@@ -3492,6 +3676,7 @@ async def monitor_s3360_positions() -> None:
                 "closed_at": datetime.now(timezone.utc).isoformat(),
             }},
         )
+        await close_track(p["id"], cur)
 
 
 class S3360TransferRequest(BaseModel):
@@ -3815,6 +4000,7 @@ async def monitor_xrp_acc_positions() -> None:
             cur = await price_feed.price_or_rest(p["symbol"])
         if not cur or cur <= 0:
             continue
+        await record_track("xrp_acc", db.xrp_acc_positions, p, cur)
         tf = p.get("timeframe", "1h")
         candles = await exchange.get_klines(p["symbol"], tf)
         closes = [c[2] for c in candles] + [cur]
@@ -3892,6 +4078,7 @@ async def monitor_xrp_acc_positions() -> None:
                 "closed_at": datetime.now(timezone.utc).isoformat(),
             }},
         )
+        await close_track(p["id"], cur)
 
 
 class XrpAccTransferRequest(BaseModel):
