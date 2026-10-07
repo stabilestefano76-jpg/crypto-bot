@@ -117,16 +117,21 @@ export type Config = {
   s3360_max_daily_rise_pct: number;
   s3360_min_atr_pct: number;
   s3360_hold_below_entry: boolean;
-  s3360_min_exit_gain_pct: number;
+  s3360_min_net_profit_pct: number;
+  s3360_trailing_enabled: boolean;
+  s3360_trailing_pct: number;
   xrp_acc_enabled: boolean;
   xrp_acc_timeframes: string[];
   xrp_acc_rsi_period: number;
   xrp_acc_low_threshold: number;
   xrp_acc_high_threshold: number;
   xrp_acc_hold_below_entry: boolean;
-  xrp_acc_min_exit_gain_pct: number;
+  xrp_acc_min_net_profit_pct: number;
+  xrp_acc_trailing_enabled: boolean;
+  xrp_acc_trailing_pct: number;
   sim_realistic_fills: boolean;
   sim_fallback_slippage_pct: number;
+  sim_fee_pct: number;
   regime_risk_reduction_pct: number;
   live_strategies: string[];
 };
@@ -436,7 +441,12 @@ export type S3360Position = {
   exit_level?: number;
   pct_to_exit_level?: number | null;
   close_last_price?: number;
+  fee_pct?: number;
   exit_cost_pct?: number | null;
+  trailing_active?: boolean;
+  peak_price?: number;
+  trailing_stop?: number;
+  break_even_price?: number;
 };
 
 export type S3360Portfolio = {
@@ -453,7 +463,10 @@ export type S3360Portfolio = {
   rsi_low_threshold?: number;
   rsi_target?: number;
   hold_below_entry?: boolean;
-  min_exit_gain_pct?: number;
+  min_net_profit_pct?: number;
+  fee_pct?: number;
+  trailing_enabled?: boolean;
+  trailing_pct?: number;
 };
 
 export const s3360Api = {
@@ -500,7 +513,12 @@ export type XrpAccPosition = {
   exit_level?: number;
   pct_to_exit_level?: number | null;
   close_last_price?: number;
+  fee_pct?: number;
   exit_cost_pct?: number | null;
+  trailing_active?: boolean;
+  peak_price?: number;
+  trailing_stop?: number;
+  break_even_price?: number;
 };
 
 export type XrpAccPortfolio = {
@@ -518,7 +536,10 @@ export type XrpAccPortfolio = {
   rsi_low_threshold?: number;
   rsi_target?: number;
   hold_below_entry?: boolean;
-  min_exit_gain_pct?: number;
+  min_net_profit_pct?: number;
+  fee_pct?: number;
+  trailing_enabled?: boolean;
+  trailing_pct?: number;
 };
 
 export const xrpAccApi = {

@@ -41,6 +41,13 @@ function px(n?: number | null): string {
   return n.toFixed(d);
 }
 
+// Human label for why a trade was closed.
+function reasonLabel(r?: string): string {
+  if (r === "target_rsi_raggiunto") return "target RSI";
+  if (r === "trailing_stop") return "trailing";
+  return r ?? "";
+}
+
 export default function S3360Screen() {
   const insets = useSafeAreaInsets();
   const router = useRouter();
@@ -148,6 +155,11 @@ export default function S3360Screen() {
               : ""}
           </Text>
         )}
+        {!closed && p.trailing_active && p.trailing_stop !== undefined && (
+          <Text style={styles.posMeta}>
+            Trailing attivo  ·  massimo {px(p.peak_price)}  ·  vende se scende a {px(p.trailing_stop)}
+          </Text>
+        )}
         <View style={styles.posFooter}>
           <Text style={[styles.posPnl, { color: pnlColor }]}>
             {pnl >= 0 ? "+" : ""}
@@ -155,7 +167,7 @@ export default function S3360Screen() {
             {p.notional ? ` (${pnl >= 0 ? "+" : ""}${((pnl / p.notional) * 100).toFixed(2)}%)` : ""}
           </Text>
           <Text style={styles.posTime}>
-            {closed ? p.close_reason : "aperta"} · {timeAgo(closed ? p.closed_at : p.opened_at)}
+            {closed ? reasonLabel(p.close_reason) : "aperta"} · {timeAgo(closed ? p.closed_at : p.opened_at)}
           </Text>
         </View>
       </View>
@@ -175,7 +187,7 @@ export default function S3360Screen() {
         {portfolio?.rsi_low_threshold !== undefined && portfolio?.rsi_target !== undefined
           ? `Compra con RSI sotto ${portfolio.rsi_low_threshold}, vende con RSI sopra ${portfolio.rsi_target}` +
             (portfolio.hold_below_entry
-              ? ` e solo sopra l'entrata di almeno +${portfolio.min_exit_gain_pct}%`
+              ? ` e solo con guadagno netto di almeno +${portfolio.min_net_profit_pct}% (commissioni ${portfolio.fee_pct}% per lato)`
               : "")
           : "Compra quando l'RSI scende sotto la soglia, vende quando risale al target"}
       </Text>

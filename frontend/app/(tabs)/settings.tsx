@@ -558,30 +558,56 @@ export default function SettingsScreen() {
                 Con 0 il filtro è spento.
               </Text>
               <ToggleRow
-                label="Non chiudere sotto il prezzo di entrata"
+                label="Chiudi solo con guadagno netto minimo"
                 value={cfg.s3360_hold_below_entry}
                 onChange={(v) => update({ s3360_hold_below_entry: v })}
                 testID="toggle-s3360-hold-below-entry"
               />
               <NumRow
-                label="Margine minimo sopra l'entrata per chiudere (%)"
-                value={cfg.s3360_min_exit_gain_pct}
-                onChange={(v) => update({ s3360_min_exit_gain_pct: v })}
+                label="Guadagno netto minimo per chiudere (%)"
+                value={cfg.s3360_min_net_profit_pct}
+                onChange={(v) => update({ s3360_min_net_profit_pct: v })}
                 step={0.05}
-                testID="input-s3360-min-exit-gain"
+                testID="input-s3360-min-net-profit"
+              />
+              <ToggleRow
+                label="Trailing dopo il guadagno minimo"
+                value={cfg.s3360_trailing_enabled}
+                onChange={(v) => update({ s3360_trailing_enabled: v })}
+                testID="toggle-s3360-trailing"
+              />
+              <NumRow
+                label="Distanza del trailing dal massimo (%)"
+                value={cfg.s3360_trailing_pct}
+                onChange={(v) => update({ s3360_trailing_pct: v })}
+                step={0.05}
+                testID="input-s3360-trailing-pct"
               />
               <Text style={styles.scoreHintText}>
+                Trailing: appena il prezzo supera il livello del guadagno
+                netto minimo, il bot comincia a seguire il prezzo massimo. Se
+                poi il prezzo scende dal massimo della distanza impostata,
+                 vende. Non vende mai a un prezzo che non copre le
+                commissioni: se un calo improvviso porta il prezzo sotto il
+                pareggio, la posizione aspetta. Il target RSI resta il motivo
+                principale di uscita: se arriva prima, esce lì. Il trailing
+                funziona solo con l&apos;interruttore del guadagno netto
+                minimo acceso.
+              </Text>
+              <Text style={styles.scoreHintText}>
                 Con l&apos;interruttore acceso, quando l&apos;RSI arriva al
-                target ma il prezzo è ancora sotto l&apos;entrata (più il
-                margine), l&apos;operazione resta aperta e aspetta: chiude
-                solo quando le due condizioni sono vere insieme. Il margine di
-                0,25% copre le commissioni di andata e ritorno (0,2%), così
-                una chiusura non è mai in perdita netta. Attenzione: senza
-                stop né limite di tempo, una moneta che non recupera tiene
-                occupato il suo posto, e quel capitale resta bloccato finché
-                non torna sopra l&apos;entrata. Le perdite non si realizzano
-                più ma restano nel capitale come perdita sulla carta: guarda il
-                capitale, non la percentuale di vincite.
+                target ma il prezzo di vendita vero non lascia almeno il
+                guadagno netto minimo dopo le commissioni ({cfg.sim_fee_pct}%
+                per lato), l&apos;operazione resta aperta e aspetta: chiude
+                solo quando le due condizioni sono vere insieme. Il bot
+                calcola da solo il prezzo che serve: con i valori attuali
+                circa +{(((1 + cfg.s3360_min_net_profit_pct / 100 + cfg.sim_fee_pct / 100) / (1 - cfg.sim_fee_pct / 100) - 1) * 100).toFixed(2)}% sopra il
+                prezzo pagato. Attenzione: senza stop né limite di tempo, una
+                moneta che non recupera tiene occupato il suo posto, e quel
+                capitale resta bloccato finché non torna al livello
+                necessario. Le perdite non si realizzano più ma restano nel
+                capitale come perdita sulla carta: guarda il capitale, non la
+                percentuale di vincite.
               </Text>
               <Text style={styles.scoreHintText}>
                 Entra appena l&apos;RSI scende sotto {cfg.s3360_low_threshold}{" "}
@@ -639,18 +665,42 @@ export default function SettingsScreen() {
                 testID="input-xrp-acc-high"
               />
               <ToggleRow
-                label="Non vendere sotto il prezzo di entrata"
+                label="Vendi solo con guadagno netto minimo"
                 value={cfg.xrp_acc_hold_below_entry}
                 onChange={(v) => update({ xrp_acc_hold_below_entry: v })}
                 testID="toggle-xrp-acc-hold-below-entry"
               />
               <NumRow
-                label="Margine minimo sopra l'entrata per vendere (%)"
-                value={cfg.xrp_acc_min_exit_gain_pct}
-                onChange={(v) => update({ xrp_acc_min_exit_gain_pct: v })}
+                label="Guadagno netto minimo per vendere (%)"
+                value={cfg.xrp_acc_min_net_profit_pct}
+                onChange={(v) => update({ xrp_acc_min_net_profit_pct: v })}
                 step={0.05}
-                testID="input-xrp-acc-min-exit-gain"
+                testID="input-xrp-acc-min-net-profit"
               />
+              <ToggleRow
+                label="Trailing dopo il guadagno minimo"
+                value={cfg.xrp_acc_trailing_enabled}
+                onChange={(v) => update({ xrp_acc_trailing_enabled: v })}
+                testID="toggle-xrp-acc-trailing"
+              />
+              <NumRow
+                label="Distanza del trailing dal massimo (%)"
+                value={cfg.xrp_acc_trailing_pct}
+                onChange={(v) => update({ xrp_acc_trailing_pct: v })}
+                step={0.05}
+                testID="input-xrp-acc-trailing-pct"
+              />
+              <Text style={styles.scoreHintText}>
+                Trailing: appena il prezzo supera il livello del guadagno
+                netto minimo, il bot comincia a seguire il prezzo massimo. Se
+                poi il prezzo scende dal massimo della distanza impostata,
+                 vende. Non vende mai a un prezzo che non copre le
+                commissioni: se un calo improvviso porta il prezzo sotto il
+                pareggio, la posizione aspetta. Il target RSI resta il motivo
+                principale di uscita: se arriva prima, esce lì. Il trailing
+                funziona solo con l&apos;interruttore del guadagno netto
+                minimo acceso.
+              </Text>
               <Text style={styles.scoreHintText}>
                 Strategia dedicata solo a XRPUSDC, con un obiettivo diverso
                 dalle altre: non il guadagno in dollari, ma possedere più XRP
@@ -663,14 +713,14 @@ export default function SettingsScreen() {
                 successivo, e SOLO il profitto viene convertito subito in XRP
                 e tenuto per sempre — così il capitale di trading non si
                 gonfia mai restando bloccato in USDC, e la riserva di XRP
-                cresce ad ogni ciclo vincente. Con l&apos;interruttore
-                &quot;Non vendere sotto il prezzo di entrata&quot; acceso, se
-                l&apos;RSI arriva al target ma il prezzo è ancora sotto
-                l&apos;entrata (più il margine), il bot aspetta e non vende:
-                vende solo quando le due condizioni sono vere insieme. Il
-                margine copre le commissioni di andata e ritorno (0,2%) con un
-                po&apos; di spazio, così una vendita non è mai in perdita
-                netta. Attenzione: XRP investe tutto il capitale in una sola
+                cresce ad ogni ciclo vincente. Con l&apos;interruttore &quot;Vendi solo con guadagno netto
+                minimo&quot; acceso, se l&apos;RSI arriva al target ma il
+                prezzo di vendita vero non lascia almeno il guadagno netto
+                minimo dopo le commissioni ({cfg.sim_fee_pct}% per lato), il
+                bot aspetta e non vende: vende solo quando le due condizioni
+                sono vere insieme. Il prezzo che serve lo calcola da solo: con
+                i valori attuali circa +{(((1 + cfg.xrp_acc_min_net_profit_pct / 100 + cfg.sim_fee_pct / 100) / (1 - cfg.sim_fee_pct / 100) - 1) * 100).toFixed(2)}% sopra il prezzo
+                pagato. Attenzione: XRP investe tutto il capitale in una sola
                 operazione, quindi se il prezzo non recupera, tutto il
                 capitale resta fermo finché non torna sopra l&apos;entrata e
                 il bot non può aprire altre operazioni. Con l&apos;interruttore
@@ -681,7 +731,7 @@ export default function SettingsScreen() {
             </Section>
           )}
 
-          <Section title="Simulazione prezzi reali (33/60 e XRP)">
+          <Section title="Simulazione: prezzi reali e commissioni">
             <ToggleRow
               label="Compra e vendi ai prezzi veri di Bybit"
               value={cfg.sim_realistic_fills}
@@ -695,6 +745,13 @@ export default function SettingsScreen() {
               step={0.01}
               testID="input-sim-fallback-slippage"
             />
+            <NumRow
+              label="Commissione per operazione (% per lato)"
+              value={cfg.sim_fee_pct}
+              onChange={(v) => update({ sim_fee_pct: v })}
+              step={0.01}
+              testID="input-sim-fee"
+            />
             <Text style={styles.scoreHintText}>
               Con l&apos;interruttore acceso, le operazioni di prova di 33/60
               e di XRP Accumulation non usano più l&apos;ultimo prezzo
@@ -703,12 +760,16 @@ export default function SettingsScreen() {
               acquisto più alto, scendendo di livello se il tuo ordine è più
               grande del primo. Così i risultati di prova includono lo scarto
               tra i due prezzi (spread) e sono più vicini a quelli veri. Il
-              controllo &quot;non chiudere sotto il prezzo di entrata&quot;
-              guarda il prezzo di vendita vero, non l&apos;ultimo. Se il
+              controllo del guadagno netto minimo guarda il prezzo di vendita
+              vero, non l&apos;ultimo. Se il
               libro non si legge (o è troppo sottile per l&apos;ordine) il bot
               usa l&apos;ultimo prezzo peggiorato dello scarto di riserva.
-              Vale solo per le operazioni nuove: quelle già aperte o chiuse
-              non cambiano. Spento, tutto torna come prima.
+              Vale per ogni nuova apertura e per ogni vendita, anche delle
+              posizioni già aperte; le operazioni già chiuse non cambiano. La
+              commissione si applica a entrambe le gambe di ogni operazione
+              di prova (33/60, XRP e RSI Reversion): imposta quella che paghi
+              davvero su Bybit. Spegnendo l&apos;interruttore dei prezzi
+              reali si torna all&apos;ultimo prezzo (la commissione resta).
             </Text>
           </Section>
 

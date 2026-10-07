@@ -59,7 +59,7 @@ TF_MAP = {
 }
 TF_SECONDS = {"5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400, "1d": 86400}
 DEFAULT_TIMEFRAMES = ["1h", "4h"]
-PAPER_FEE_PCT = 0.001  # 0.10% Bybit spot fee per side (open + close = 0.20% round trip) — same real-world assumption as SCALPING_FEE_PCT/RSI_REBOUND_FEE_PCT, used here only to estimate a safe trailing-activation margin for the traditional strategies (their booked PnL itself doesn't model fees)
+
 CANDLE_LIMIT = 200  # candles fetched per pair/tf
 
 # ---------------------------------------------------------------------------
@@ -97,7 +97,7 @@ class Config(BaseModel):
     timeout_1d: int = 3
     timeout_min_r: float = 0.3  # move to BE if profit_in_R below this at timeout
     breakeven_safety_pct: float = 0.05  # % safety margin added to breakeven
-    default_fee_rate: float = 0.001  # fallback maker/taker if API unavailable
+    default_fee_rate: float = 0.001  # LEGACY: no longer read, replaced by sim_fee_pct (kept so stored configs still load)
     trailing_activation_r: float = 1.0  # activate trailing when profit_in_R >= this
     partial_close_enabled: bool = True
     partial_close_r: float = 1.0
@@ -161,16 +161,21 @@ class Config(BaseModel):
     s3360_max_daily_rise_pct: float = 0.0  # entry filter: skip a coin that is already up more than this % since the current UTC day opened (0 = filter off, the old behaviour)
     s3360_min_atr_pct: float = 0.0  # entry filter: skip when the timeframe's ATR (as % of price) is below this — in a dead-flat market the rebounds are tiny (0 = filter off)
     s3360_hold_below_entry: bool = True  # exit rule: when RSI reaches the target but the price is still below the entry (plus the margin below), keep the position open instead of closing at a loss
-    s3360_min_exit_gain_pct: float = 0.25  # how far above the entry price the exit must be (0.25 ≈ round-trip fees 0.2% plus a hair, so a close is never a net loss); only used with hold_below_entry
+    s3360_min_net_profit_pct: float = 0.3  # exit rule: the sale must leave at least this NET profit (%) after the fees on both legs; the bot works out the price needed (only used with hold_below_entry)
+    s3360_trailing_enabled: bool = True  # once the minimum net profit is reached, follow the highest price and sell if it falls back by s3360_trailing_pct — never below break-even (fees covered); only used with hold_below_entry
+    s3360_trailing_pct: float = 0.3  # how far (%) below the highest price the trailing sells
     xrp_acc_enabled: bool = True
     xrp_acc_timeframes: list[str] = Field(default_factory=lambda: ["1h"])
     xrp_acc_rsi_period: int = 14
     xrp_acc_low_threshold: float = 25.0  # entry: buy ALL trading capital when RSI drops to/below this
     xrp_acc_high_threshold: float = 60.0  # exit: sell everything when RSI rises to/above this
     xrp_acc_hold_below_entry: bool = True  # exit rule: when RSI reaches the target but the price is still below the entry (plus the margin below), keep the position open instead of selling at a loss
-    xrp_acc_min_exit_gain_pct: float = 0.4  # how far above the entry price the exit must be (0.4 = round-trip fees 0.2% plus a cushion, so a sale is never a net loss); only used with hold_below_entry
+    xrp_acc_min_net_profit_pct: float = 0.3  # exit rule: the sale must leave at least this NET profit (%) after the fees on both legs; the bot works out the price needed (only used with hold_below_entry)
+    xrp_acc_trailing_enabled: bool = True  # once the minimum net profit is reached, follow the highest price and sell if it falls back by xrp_acc_trailing_pct — never below break-even (fees covered); only used with hold_below_entry
+    xrp_acc_trailing_pct: float = 0.3  # how far (%) below the highest price the trailing sells
     sim_realistic_fills: bool = True  # paper fills of 33/60 and XRP Accumulation use the REAL order book (buy at the ask side, sell at the bid side, walking the depth) instead of the last traded price
     sim_fallback_slippage_pct: float = 0.05  # when the order book cannot be read (or is too thin for the order), the fill is the last price made worse by this % per side
+    sim_fee_pct: float = 0.25  # exchange fee per side (%), charged on both legs of every paper trade — the Bybit EU rate the account actually pays (taker)
 
     regime_risk_reduction_pct: float = 50.0  # position size cut applied to RSI Reversion and 33/60 whenever BTC's regime isn't clearly bullish (range or bearish) — trims risk during an uncertain/consolidating phase instead of sizing every trade the same
 
@@ -922,10 +927,13 @@ async def close_paper_position(pos: dict[str, Any], exit_price: float, outcome: 
     entry = float(pos.get("fill_price") or pos["entry"])  # real fill for PnL
     qty = float(pos["quantity"])
     pcfg = await get_paper_config()
+    # Fees on both legs, like the other strategies: this pipeline used to book
+    # the profit GROSS of fees.
+    fee = (entry * qty + exit_price * qty) * ((await get_config()).sim_fee_pct / 100.0)
     if pos["side"] == "long":
-        pnl = (exit_price - entry) * qty
+        pnl = (exit_price - entry) * qty - fee
     else:
-        pnl = (entry - exit_price) * qty
+        pnl = (entry - exit_price) * qty - fee
     pnl_pct = (pnl / (entry * qty)) * 100 if entry > 0 and qty > 0 else 0.0
     strategy = pos.get("strategy", "counter_trend")
     trade = PaperTrade(
@@ -948,8 +956,8 @@ async def close_paper_position(pos: dict[str, Any], exit_price: float, outcome: 
     await db.paper_trades.insert_one(trade.model_dump())
     await db.paper_positions.delete_one({"id": pos["id"]})
     if pcfg.trading_mode == "spot" and pos["side"] == "long":
-        # Unlock notional and add PnL: cash += exit * qty
-        await adjust_effective_cash(strategy, exit_price * qty)
+        # Unlock notional and add PnL: cash += exit * qty - fees
+        await adjust_effective_cash(strategy, exit_price * qty - fee)
     else:
         await adjust_effective_cash(strategy, pnl)
     await db.signals.update_one(
@@ -991,19 +999,15 @@ async def close_paper_position(pos: dict[str, Any], exit_price: float, outcome: 
 # ===========================================================================
 # POSITION MANAGEMENT: Timeout + Breakeven + Trailing Stop (additive modules)
 # ===========================================================================
-_fee_cache: dict[str, tuple[float, float]] = {}
 _funding_cache: dict[str, float] = {}
 
 
 async def get_trade_fees(symbol: str, cfg: Config) -> tuple[float, float]:
-    """Maker/taker fee rates. Bybit spot/linear default taker is ~0.1% / 0.055%.
-    For paper trading we use the configured default_fee_rate; real per-symbol
-    fees via the signed Bybit API are wired in the execution phase."""
-    if symbol in _fee_cache:
-        return _fee_cache[symbol]
-    maker = taker = cfg.default_fee_rate
-    _fee_cache[symbol] = (maker, taker)
-    return maker, taker
+    """Maker/taker fee rates (as fractions). Paper trading charges the single
+    configured rate `sim_fee_pct` on every strategy; reading the real
+    per-symbol rates from the signed Bybit API is part of the execution phase."""
+    rate = cfg.sim_fee_pct / 100.0
+    return rate, rate
 
 
 async def get_funding_rate(symbol: str, cfg: Config) -> float:
@@ -1179,7 +1183,8 @@ async def _close_fraction(pos: dict[str, Any], price: float, frac: float,
     if close_qty <= 0:
         return float(pos["quantity"])
     entry = float(pos.get("fill_price") or pos["entry"])
-    pnl = (price - entry) * close_qty if pos["side"] == "long" else (entry - price) * close_qty
+    fee = (entry * close_qty + price * close_qty) * ((await get_config()).sim_fee_pct / 100.0)
+    pnl = ((price - entry) * close_qty if pos["side"] == "long" else (entry - price) * close_qty) - fee
     pnl_pct = (pnl / (entry * close_qty)) * 100 if entry > 0 else 0.0
     pcfg = await get_paper_config()
     strategy = pos.get("strategy", "counter_trend")
@@ -1195,7 +1200,7 @@ async def _close_fraction(pos: dict[str, Any], price: float, frac: float,
     )
     await db.paper_trades.insert_one(trade.model_dump())
     if pcfg.trading_mode == "spot" and pos["side"] == "long":
-        await adjust_effective_cash(strategy, price * close_qty)
+        await adjust_effective_cash(strategy, price * close_qty - fee)
     else:
         await adjust_effective_cash(strategy, pnl)
     upd: dict[str, Any] = {"quantity": round(remain_qty, 8)}
@@ -1244,7 +1249,7 @@ async def manage_rsi_reversion_position(pos: dict[str, Any], price: float, cfg: 
         notional = entry * qty
         gross_pnl_so_far = (price - entry) * qty if long else (entry - price) * qty
         exit_notional_now = price * qty
-        fees_now = (notional + exit_notional_now) * PAPER_FEE_PCT
+        fees_now = (notional + exit_notional_now) * (cfg.sim_fee_pct / 100.0)
         margin_now = notional * cfg.rsi_rev_trailing_activation_margin_pct / 100
         if gross_pnl_so_far <= fees_now + margin_now:
             return pos
@@ -3095,6 +3100,41 @@ def walk_book(
     return None
 
 
+def required_exit_price(fill: float, min_net_pct: float, fee_pct: float) -> float:
+    """Lowest sell price that still leaves `min_net_pct` NET profit after the
+    fee on BOTH legs (fee charged on the entry value and on the exit value, as
+    the closing code does). With N the entry value, q the quantity and f the fee:
+        sell*q - (N + sell*q)*f >= N*(1+m)   =>   sell >= fill*(1+m+f)/(1-f)
+    Exact for any fee level; the spread is not in here because the callers
+    compare it with the REAL bid, which already includes it."""
+    m = min_net_pct / 100.0
+    f = fee_pct / 100.0
+    return fill * (1.0 + m + f) / (1.0 - f)
+
+
+def trailing_stop_price(fill: float, peak: float, trail_pct: float, fee_pct: float) -> float:
+    """Price at which the trailing sells: `trail_pct` below the highest price
+    seen, but NEVER below break-even — the price where the fees on both legs are
+    exactly covered — so a trailing exit can never lock in a net loss."""
+    return max(peak * (1.0 - trail_pct / 100.0), required_exit_price(fill, 0.0, fee_pct))
+
+
+async def update_trailing_state(coll: Any, p: dict[str, Any], cur: float, activation_price: float) -> tuple[bool, float]:
+    """Arms the trailing the first time the last price clears `activation_price`
+    (the minimum-net-profit level) and from then on keeps the highest price
+    seen. Saved on the position, so it survives restarts. Returns (active, peak)."""
+    active = bool(p.get("trailing_active"))
+    peak = float(p.get("peak_price") or 0.0)
+    if not active:
+        if cur >= activation_price:
+            active, peak = True, max(peak, cur)
+            await coll.update_one({"id": p["id"]}, {"$set": {"trailing_active": True, "peak_price": peak}})
+    elif cur > peak * 1.0001:  # a new high; ignore sub-0.01% noise to keep database writes low
+        peak = cur
+        await coll.update_one({"id": p["id"]}, {"$set": {"peak_price": peak}})
+    return active, peak
+
+
 async def simulate_fill(
     symbol: str, side: str, ref_price: float, cfg: Config,
     *, quote_budget: Optional[float] = None, base_qty: Optional[float] = None,
@@ -3137,7 +3177,6 @@ async def simulate_fill(
 # ============================================================================
 
 S3360_WALLET_ID = "s3360_wallet_singleton"
-S3360_FEE_PCT = 0.001
 
 
 async def get_s3360_wallet() -> dict[str, Any]:
@@ -3357,7 +3396,7 @@ async def open_s3360_position(symbol: str, tf: str, signal: dict[str, Any], cfg:
 _s3360_hold_log_at: dict[str, float] = {}
 
 
-async def _s3360_hold_log(p: dict[str, Any]) -> None:
+async def _s3360_hold_log(p: dict[str, Any], reason: str = "RSI al target ma prezzo sotto l'entrata: attendo il recupero") -> None:
     """The monitor runs every 3 seconds; write the 'waiting' note at most once
     every 5 minutes per position so it stays visible without flooding the log."""
     now = time.time()
@@ -3366,7 +3405,7 @@ async def _s3360_hold_log(p: dict[str, Any]) -> None:
     _s3360_hold_log_at[p["id"]] = now
     await log_reject(
         p["symbol"], p.get("timeframe", "?"), "s3360",
-        "RSI al target ma prezzo sotto l'entrata: attendo il recupero",
+        reason,
     )
 
 
@@ -3389,33 +3428,51 @@ async def monitor_s3360_positions() -> None:
         # to finish (which could let the touch reverse away unrealized).
         closes = [c[2] for c in candles] + [cur]
         rsis = rsi_wilder(closes, cfg.s3360_rsi_period) if len(closes) > cfg.s3360_rsi_period else []
-        if rsis and rsis[-1] >= cfg.s3360_high_threshold:
-            hit = "target_rsi_raggiunto"
-        if not hit:
-            continue
+        rsi_hit = bool(rsis and rsis[-1] >= cfg.s3360_high_threshold)
 
         fill = p.get("fill_price", p["entry"])
-        margin_price = fill * (1 + cfg.s3360_min_exit_gain_pct / 100.0)
-        if cfg.s3360_hold_below_entry and cur < margin_price:
-            # RSI reached the target but closing now would lock in a loss (or
-            # less than the fees): keep waiting. Both conditions must be true
-            # together — RSI at the target AND the price above the entry.
+        margin_price = required_exit_price(fill, cfg.s3360_min_net_profit_pct, cfg.sim_fee_pct)
+        break_even = required_exit_price(fill, 0.0, cfg.sim_fee_pct)
+        # Trailing: armed when the last price first clears the minimum-net level,
+        # then it follows the highest price. It sells if the price falls back by
+        # s3360_trailing_pct, but never below break-even.
+        trail_hit = False
+        if cfg.s3360_hold_below_entry and cfg.s3360_trailing_enabled:
+            active, peak = await update_trailing_state(db.s3360_positions, p, cur, margin_price)
+            trail_hit = active and cur <= trailing_stop_price(fill, peak, cfg.s3360_trailing_pct, cfg.sim_fee_pct)
+
+        # The RSI target stays the main exit; the trailing protects the profit
+        # when the price turns back before the target is reached.
+        if rsi_hit and (not cfg.s3360_hold_below_entry or cur >= margin_price):
+            hit, floor_price = "target_rsi_raggiunto", margin_price
+        elif trail_hit:
+            hit, floor_price = "trailing_stop", break_even
+        elif rsi_hit:
+            # RSI reached the target but selling now would lock in less than the
+            # minimum net profit: keep waiting. Both conditions must be true
+            # together — RSI at the target AND the price high enough.
             await _s3360_hold_log(p)
             continue
+        else:
+            continue
+        if cfg.s3360_hold_below_entry and cur < floor_price:
+            await _s3360_hold_log(p, "Trailing: il prezzo non copre i costi, attendo" if hit == "trailing_stop" else "RSI al target ma prezzo sotto l'entrata: attendo il recupero")
+            continue
 
-        # The last price clears the margin; now ask what a market sell would
+        # The last price clears the floor; now ask what a market sell would
         # REALLY get (best bid / depth). With the simulation off this is `cur`
         # and costs no request. The book is read at most every 10s per position.
         if cfg.sim_realistic_fills and not book_recheck_due(p["id"]):
             continue
         sell_price, sell_info = await simulate_fill(p["symbol"], "sell", cur, cfg, base_qty=p["quantity"])
-        if cfg.s3360_hold_below_entry and sell_price < margin_price:
-            await _s3360_hold_log(p)  # the price we would really get is still too low
+        if cfg.s3360_hold_below_entry and sell_price < floor_price:
+            # the price we would really get is still too low
+            await _s3360_hold_log(p, "Trailing: il prezzo di vendita vero non copre i costi, attendo" if hit == "trailing_stop" else "RSI al target ma prezzo sotto l'entrata: attendo il recupero")
             continue
 
         gross_pnl = (sell_price - fill) * p["quantity"]
         exit_notional = sell_price * p["quantity"]
-        fees = (p["notional"] + exit_notional) * S3360_FEE_PCT
+        fees = (p["notional"] + exit_notional) * (cfg.sim_fee_pct / 100.0)
         pnl = gross_pnl - fees
         await db.s3360_wallet.update_one(
             {"_id": S3360_WALLET_ID},
@@ -3430,6 +3487,7 @@ async def monitor_s3360_positions() -> None:
                 "exit_fill_model": sell_info["fill_model"],
                 "exit_cost_pct": sell_info["cost_pct"],
                 "exit_spread_pct": sell_info.get("spread_pct"),
+                "fee_pct": cfg.sim_fee_pct,
                 "pnl_usdt": round(pnl, 4),
                 "closed_at": datetime.now(timezone.utc).isoformat(),
             }},
@@ -3502,9 +3560,15 @@ async def s3360_portfolio() -> dict[str, Any]:
         open_value += cur * p["quantity"]
         item = {**p, "current_price": cur, "unrealized_pnl": round(upnl, 4)}
         if cfg.s3360_hold_below_entry:
-            level = basis * (1 + cfg.s3360_min_exit_gain_pct / 100.0)
+            level = required_exit_price(basis, cfg.s3360_min_net_profit_pct, cfg.sim_fee_pct)
             item["exit_level"] = level  # the real SELL price needed to close (with RSI at the target)
             item["pct_to_exit_level"] = round((level / cur - 1.0) * 100.0, 2) if cur else None
+            item["break_even_price"] = required_exit_price(basis, 0.0, cfg.sim_fee_pct)
+            if cfg.s3360_trailing_enabled and p.get("trailing_active"):
+                peak = float(p.get("peak_price") or cur)
+                item["trailing_active"] = True
+                item["peak_price"] = peak
+                item["trailing_stop"] = trailing_stop_price(basis, peak, cfg.s3360_trailing_pct, cfg.sim_fee_pct)
         open_out.append(item)
 
     realized = sum(c.get("pnl_usdt", 0.0) for c in closed_docs)
@@ -3526,7 +3590,10 @@ async def s3360_portfolio() -> dict[str, Any]:
         "rsi_low_threshold": cfg.s3360_low_threshold,
         "rsi_target": cfg.s3360_high_threshold,
         "hold_below_entry": cfg.s3360_hold_below_entry,
-        "min_exit_gain_pct": cfg.s3360_min_exit_gain_pct,
+        "min_net_profit_pct": cfg.s3360_min_net_profit_pct,
+        "fee_pct": cfg.sim_fee_pct,
+        "trailing_enabled": cfg.s3360_trailing_enabled and cfg.s3360_hold_below_entry,
+        "trailing_pct": cfg.s3360_trailing_pct,
     }
 
 
@@ -3612,7 +3679,6 @@ async def s3360_reset() -> dict[str, Any]:
 # ============================================================================
 
 XRP_ACC_WALLET_ID = "xrp_acc_wallet_singleton"
-XRP_ACC_FEE_PCT = 0.001
 XRP_ACC_SYMBOL = "XRPUSDC"
 
 
@@ -3727,7 +3793,7 @@ async def run_xrp_acc_scan() -> None:
 _xrp_acc_hold_log_at: dict[str, float] = {}
 
 
-async def _xrp_acc_hold_log(p: dict[str, Any]) -> None:
+async def _xrp_acc_hold_log(p: dict[str, Any], reason: str = "RSI al target ma prezzo sotto l'entrata: attendo il recupero") -> None:
     """The monitor runs every 3 seconds; write the 'waiting' note at most once
     every 5 minutes per position so it stays visible without flooding the log."""
     now = time.time()
@@ -3736,7 +3802,7 @@ async def _xrp_acc_hold_log(p: dict[str, Any]) -> None:
     _xrp_acc_hold_log_at[p["id"]] = now
     await log_reject(
         p["symbol"], p.get("timeframe", "?"), "xrp_acc",
-        "RSI al target ma prezzo sotto l'entrata: attendo il recupero",
+        reason,
     )
 
 
@@ -3753,32 +3819,50 @@ async def monitor_xrp_acc_positions() -> None:
         candles = await exchange.get_klines(p["symbol"], tf)
         closes = [c[2] for c in candles] + [cur]
         rsis = rsi_wilder(closes, cfg.xrp_acc_rsi_period) if len(closes) > cfg.xrp_acc_rsi_period else []
-        if not (rsis and rsis[-1] >= cfg.xrp_acc_high_threshold):
-            continue
+        rsi_hit = bool(rsis and rsis[-1] >= cfg.xrp_acc_high_threshold)
 
         fill = p.get("fill_price", p["entry"])
-        margin_price = fill * (1 + cfg.xrp_acc_min_exit_gain_pct / 100.0)
-        if cfg.xrp_acc_hold_below_entry and cur < margin_price:
-            # RSI reached the target but selling now would lock in a loss (or
-            # less than the fees): keep waiting. Both conditions must be true
-            # together — RSI at the target AND the price above the entry. All
-            # the trading capital sits in this one position, so while it waits
-            # no new entry can open.
+        margin_price = required_exit_price(fill, cfg.xrp_acc_min_net_profit_pct, cfg.sim_fee_pct)
+        break_even = required_exit_price(fill, 0.0, cfg.sim_fee_pct)
+        # Trailing: armed when the last price first clears the minimum-net level,
+        # then it follows the highest price. It sells if the price falls back by
+        # xrp_acc_trailing_pct, but never below break-even.
+        trail_hit = False
+        if cfg.xrp_acc_hold_below_entry and cfg.xrp_acc_trailing_enabled:
+            active, peak = await update_trailing_state(db.xrp_acc_positions, p, cur, margin_price)
+            trail_hit = active and cur <= trailing_stop_price(fill, peak, cfg.xrp_acc_trailing_pct, cfg.sim_fee_pct)
+
+        # The RSI target stays the main exit; the trailing protects the profit
+        # when the price turns back before the target is reached.
+        if rsi_hit and (not cfg.xrp_acc_hold_below_entry or cur >= margin_price):
+            hit, floor_price = "target_rsi_raggiunto", margin_price
+        elif trail_hit:
+            hit, floor_price = "trailing_stop", break_even
+        elif rsi_hit:
+            # RSI reached the target but selling now would lock in less than the
+            # minimum net profit: keep waiting. All the trading capital sits in
+            # this one position, so while it waits no new entry can open.
             await _xrp_acc_hold_log(p)
             continue
+        else:
+            continue
+        if cfg.xrp_acc_hold_below_entry and cur < floor_price:
+            await _xrp_acc_hold_log(p, "Trailing: il prezzo non copre i costi, attendo" if hit == "trailing_stop" else "RSI al target ma prezzo sotto l'entrata: attendo il recupero")
+            continue
 
-        # The last price clears the margin; now ask what a market sell would
+        # The last price clears the floor; now ask what a market sell would
         # REALLY get (best bid / depth). With the simulation off this is `cur`
         # and costs no request. The book is read at most every 10s.
         if cfg.sim_realistic_fills and not book_recheck_due(p["id"]):
             continue
         sell_price, sell_info = await simulate_fill(p["symbol"], "sell", cur, cfg, base_qty=p["quantity"])
-        if cfg.xrp_acc_hold_below_entry and sell_price < margin_price:
-            await _xrp_acc_hold_log(p)  # the price we would really get is still too low
+        if cfg.xrp_acc_hold_below_entry and sell_price < floor_price:
+            # the price we would really get is still too low
+            await _xrp_acc_hold_log(p, "Trailing: il prezzo di vendita vero non copre i costi, attendo" if hit == "trailing_stop" else "RSI al target ma prezzo sotto l'entrata: attendo il recupero")
             continue
 
         proceeds = sell_price * p["quantity"]
-        fees = (p["notional"] + proceeds) * XRP_ACC_FEE_PCT
+        fees = (p["notional"] + proceeds) * (cfg.sim_fee_pct / 100.0)
         net_proceeds = proceeds - fees
         profit_usdt = net_proceeds - p["notional"]
         # Original trading capital goes back to cash for the next cycle;
@@ -3797,11 +3881,12 @@ async def monitor_xrp_acc_positions() -> None:
         await db.xrp_acc_positions.update_one(
             {"id": p["id"]},
             {"$set": {
-                "status": "closed", "close_price": sell_price, "close_reason": "target_rsi_raggiunto",
+                "status": "closed", "close_price": sell_price, "close_reason": hit,
                 "close_last_price": cur,
                 "exit_fill_model": sell_info["fill_model"],
                 "exit_cost_pct": sell_info["cost_pct"],
                 "exit_spread_pct": sell_info.get("spread_pct"),
+                "fee_pct": cfg.sim_fee_pct,
                 "profit_usdt": round(profit_usdt, 4),
                 "profit_xrp": round(profit_xrp, 6),
                 "closed_at": datetime.now(timezone.utc).isoformat(),
@@ -3874,9 +3959,15 @@ async def xrp_acc_portfolio() -> dict[str, Any]:
         basis = p.get("fill_price", p["entry"])  # what the bot REALLY paid (real ask)
         item = {**p, "current_price": cur, "unrealized_pnl": round((cur - basis) * p["quantity"], 4)}
         if cfg.xrp_acc_hold_below_entry:
-            level = basis * (1 + cfg.xrp_acc_min_exit_gain_pct / 100.0)
+            level = required_exit_price(basis, cfg.xrp_acc_min_net_profit_pct, cfg.sim_fee_pct)
             item["exit_level"] = level  # the real SELL price needed to close (with RSI at the target)
             item["pct_to_exit_level"] = round((level / cur - 1.0) * 100.0, 2) if cur else None
+            item["break_even_price"] = required_exit_price(basis, 0.0, cfg.sim_fee_pct)
+            if cfg.xrp_acc_trailing_enabled and p.get("trailing_active"):
+                peak = float(p.get("peak_price") or cur)
+                item["trailing_active"] = True
+                item["peak_price"] = peak
+                item["trailing_stop"] = trailing_stop_price(basis, peak, cfg.xrp_acc_trailing_pct, cfg.sim_fee_pct)
         open_out.append(item)
 
     permanent_xrp = wallet.get("permanent_xrp", 0.0)
@@ -3899,7 +3990,10 @@ async def xrp_acc_portfolio() -> dict[str, Any]:
         "rsi_low_threshold": cfg.xrp_acc_low_threshold,
         "rsi_target": cfg.xrp_acc_high_threshold,
         "hold_below_entry": cfg.xrp_acc_hold_below_entry,
-        "min_exit_gain_pct": cfg.xrp_acc_min_exit_gain_pct,
+        "min_net_profit_pct": cfg.xrp_acc_min_net_profit_pct,
+        "fee_pct": cfg.sim_fee_pct,
+        "trailing_enabled": cfg.xrp_acc_trailing_enabled and cfg.xrp_acc_hold_below_entry,
+        "trailing_pct": cfg.xrp_acc_trailing_pct,
     }
 
 
