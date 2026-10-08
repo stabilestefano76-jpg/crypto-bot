@@ -558,6 +558,87 @@ export default function SettingsScreen() {
                 Con 0 il filtro è spento.
               </Text>
               <ToggleRow
+                label="Entra solo se il trend della moneta è long"
+                value={cfg.s3360_require_coin_trend}
+                onChange={(v) => update({ s3360_require_coin_trend: v })}
+                testID="toggle-s3360-coin-trend"
+              />
+              <ToggleRow
+                label="Entra solo se il prezzo è sopra la media lunga (200, giornaliera)"
+                value={cfg.s3360_require_above_long_ema}
+                onChange={(v) => update({ s3360_require_above_long_ema: v })}
+                testID="toggle-s3360-above-ema200"
+              />
+              <ToggleRow
+                label="Entra solo se Bitcoin è in trend rialzista"
+                value={cfg.s3360_require_btc_trend}
+                onChange={(v) => update({ s3360_require_btc_trend: v })}
+                testID="toggle-s3360-btc-trend"
+              />
+              <Text style={styles.scoreHintText}>
+                Filtro trend: il trend della moneta è &quot;long&quot; quando la media
+                mobile veloce è sopra quella lenta sul timeframe scelto qui
+                sotto. Bitcoin è &quot;rialzista&quot; con lo stesso giudizio che il bot
+                già usa per ridurre le dimensioni delle operazioni. Se il
+                filtro blocca un ingresso, lo scrive nel registro. Se il
+                trend non si può calcolare, il bot non entra. Non cambia le
+                uscite. Le impostazioni qui sotto valgono anche per XRP
+                Accumulation.
+              </Text>
+              <View style={styles.chipsRow}>
+                {["15m", "30m", "1h", "4h", "1d"].map((t) => {
+                  const active = cfg.trend_filter_timeframe === t;
+                  return (
+                    <Pressable
+                      key={t}
+                      onPress={() => update({ trend_filter_timeframe: t })}
+                      style={[styles.chip, active && styles.chipActive]}
+                      testID={`trend-tf-${t}`}
+                    >
+                      <Text style={[styles.chipText, active && styles.chipTextActive]}>
+                        {t}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+              <NumRow
+                label="Media mobile veloce (periodi)"
+                value={cfg.trend_filter_ema_fast}
+                onChange={(v) => update({ trend_filter_ema_fast: v })}
+                testID="input-trend-ema-fast"
+              />
+              <NumRow
+                label="Media mobile lenta (periodi)"
+                value={cfg.trend_filter_ema_slow}
+                onChange={(v) => update({ trend_filter_ema_slow: v })}
+                testID="input-trend-ema-slow"
+              />
+              <Text style={styles.fieldLabel}>Timeframe della media lunga</Text>
+              <View style={styles.chipsRow}>
+                {["4h", "1d"].map((t) => {
+                  const active = cfg.trend_filter_long_timeframe === t;
+                  return (
+                    <Pressable
+                      key={t}
+                      onPress={() => update({ trend_filter_long_timeframe: t })}
+                      style={[styles.chip, active && styles.chipActive]}
+                      testID={`trend-long-tf-${t}`}
+                    >
+                      <Text style={[styles.chipText, active && styles.chipTextActive]}>
+                        {t}
+                      </Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+              <NumRow
+                label="Media lunga (periodi, di solito 200)"
+                value={cfg.trend_filter_ema_long}
+                onChange={(v) => update({ trend_filter_ema_long: v })}
+                testID="input-trend-ema-long"
+              />
+              <ToggleRow
                 label="Chiudi solo con guadagno netto minimo"
                 value={cfg.s3360_hold_below_entry}
                 onChange={(v) => update({ s3360_hold_below_entry: v })}
@@ -663,6 +744,24 @@ export default function SettingsScreen() {
                 onChange={(v) => update({ xrp_acc_high_threshold: v })}
                 step={1}
                 testID="input-xrp-acc-high"
+              />
+              <ToggleRow
+                label="Entra solo se il trend di XRP è long"
+                value={cfg.xrp_acc_require_coin_trend}
+                onChange={(v) => update({ xrp_acc_require_coin_trend: v })}
+                testID="toggle-xrp-acc-coin-trend"
+              />
+              <ToggleRow
+                label="Entra solo se il prezzo è sopra la media lunga (200, giornaliera)"
+                value={cfg.xrp_acc_require_above_long_ema}
+                onChange={(v) => update({ xrp_acc_require_above_long_ema: v })}
+                testID="toggle-xrp-acc-above-ema200"
+              />
+              <ToggleRow
+                label="Entra solo se Bitcoin è in trend rialzista"
+                value={cfg.xrp_acc_require_btc_trend}
+                onChange={(v) => update({ xrp_acc_require_btc_trend: v })}
+                testID="toggle-xrp-acc-btc-trend"
               />
               <ToggleRow
                 label="Vendi solo con guadagno netto minimo"

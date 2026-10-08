@@ -159,6 +159,17 @@ class Config(BaseModel):
     s3360_high_threshold: float = 60.0  # exit target: RSI reaching this closes the trade
     s3360_max_open_positions: int = 4  # ALSO doubles as the capital-sizing divisor: each trade gets equity/max_open_positions — e.g. 2 slots = 50% each, 4 slots = 25% each. Not just a cap on count.
     s3360_max_daily_rise_pct: float = 0.0  # entry filter: skip a coin that is already up more than this % since the current UTC day opened (0 = filter off, the old behaviour)
+    trend_filter_timeframe: str = "1h"  # trend filter: timeframe on which the coin's own trend is read (EMA fast above EMA slow = trend is long)
+    trend_filter_ema_fast: int = 20  # trend filter: fast EMA period
+    trend_filter_ema_slow: int = 50  # trend filter: slow EMA period
+    s3360_require_coin_trend: bool = False  # entry filter: open only if the coin's own trend is long (EMA fast > EMA slow on trend_filter_timeframe)
+    trend_filter_long_timeframe: str = "1d"  # trend filter: timeframe on which the long EMA is read (daily, to judge the big trend)
+    trend_filter_ema_long: int = 200  # trend filter: long EMA period; with the 'above long EMA' switches on, the price must be above it
+    s3360_require_above_long_ema: bool = False  # entry filter: live price must be above the long EMA (default 200) on trend_filter_timeframe
+    xrp_acc_require_above_long_ema: bool = False  # same, for XRP Accumulation
+    s3360_require_btc_trend: bool = False  # entry filter: open only if BTC's regime is bullish (same regime used for position sizing)
+    xrp_acc_require_coin_trend: bool = False  # same as s3360_require_coin_trend, for XRP Accumulation
+    xrp_acc_require_btc_trend: bool = False  # same as s3360_require_btc_trend, for XRP Accumulation
     s3360_min_atr_pct: float = 0.0  # entry filter: skip when the timeframe's ATR (as % of price) is below this — in a dead-flat market the rebounds are tiny (0 = filter off)
     s3360_hold_below_entry: bool = True  # exit rule: when RSI reaches the target but the price is still below the entry (plus the margin below), keep the position open instead of closing at a loss
     s3360_min_net_profit_pct: float = 0.3  # exit rule: the sale must leave at least this NET profit (%) after the fees on both legs; the bot works out the price needed (only used with hold_below_entry)
@@ -3051,6 +3062,76 @@ async def get_regime_size_multiplier(cfg: Config) -> float:
     return max(0.0, 1.0 - cfg.regime_risk_reduction_pct / 100)
 
 
+_coin_trend_cache: dict[tuple[str, str, int, int], tuple[bool, float]] = {}
+
+
+async def coin_trend_is_long(symbol: str, cfg: Config) -> Optional[bool]:
+    """True if the coin's own trend is long: fast EMA above slow EMA on the
+    trend-filter timeframe. None when it cannot be worked out (not enough
+    candles / error) — callers then block the entry, because the filter is
+    meant to be strict. Cached 2 minutes per coin."""
+    tf = cfg.trend_filter_timeframe
+    fast, slow = cfg.trend_filter_ema_fast, cfg.trend_filter_ema_slow
+    key = (symbol, tf, fast, slow)
+    now = time.time()
+    hit = _coin_trend_cache.get(key)
+    if hit and now - hit[1] < 120:
+        return hit[0]
+    try:
+        candles = await exchange.get_klines(symbol, tf)
+    except Exception:  # noqa: BLE001
+        return None
+    if len(candles) < slow + 5 or fast >= slow:
+        return None
+    closes = [c[2] for c in candles]
+    ok = _ema(closes, fast)[-1] > _ema(closes, slow)[-1]
+    _coin_trend_cache[key] = (ok, now)
+    return ok
+
+
+_long_ema_cache: dict[tuple[str, str, int], tuple[Optional[float], float]] = {}
+
+
+async def long_ema_value(symbol: str, cfg: Config) -> Optional[float]:
+    """Current value of the long EMA (default 200 periods) on its own
+    timeframe (default daily). Fetches twice the period in candles so the EMA is properly
+    warmed up. None if there is not enough history. Cached 2 minutes."""
+    tf, period = cfg.trend_filter_long_timeframe, cfg.trend_filter_ema_long
+    key = (symbol, tf, period)
+    now = time.time()
+    hit = _long_ema_cache.get(key)
+    if hit and now - hit[1] < 120:
+        return hit[0]
+    try:
+        candles = await exchange.get_klines(symbol, tf, limit=max(CANDLE_LIMIT, period * 2))
+    except Exception:  # noqa: BLE001
+        return None
+    if period < 2 or len(candles) < period + 5:
+        return None
+    val = _ema([c[2] for c in candles], period)[-1]
+    _long_ema_cache[key] = (val, now)
+    return val
+
+
+async def trend_filter_block_reason(symbol: str, cfg: Config, need_coin: bool, need_btc: bool, need_above_long: bool = False, price: Optional[float] = None) -> Optional[str]:
+    """None = entry allowed; otherwise the reason (Italian, for the log)."""
+    if need_btc and await get_shared_market_regime(cfg) != "bullish":
+        return "trend BTC non rialzista (filtro trend)"
+    if need_above_long:
+        ema_l = await long_ema_value(symbol, cfg)
+        if ema_l is None or not price:
+            return f"media {cfg.trend_filter_ema_long} non calcolabile (filtro trend)"
+        if price <= ema_l:
+            return f"prezzo sotto la media {cfg.trend_filter_ema_long} su {cfg.trend_filter_long_timeframe} (filtro trend)"
+    if need_coin:
+        up = await coin_trend_is_long(symbol, cfg)
+        if up is None:
+            return "trend della moneta non calcolabile (filtro trend)"
+        if not up:
+            return f"trend della moneta non long su {cfg.trend_filter_timeframe} (filtro trend)"
+    return None
+
+
 async def get_top10_universe(cfg: Config) -> list[str]:
     """Top N coins by 24h volume (proxy for market cap — this exchange has
     no market-cap feed), deduplicated by base asset across all supported
@@ -3491,6 +3572,15 @@ async def run_s3360_scan() -> None:
                 if atr_now is not None and atr_now / live_price * 100.0 < cfg.s3360_min_atr_pct:
                     # Not marked as "attempted": volatility may pick up within this candle.
                     await log_reject(symbol, tf, "s3360", "mercato troppo piatto (filtro volatilità)")
+                    continue
+            if cfg.s3360_require_coin_trend or cfg.s3360_require_btc_trend or cfg.s3360_require_above_long_ema:
+                why = await trend_filter_block_reason(
+                    symbol, cfg, cfg.s3360_require_coin_trend, cfg.s3360_require_btc_trend,
+                    cfg.s3360_require_above_long_ema, live_price,
+                )
+                if why:
+                    # Not marked as "attempted": the trend may turn within this candle.
+                    await log_reject(symbol, tf, "s3360", why)
                     continue
             rise_pct: Optional[float] = None
             day_open = await get_daily_open_price(symbol)
@@ -3946,6 +4036,14 @@ async def run_xrp_acc_scan() -> None:
         if _xrp_acc_last_candle.get(tf) == forming_candle_t:
             await _xrp_acc_log(tf, "stessa candela già tentata")
             continue
+        if cfg.xrp_acc_require_coin_trend or cfg.xrp_acc_require_btc_trend or cfg.xrp_acc_require_above_long_ema:
+            why = await trend_filter_block_reason(
+                XRP_ACC_SYMBOL, cfg, cfg.xrp_acc_require_coin_trend, cfg.xrp_acc_require_btc_trend,
+                cfg.xrp_acc_require_above_long_ema, live_price,
+            )
+            if why:
+                await _xrp_acc_log(tf, why)
+                continue
         _xrp_acc_last_candle[tf] = forming_candle_t
 
         # Paper fill at the real ask (walking the book if needed) instead of

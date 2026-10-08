@@ -115,6 +115,17 @@ export type Config = {
   s3360_high_threshold: number;
   s3360_max_open_positions: number;
   s3360_max_daily_rise_pct: number;
+  trend_filter_timeframe: string;
+  trend_filter_ema_fast: number;
+  trend_filter_ema_slow: number;
+  s3360_require_coin_trend: boolean;
+  trend_filter_long_timeframe: string;
+  trend_filter_ema_long: number;
+  s3360_require_above_long_ema: boolean;
+  xrp_acc_require_above_long_ema: boolean;
+  s3360_require_btc_trend: boolean;
+  xrp_acc_require_coin_trend: boolean;
+  xrp_acc_require_btc_trend: boolean;
   s3360_min_atr_pct: number;
   s3360_hold_below_entry: boolean;
   s3360_min_net_profit_pct: number;
