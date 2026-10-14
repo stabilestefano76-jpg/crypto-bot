@@ -111,7 +111,7 @@ export default function RealScreen() {
           disabled={busy || !st.enabled}
           onPress={() =>
             ask("Ordine di prova", "Compra 6 USDC di XRP e li rivende subito. Costa circa 0,3-0,5% (commissioni).", "Fai la prova", () =>
-              run(() => realApi.test(6), (r) => `Prova ok: speso ${r.speso}, incassato ${r.incassato}. Costo ${r.costo_totale} (${r.costo_pct}%)`))
+              run(() => realApi.test(6), (r) => `Prova ok: speso ${r.speso}, incassato ${r.incassato} (+ resti ${r.resti_rimasti}). Costo ${r.costo_totale} (${r.costo_pct}%)`))
           }
         >
           <Text style={styles.btnText}>Ordine di prova (6 USDC)</Text>

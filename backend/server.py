@@ -3766,7 +3766,7 @@ async def monitor_s3360_positions() -> None:
                 await rlog(f"Vendita reale di {p['symbol']} non riuscita, riprovo tra 30 s", "errore")
                 continue
             sell_price = sell["avg_price"]
-            pnl = sell["net_value"] - p["notional"]
+            pnl = sell["net_value"] + sell.get("dust_value", 0.0) - p["notional"]
             await db.s3360_wallet.update_one({"_id": S3360_WALLET_ID}, {"$inc": {"cash": p["notional"] + pnl}}, upsert=True)
             await db.s3360_positions.update_one({"id": p["id"]}, {"$set": {
                 "status": "closed", "close_price": sell_price, "close_reason": hit, "close_last_price": cur,
@@ -4211,7 +4211,11 @@ async def real_close_position(p: dict[str, Any], cfg: Config, tag: str) -> Optio
         await rlog(f"{p['symbol']}: nulla da vendere (saldo {bal}, minimo {inst['min_qty']}); posizione chiusa come polvere", "errore")
         cur = price_feed.get(p["symbol"]) or p["entry"]
         return {"avg_price": cur, "net_value": float(qty) * cur, "dust": True, "qty": float(qty)}
-    return await real_execute(p["symbol"], "Sell", qty_dec, tag)
+    res = await real_execute(p["symbol"], "Sell", qty_dec, tag)
+    if res:
+        # i resti sotto il passo minimo restano nel conto: li conto al prezzo di vendita
+        res["dust_value"] = max(0.0, float(r.get("net_qty") or p["quantity"]) - float(qty_dec)) * res["avg_price"]
+    return res
 
 
 def real_sell_due(key: str, seconds: float = 30.0) -> bool:
@@ -4322,10 +4326,11 @@ async def real_test_roundtrip(req: RealTestRequest) -> dict[str, Any]:
         await asyncio.sleep(2.0)
     if not sell:
         raise HTTPException(status_code=502, detail=f"Comprato {buy['net_qty']} {inst['base']} ma la vendita NON e' riuscita: vendi a mano su Bybit.")
-    pnl = sell["net_value"] - buy["value"]
+    dust = max(0.0, buy["net_qty"] - sell["qty"]) * sell["avg_price"]
+    pnl = sell["net_value"] + dust - buy["value"]
     await db.real_roundtrips.insert_one({"at": datetime.now(timezone.utc).isoformat(), "symbol": sym, "pnl": pnl})
     return {"symbol": sym, "comprato_a": buy["avg_price"], "venduto_a": sell["avg_price"], "speso": round(buy["value"], 4),
-            "incassato": round(sell["net_value"], 4), "costo_totale": round(-pnl, 4),
+            "incassato": round(sell["net_value"], 4), "resti_rimasti": round(dust, 4), "costo_totale": round(-pnl, 4),
             "costo_pct": round(-pnl / buy["value"] * 100.0, 3)}
 
 
@@ -4341,7 +4346,7 @@ async def real_close_all() -> dict[str, Any]:
             failed += 1
             continue
         cur = sell["avg_price"]
-        pnl = sell["net_value"] - p["notional"]
+        pnl = sell["net_value"] + sell.get("dust_value", 0.0) - p["notional"]
         await db.s3360_wallet.update_one({"_id": S3360_WALLET_ID}, {"$inc": {"cash": p["notional"] + pnl}}, upsert=True)
         await db.s3360_positions.update_one({"id": p["id"]}, {"$set": {
             "status": "closed", "close_price": cur, "close_reason": "chiusura_manuale_reale", "close_last_price": cur,
