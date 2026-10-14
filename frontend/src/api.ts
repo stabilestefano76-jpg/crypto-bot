@@ -634,3 +634,37 @@ export const trackApi = {
   get: (kind: string, id: string) =>
     req<PositionTrack>(`/positions/${kind}/${encodeURIComponent(id)}/track`),
 };
+
+// ---- Trading reale ----
+export type RealLogRow = { at: string; level: string; text: string };
+export type RealStatus = {
+  enabled: boolean;
+  live_strategies: string[];
+  max_order: number;
+  max_total: number;
+  daily_loss_limit: number;
+  daily_pnl: number;
+  exposure: number;
+  password_active: boolean;
+  key_connected: boolean;
+  open_positions: { symbol: string; notional: number; fill_price: number; quantity: number; opened_at: string }[];
+  log: RealLogRow[];
+};
+export type RealTestResult = {
+  symbol: string;
+  comprato_a: number;
+  venduto_a: number;
+  speso: number;
+  incassato: number;
+  costo_totale: number;
+  costo_pct: number;
+};
+export const realApi = {
+  status: () => req<RealStatus>("/real/status"),
+  save: (patch: Record<string, unknown>) =>
+    req<Record<string, unknown>>("/real/settings", { method: "PUT", body: JSON.stringify(patch) }),
+  stop: () => req<{ ok: boolean }>("/real/stop", { method: "POST" }),
+  test: (amount: number) =>
+    req<RealTestResult>("/real/test-roundtrip", { method: "POST", body: JSON.stringify({ symbol: "XRPUSDC", amount }) }),
+  closeAll: () => req<{ chiuse: number; non_riuscite: number }>("/real/close-all", { method: "POST" }),
+};

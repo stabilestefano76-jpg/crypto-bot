@@ -114,6 +114,10 @@ class Config(BaseModel):
     post_tp1_advance_pct: float = 0.5  # % beyond TP1 before moving SL to TP1 (net fees)
     # --- Parallel strategy selection ---
     enabled_strategies: list[str] = Field(default_factory=list)  # only "rsi_reversion" is acted upon here (the other names are ignored); empty = ["rsi_reversion"]
+    real_trading_enabled: bool = False  # master switch for REAL orders (off by default)
+    real_max_order_usdc: float = 30.0
+    real_max_total_usdc: float = 30.0
+    real_daily_loss_usdc: float = 3.0
     live_strategies: list[str] = Field(default_factory=list)  # which strategies currently trade with REAL money via Bybit — empty means ALL of them are in paper mode (the safe default). No trading logic reads this yet; it's wired strategy-by-strategy as each one gets connected to real order placement.
     # --- LEGACY FVG Reversal params (strategy removed; kept for compatibility) ---
     fvgr_rsi_high_tf_ob: float = 80.0
@@ -3631,8 +3635,24 @@ async def open_s3360_position(symbol: str, tf: str, signal: dict[str, Any], cfg:
         return
     # Paper fill at the real ask (walking the book if the order is bigger than
     # the first level) instead of the last traded price.
-    fill_price, fill_info = await simulate_fill(symbol, "buy", ref_price, cfg, quote_budget=notional)
-    quantity = notional / fill_price
+    mode, why = await real_guard(cfg, "s3360")
+    if mode == "blocked":
+        await log_reject(symbol, tf, "s3360", f"reale bloccato: {why}")
+        return
+    real_info = None
+    if mode == "real":
+        rb = await real_open_buy(symbol, notional, cfg, "s3360")
+        if not rb:
+            await log_reject(symbol, tf, "s3360", "ordine reale non eseguito (vedi registro reale)")
+            return
+        real_info = rb
+        notional = rb["value"]
+        fill_price = rb["avg_price"]
+        fill_info = {"fill_model": "reale", "cost_pct": 0.0, "spread_pct": None}
+        quantity = rb["net_qty"]
+    else:
+        fill_price, fill_info = await simulate_fill(symbol, "buy", ref_price, cfg, quote_budget=notional)
+        quantity = notional / fill_price
 
     candles = await exchange.get_klines(symbol, tf)
     highs = [c[3] for c in candles]
@@ -3660,6 +3680,8 @@ async def open_s3360_position(symbol: str, tf: str, signal: dict[str, Any], cfg:
         "status": "open",
         "opened_at": datetime.now(timezone.utc).isoformat(),
     }
+    if real_info:
+        doc["real"] = {k: real_info[k] for k in ("order_id", "link_id", "net_qty", "fee_base", "fee_quote", "qty")}
     await db.s3360_positions.insert_one(dict(doc))
     await db.s3360_wallet.update_one(
         {"_id": S3360_WALLET_ID}, {"$inc": {"cash": -notional}}, upsert=True
@@ -3736,6 +3758,24 @@ async def monitor_s3360_positions() -> None:
         # The last price clears the floor; now ask what a market sell would
         # REALLY get (best bid / depth). With the simulation off this is `cur`
         # and costs no request. The book is read at most every 10s per position.
+        if p.get("real"):
+            if not real_sell_due(p["id"]):
+                continue
+            sell = await real_close_position(p, cfg, "s3360x")
+            if not sell:
+                await rlog(f"Vendita reale di {p['symbol']} non riuscita, riprovo tra 30 s", "errore")
+                continue
+            sell_price = sell["avg_price"]
+            pnl = sell["net_value"] - p["notional"]
+            await db.s3360_wallet.update_one({"_id": S3360_WALLET_ID}, {"$inc": {"cash": p["notional"] + pnl}}, upsert=True)
+            await db.s3360_positions.update_one({"id": p["id"]}, {"$set": {
+                "status": "closed", "close_price": sell_price, "close_reason": hit, "close_last_price": cur,
+                "exit_fill_model": "reale", "fee_pct": cfg.sim_fee_pct, "pnl_usdt": round(pnl, 4),
+                "closed_at": datetime.now(timezone.utc).isoformat(),
+                "real_exit": {k: v for k, v in sell.items() if k != "dust"},
+            }})
+            await close_track(p["id"], cur)
+            continue
         if cfg.sim_realistic_fills and not book_recheck_due(p["id"]):
             continue
         sell_price, sell_info = await simulate_fill(p["symbol"], "sell", cur, cfg, base_qty=p["quantity"])
@@ -3937,6 +3977,380 @@ async def s3360_reset() -> dict[str, Any]:
         upsert=True,
     )
     return {"ok": True}
+
+
+# ============================================================================
+# TRADING REALE su Bybit (spot) — collegato SOLO a 33/60, con i freni:
+#   1. interruttore generale (spento di default) + la strategia deve essere nella lista "reali"
+#   2. serve la password di accesso al bot (BOT_ACCESS_KEY): senza, il reale non si accende
+#   3. tetto per ordine, tetto totale esposto e limite di perdita giornaliera
+#   4. un solo ordine reale alla volta (lock) e controllo vero dell'esecuzione
+#   5. se un ordine non e' chiaro, NON si apre nessuna posizione
+# Le uscite (vendite) restano sempre permesse, anche con l'interruttore spento,
+# cosi' una posizione reale non resta mai "bloccata".
+# ============================================================================
+import urllib.parse as _urlparse
+
+try:
+    import real_orders as RO
+except ImportError:  # pragma: no cover
+    from backend import real_orders as RO
+
+REAL_HARD_MAX_ORDER = 100.0    # nessuna impostazione puo' superare questi tetti
+REAL_HARD_MAX_TOTAL = 200.0
+REAL_HARD_MAX_DAILY_LOSS = 50.0
+REAL_ALLOWED_STRATEGIES = ("s3360",)
+REAL_SETTING_KEYS = ("real_trading_enabled", "real_max_order_usdc", "real_max_total_usdc",
+                     "real_daily_loss_usdc", "live_strategies")
+
+_real_lock = asyncio.Lock()
+_real_sell_at: dict[str, float] = {}
+_inst_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+
+
+async def rlog(text: str, level: str = "info") -> None:
+    try:
+        await db.real_log.insert_one({"at": datetime.now(timezone.utc).isoformat(), "level": level, "text": text})
+        logger.log(logging.WARNING if level != "info" else logging.INFO, "REALE: %s", text)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _bybit_signed(method: str, path: str, params: Optional[dict[str, Any]] = None,
+                        body: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """Chiamata firmata a Bybit. Ritorna il JSON; solleva eccezione se la rete non risponde."""
+    doc = await db.exchange_creds.find_one({"_id": "bybit"}, {"_id": 0})
+    if not doc:
+        raise RuntimeError("Nessuna chiave Bybit collegata")
+    api_key = decrypt_str(doc["api_key"])
+    api_secret = decrypt_str(doc["api_secret"])
+    ts = str(int(time.time() * 1000))
+    recv = "5000"
+    headers = {"X-BAPI-API-KEY": api_key, "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": recv}
+    async with httpx.AsyncClient(base_url=BYBIT_BASE, timeout=12.0) as c:
+        if method == "GET":
+            query = _urlparse.urlencode(params or {})
+            headers["X-BAPI-SIGN"] = RO.sign(api_secret, ts, api_key, recv, query)
+            r = await c.get(path + (("?" + query) if query else ""), headers=headers)
+        else:
+            payload = RO.body_string(body or {})
+            headers["X-BAPI-SIGN"] = RO.sign(api_secret, ts, api_key, recv, payload)
+            headers["Content-Type"] = "application/json"
+            r = await c.post(path, content=payload, headers=headers)
+    try:
+        return r.json()
+    except Exception:  # noqa: BLE001
+        raise RuntimeError(f"Risposta Bybit non leggibile (HTTP {r.status_code})")
+
+
+async def get_instrument(symbol: str) -> Optional[dict[str, Any]]:
+    c = _inst_cache.get(symbol)
+    if c and time.time() - c[0] < 3600:
+        return c[1]
+    try:
+        resp = await _bybit_signed("GET", "/v5/market/instruments-info", {"category": "spot", "symbol": symbol})
+    except Exception as e:  # noqa: BLE001
+        await rlog(f"Regole della coppia {symbol} non lette: {e}", "errore")
+        return None
+    inst = RO.parse_instrument(resp, symbol)
+    if inst:
+        _inst_cache[symbol] = (time.time(), inst)
+    else:
+        await rlog(f"Regole della coppia {symbol} non trovate: {resp.get('retMsg')}", "errore")
+    return inst
+
+
+async def real_balance(coin: str) -> Optional[float]:
+    try:
+        resp = await _bybit_signed("GET", "/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": coin})
+    except Exception as e:  # noqa: BLE001
+        await rlog(f"Saldo {coin} non letto: {e}", "errore")
+        return None
+    if resp.get("retCode") != 0:
+        await rlog(f"Saldo {coin} non letto: {resp.get('retMsg')}", "errore")
+        return None
+    v = RO.coin_available(resp, coin)
+    return None if v is None else float(v)
+
+
+async def real_daily_pnl() -> float:
+    start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    rows = await db.s3360_positions.find(
+        {"status": "closed", "real": {"$exists": True}, "closed_at": {"$gte": start}}, {"pnl_usdt": 1, "_id": 0}
+    ).to_list(1000)
+    extra = await db.real_roundtrips.find({"at": {"$gte": start}}, {"pnl": 1, "_id": 0}).to_list(1000)
+    return float(sum(r.get("pnl_usdt", 0.0) for r in rows) + sum(r.get("pnl", 0.0) for r in extra))
+
+
+async def real_open_exposure() -> float:
+    rows = await db.s3360_positions.find({"status": "open", "real": {"$exists": True}}, {"notional": 1, "_id": 0}).to_list(500)
+    return float(sum(r.get("notional", 0.0) for r in rows))
+
+
+async def real_guard(cfg: Config, strategy: str) -> tuple[str, Optional[str]]:
+    """('paper'|'real'|'blocked', motivo). 'blocked' = la strategia e' reale ma non puo' operare ora."""
+    if strategy not in cfg.live_strategies:
+        return "paper", None
+    if not cfg.real_trading_enabled:
+        return "blocked", "reale spento (interruttore generale)"
+    if not BOT_ACCESS_KEY:
+        return "blocked", "manca la password di accesso al bot"
+    if not await db.exchange_creds.find_one({"_id": "bybit"}, {"_id": 1}):
+        return "blocked", "nessuna chiave Bybit collegata"
+    if await real_daily_pnl() <= -abs(cfg.real_daily_loss_usdc):
+        return "blocked", "limite di perdita giornaliera raggiunto"
+    return "real", None
+
+
+async def real_execute(symbol: str, side: str, amount: Any, tag: str) -> Optional[dict[str, Any]]:
+    """Manda UN ordine di mercato vero e ne verifica l'esecuzione. Ritorna i numeri veri, o None
+    se non e' stato eseguito con certezza (in quel caso nessuna posizione viene aperta/chiusa)."""
+    async with _real_lock:
+        inst = await get_instrument(symbol)
+        if not inst or not inst["trading"]:
+            await rlog(f"{symbol}: coppia non negoziabile o regole non disponibili", "errore")
+            return None
+        link = f"{tag}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
+        body = RO.buy_body(symbol, amount, link, inst) if side == "Buy" else RO.sell_body(symbol, amount, link, inst)
+        q = RO.D(body["qty"])
+        if (side == "Buy" and q < inst["min_amt"]) or (side == "Sell" and q < inst["min_qty"]) or q <= 0:
+            await rlog(f"{symbol}: {side} {body['qty']} sotto il minimo ({inst['min_amt']} / {inst['min_qty']})", "errore")
+            return None
+        await rlog(f"INVIO {side} {symbol} {body['qty']} {'USD' if side == 'Buy' else inst['base']} [{link}]")
+        order_id = None
+        try:
+            r = await _bybit_signed("POST", "/v5/order/create", body=body)
+        except Exception as e:  # noqa: BLE001
+            r = None
+            await rlog(f"Rete incerta durante l'invio: {e}. Controllo se l'ordine e' partito.", "errore")
+        if r is not None:
+            if r.get("retCode") != 0:
+                await rlog(f"Ordine RIFIUTATO da Bybit: {r.get('retCode')} {r.get('retMsg')}", "errore")
+                return None
+            order_id = (r.get("result") or {}).get("orderId")
+        else:
+            await asyncio.sleep(2.0)
+            try:
+                st0, o0 = RO.order_status(await _bybit_signed("GET", "/v5/order/history", {"category": "spot", "orderLinkId": link}))
+            except Exception:  # noqa: BLE001
+                st0, o0 = "Error", {}
+            if st0 in ("NotFound", "Error"):
+                await rlog("Ordine NON partito (nessuna traccia su Bybit).", "errore")
+                return None
+            order_id = o0.get("orderId")
+        st, o = "New", {}
+        for _ in range(15):
+            await asyncio.sleep(0.8)
+            try:
+                st, o = RO.order_status(await _bybit_signed("GET", "/v5/order/history", {"category": "spot", "orderLinkId": link}))
+            except Exception:  # noqa: BLE001
+                continue
+            if st in RO.FINAL_STATUSES:
+                break
+        if st not in RO.FINAL_STATUSES:
+            try:
+                await _bybit_signed("POST", "/v5/order/cancel", body={"category": "spot", "symbol": symbol, "orderLinkId": link})
+            except Exception:  # noqa: BLE001
+                pass
+            await rlog(f"ATTENZIONE: ordine {link} senza esito definitivo (stato {st}); provato ad annullarlo. Controlla su Bybit.", "errore")
+            return None
+        ex = None
+        try:
+            ex = await _bybit_signed("GET", "/v5/execution/list", {"category": "spot", "orderId": order_id or o.get("orderId", "")})
+        except Exception:  # noqa: BLE001
+            ex = None
+        f = RO.parse_fills(ex, o, inst["base"], inst["quote"])
+        if f is None:
+            await rlog(f"Ordine {link} chiuso senza esecuzione (stato {st}, motivo {o.get('rejectReason') or '-'}).", "errore")
+            return None
+        res = {
+            "order_id": order_id, "link_id": link, "base": inst["base"], "quote": inst["quote"],
+            "avg_price": float(f["avg_price"]), "qty": float(f["qty"]), "value": float(f["value"]),
+            "fee_base": float(f["fee_base"]), "fee_quote": float(f["fee_quote"]),
+            "net_qty": float(RO.net_base_after_buy(f)), "net_value": float(RO.net_quote_after_sell(f)),
+            "status": st,
+        }
+        await rlog(f"ESEGUITO {side} {symbol}: {res['qty']} a {res['avg_price']:.6g} (valore {res['value']:.4f}, "
+                   f"commissioni {res['fee_base']:.6g} {inst['base']} + {res['fee_quote']:.6g} {inst['quote']})")
+        return res
+
+
+async def real_open_buy(symbol: str, notional: float, cfg: Config, tag: str) -> Optional[dict[str, Any]]:
+    """Acquisto reale per aprire una posizione: rispetta tetto per ordine, tetto totale e saldo."""
+    inst = await get_instrument(symbol)
+    if not inst:
+        return None
+    room = cfg.real_max_total_usdc - await real_open_exposure()
+    amount = min(notional, cfg.real_max_order_usdc, REAL_HARD_MAX_ORDER, room)
+    bal = await real_balance(inst["quote"])
+    if bal is None:
+        return None
+    amount = min(amount, bal * 0.995)
+    if amount < float(inst["min_amt"]) or amount < 1.0:
+        await rlog(f"{symbol}: importo {amount:.2f} troppo basso (minimo {inst['min_amt']}, saldo {bal:.2f}, spazio {room:.2f})", "errore")
+        return None
+    res = await real_execute(symbol, "Buy", amount, tag)
+    if not res:
+        return None
+    res["value_spent"] = res["value"]
+    return res
+
+
+async def real_close_position(p: dict[str, Any], cfg: Config, tag: str) -> Optional[dict[str, Any]]:
+    """Vendita reale di una posizione. Ritorna net_value (dollari entrati) o None se non riuscita."""
+    r = p.get("real") or {}
+    inst = await get_instrument(p["symbol"])
+    if not inst:
+        return None
+    bal = await real_balance(inst["base"])
+    if bal is None:
+        return None
+    qty = min(float(r.get("net_qty") or p["quantity"]), bal)
+    qty_dec = RO.step_floor(qty, inst["base_step"])
+    if qty_dec < inst["min_qty"] or qty_dec <= 0:
+        await rlog(f"{p['symbol']}: nulla da vendere (saldo {bal}, minimo {inst['min_qty']}); posizione chiusa come polvere", "errore")
+        cur = price_feed.get(p["symbol"]) or p["entry"]
+        return {"avg_price": cur, "net_value": float(qty) * cur, "dust": True, "qty": float(qty)}
+    return await real_execute(p["symbol"], "Sell", qty_dec, tag)
+
+
+def real_sell_due(key: str, seconds: float = 30.0) -> bool:
+    now = time.time()
+    if now - _real_sell_at.get(key, 0.0) < seconds:
+        return False
+    _real_sell_at[key] = now
+    return True
+
+
+def _clamp_real_settings(new_cfg: Config) -> None:
+    if not (0 < new_cfg.real_max_order_usdc <= REAL_HARD_MAX_ORDER):
+        raise HTTPException(status_code=400, detail=f"Tetto per ordine tra 0 e {REAL_HARD_MAX_ORDER:g}")
+    if not (0 < new_cfg.real_max_total_usdc <= REAL_HARD_MAX_TOTAL):
+        raise HTTPException(status_code=400, detail=f"Tetto totale tra 0 e {REAL_HARD_MAX_TOTAL:g}")
+    if not (0 < new_cfg.real_daily_loss_usdc <= REAL_HARD_MAX_DAILY_LOSS):
+        raise HTTPException(status_code=400, detail=f"Perdita giornaliera tra 0 e {REAL_HARD_MAX_DAILY_LOSS:g}")
+    for s in new_cfg.live_strategies:
+        if s not in REAL_ALLOWED_STRATEGIES:
+            raise HTTPException(status_code=400, detail=f"La strategia '{s}' non e' ancora collegabile al reale")
+
+
+@api.get("/real/status")
+async def real_status() -> dict[str, Any]:
+    cfg = await get_config()
+    creds = bool(await db.exchange_creds.find_one({"_id": "bybit"}, {"_id": 1}))
+    log = await db.real_log.find({}, {"_id": 0}).sort("at", -1).to_list(30)
+    open_rows = await db.s3360_positions.find({"status": "open", "real": {"$exists": True}}, {"_id": 0}).to_list(50)
+    return {
+        "enabled": cfg.real_trading_enabled,
+        "live_strategies": cfg.live_strategies,
+        "max_order": cfg.real_max_order_usdc,
+        "max_total": cfg.real_max_total_usdc,
+        "daily_loss_limit": cfg.real_daily_loss_usdc,
+        "daily_pnl": round(await real_daily_pnl(), 4),
+        "exposure": round(await real_open_exposure(), 4),
+        "password_active": bool(BOT_ACCESS_KEY),
+        "key_connected": creds,
+        "open_positions": [{"symbol": r["symbol"], "notional": r.get("notional"), "fill_price": r.get("fill_price"),
+                            "quantity": r.get("quantity"), "opened_at": r.get("opened_at")} for r in open_rows],
+        "log": log,
+    }
+
+
+@api.put("/real/settings")
+async def real_put_settings(body: dict[str, Any]) -> dict[str, Any]:
+    cfg = await get_config()
+    data = cfg.model_dump()
+    for k, v in body.items():
+        if k not in REAL_SETTING_KEYS:
+            raise HTTPException(status_code=400, detail=f"Impostazione sconosciuta: {k}")
+        data[k] = v
+    try:
+        new_cfg = Config(**data)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Valore non valido: {e}")
+    _clamp_real_settings(new_cfg)
+    if new_cfg.real_trading_enabled and not cfg.real_trading_enabled:
+        if not BOT_ACCESS_KEY:
+            raise HTTPException(status_code=400, detail="Prima attiva la password di accesso al bot (variabile BOT_ACCESS_KEY su Railway).")
+        if not await db.exchange_creds.find_one({"_id": "bybit"}, {"_id": 1}):
+            raise HTTPException(status_code=400, detail="Prima collega la chiave Bybit.")
+    await db.config.update_one({"_id": CONFIG_ID}, {"$set": {k: getattr(new_cfg, k) for k in body}}, upsert=True)
+    await rlog("Impostazioni reale cambiate: " + ", ".join(f"{k}={getattr(new_cfg, k)}" for k in body))
+    return {k: getattr(new_cfg, k) for k in REAL_SETTING_KEYS}
+
+
+@api.post("/real/stop")
+async def real_stop() -> dict[str, Any]:
+    """Tasto STOP: spegne il reale (nessun nuovo ordine). Le posizioni aperte restano gestite e si possono chiudere."""
+    await db.config.update_one({"_id": CONFIG_ID}, {"$set": {"real_trading_enabled": False}}, upsert=True)
+    await rlog("STOP: reale spento dall'utente", "errore")
+    return {"ok": True}
+
+
+class RealTestRequest(BaseModel):
+    symbol: str = "XRPUSDC"
+    amount: float = 6.0
+
+
+@api.post("/real/test-roundtrip")
+async def real_test_roundtrip(req: RealTestRequest) -> dict[str, Any]:
+    """Ordine di PROVA: compra per pochi dollari e rivende subito. Serve a vedere che tutto funziona e quanto costa."""
+    cfg = await get_config()
+    if not BOT_ACCESS_KEY:
+        raise HTTPException(status_code=400, detail="Serve la password di accesso al bot.")
+    if not cfg.real_trading_enabled:
+        raise HTTPException(status_code=400, detail="Accendi prima l'interruttore del reale.")
+    if not (0 < req.amount <= min(cfg.real_max_order_usdc, 25.0)):
+        raise HTTPException(status_code=400, detail="Importo di prova troppo alto (massimo 25 e non oltre il tetto per ordine).")
+    sym = req.symbol.upper()
+    inst = await get_instrument(sym)
+    if not inst:
+        raise HTTPException(status_code=400, detail="Regole della coppia non disponibili: vedi il registro.")
+    bal = await real_balance(inst["quote"])
+    if bal is None or bal < req.amount:
+        raise HTTPException(status_code=400, detail=f"Saldo {inst['quote']} insufficiente ({bal}).")
+    buy = await real_execute(sym, "Buy", req.amount, "prova")
+    if not buy:
+        raise HTTPException(status_code=502, detail="Acquisto di prova non eseguito: vedi il registro.")
+    bal_base = await real_balance(inst["base"])
+    qty = min(buy["net_qty"], bal_base if bal_base is not None else buy["net_qty"])
+    sell = None
+    for _ in range(3):
+        sell = await real_execute(sym, "Sell", qty, "prova")
+        if sell:
+            break
+        await asyncio.sleep(2.0)
+    if not sell:
+        raise HTTPException(status_code=502, detail=f"Comprato {buy['net_qty']} {inst['base']} ma la vendita NON e' riuscita: vendi a mano su Bybit.")
+    pnl = sell["net_value"] - buy["value"]
+    await db.real_roundtrips.insert_one({"at": datetime.now(timezone.utc).isoformat(), "symbol": sym, "pnl": pnl})
+    return {"symbol": sym, "comprato_a": buy["avg_price"], "venduto_a": sell["avg_price"], "speso": round(buy["value"], 4),
+            "incassato": round(sell["net_value"], 4), "costo_totale": round(-pnl, 4),
+            "costo_pct": round(-pnl / buy["value"] * 100.0, 3)}
+
+
+@api.post("/real/close-all")
+async def real_close_all() -> dict[str, Any]:
+    """Vende subito, a mercato, tutte le posizioni reali aperte di 33/60."""
+    cfg = await get_config()
+    rows = await db.s3360_positions.find({"status": "open", "real": {"$exists": True}}, {"_id": 0}).to_list(50)
+    done, failed = 0, 0
+    for p in rows:
+        sell = await real_close_position(p, cfg, "chiudi")
+        if not sell:
+            failed += 1
+            continue
+        cur = sell["avg_price"]
+        pnl = sell["net_value"] - p["notional"]
+        await db.s3360_wallet.update_one({"_id": S3360_WALLET_ID}, {"$inc": {"cash": p["notional"] + pnl}}, upsert=True)
+        await db.s3360_positions.update_one({"id": p["id"]}, {"$set": {
+            "status": "closed", "close_price": cur, "close_reason": "chiusura_manuale_reale", "close_last_price": cur,
+            "exit_fill_model": "reale", "fee_pct": cfg.sim_fee_pct, "pnl_usdt": round(pnl, 4),
+            "closed_at": datetime.now(timezone.utc).isoformat(), "real_exit": {k: v for k, v in sell.items() if k != "dust"},
+        }})
+        await close_track(p["id"], cur)
+        done += 1
+    return {"chiuse": done, "non_riuscite": failed}
 
 
 # ============================================================================

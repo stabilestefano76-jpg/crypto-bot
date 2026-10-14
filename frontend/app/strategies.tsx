@@ -34,6 +34,13 @@ const STRATEGIES: StrategyEntry[] = [
     icon: "diamond",
     route: "/xrp-accumulation",
   },
+  {
+    key: "real",
+    title: "Trading reale",
+    subtitle: "Soldi veri su Bybit: interruttore, limiti e STOP",
+    icon: "shield-checkmark",
+    route: "/real",
+  },
 ];
 
 export default function StrategiesHubScreen() {
