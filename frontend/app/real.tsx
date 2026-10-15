@@ -3,7 +3,7 @@ import { ActivityIndicator, Alert, Pressable, ScrollView, StyleSheet, Switch, Te
 import { useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
-import { realApi, RealStatus } from "@/src/api";
+import { realApi, RealDiagnosi, RealStatus } from "@/src/api";
 import { colors, font, radius, spacing } from "@/src/theme";
 
 const money = (n?: number | null) => (n === undefined || n === null || isNaN(n) ? "-" : `${n.toFixed(2)} USDC`);
@@ -21,10 +21,14 @@ export default function RealScreen() {
   const [st, setSt] = useState<RealStatus | null>(null);
   const [msg, setMsg] = useState("");
   const [busy, setBusy] = useState(false);
+  const [dg, setDg] = useState<RealDiagnosi | null>(null);
 
   const load = useCallback(async () => {
     try {
       setSt(await realApi.status());
+      try {
+        setDg(await realApi.diagnosi());
+      } catch {}
     } catch (e: any) {
       setMsg(String(e?.message ?? "Errore"));
     }
@@ -132,6 +136,35 @@ export default function RealScreen() {
         </Pressable>
 
         {!!msg && <Text style={styles.msg}>{msg}</Text>}
+
+        <Text style={[styles.big, { marginTop: spacing.lg }]}>Diagnosi: perche' non apre?</Text>
+        {dg && (["xrp_acc", "s3360"] as const).map((k) => (
+          <View key={k} style={styles.card}>
+            <Text style={styles.big}>{k === "xrp_acc" ? "XRP Accumulation" : "33/60"}</Text>
+            <Text style={styles.note}>
+              Timeframe attivi: {(dg[k].timeframes || []).join(", ") || "nessuno"} · soglia RSI {dg[k].soglia}
+            </Text>
+            <Text style={styles.note}>
+              Filtri: trend moneta {dg[k].filtro_trend_moneta ? "ACCESO" : "spento"} · trend BTC {dg[k].filtro_trend_btc ? "ACCESO" : "spento"} · sopra media lunga {dg[k].filtro_sopra_media_lunga ? "ACCESO" : "spento"}
+            </Text>
+            <Text style={[styles.line, { marginTop: spacing.sm }]}>Motivi di scarto (ultime 6 ore):</Text>
+            {(dg.motivi[k] || []).length === 0 && <Text style={styles.note}>Nessun dato.</Text>}
+            {(dg.motivi[k] || []).map((m, i) => (
+              <Text key={i} style={styles.log}>{m.volte}x {m.motivo}</Text>
+            ))}
+          </View>
+        ))}
+        {dg && (
+          <View style={styles.card}>
+            <Text style={styles.big}>RSI minimo visto dal bot (XRP, per ora)</Text>
+            {dg.rsi_ore.length === 0 && <Text style={styles.note}>Non ancora registrato: si riempie da adesso.</Text>}
+            {dg.rsi_ore.slice(0, 24).map((r, i) => (
+              <Text key={i} style={[styles.log, r.rsi_min !== null && r.rsi_min <= dg.xrp_acc.soglia && { color: colors.error }]}>
+                {new Date(r.ora + ":00:00Z").toLocaleString("it-IT", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })} · {r.tf} · minimo {r.rsi_min}
+              </Text>
+            ))}
+          </View>
+        )}
 
         <Text style={[styles.big, { marginTop: spacing.lg }]}>Posizioni reali aperte</Text>
         {st.open_positions.length === 0 && <Text style={styles.note}>Nessuna.</Text>}

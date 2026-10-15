@@ -659,7 +659,14 @@ export type RealTestResult = {
   costo_totale: number;
   costo_pct: number;
 };
+export type RealDiagnosi = {
+  motivi: Record<string, { motivo: string; volte: number }[]>;
+  rsi_ore: { ora: string; tf: string; rsi_min: number | null; ultimo: number | null }[];
+  xrp_acc: Record<string, any>;
+  s3360: Record<string, any>;
+};
 export const realApi = {
+  diagnosi: () => req<RealDiagnosi>("/real/diagnosi"),
   status: () => req<RealStatus>("/real/status"),
   save: (patch: Record<string, unknown>) =>
     req<Record<string, unknown>>("/real/settings", { method: "PUT", body: JSON.stringify(patch) }),

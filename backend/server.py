@@ -4283,6 +4283,33 @@ async def real_put_settings(body: dict[str, Any]) -> dict[str, Any]:
     return {k: getattr(new_cfg, k) for k in REAL_SETTING_KEYS}
 
 
+@api.get("/real/diagnosi")
+async def real_diagnosi() -> dict[str, Any]:
+    """Perche' non apre? Motivi di scarto piu' frequenti (ultime 6 ore) e RSI minimo visto ogni ora."""
+    since = (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat()
+    rows = await db.strategy_debug_log.find({"at": {"$gte": since}}, {"_id": 0}).to_list(20000)
+    out: dict[str, list[dict[str, Any]]] = {}
+    for strat in ("xrp_acc", "s3360"):
+        cnt: dict[str, int] = {}
+        for r in rows:
+            if r.get("strategy") == strat:
+                k = f"{r.get('symbol')} {r.get('timeframe')}: {r.get('reason')}"
+                cnt[k] = cnt.get(k, 0) + 1
+        out[strat] = [{"motivo": k, "volte": v} for k, v in sorted(cnt.items(), key=lambda x: -x[1])[:6]]
+    rsi_rows = await db.rsi_watch.find({"strategy": "xrp_acc"}, {"_id": 0}).sort("hour", -1).to_list(200)
+    cfg = await get_config()
+    return {
+        "motivi": out,
+        "rsi_ore": [{"ora": r["hour"], "tf": r["tf"], "rsi_min": r.get("rsi_min"), "ultimo": r.get("last")} for r in rsi_rows[:48]],
+        "xrp_acc": {"timeframes": cfg.xrp_acc_timeframes, "soglia": cfg.xrp_acc_low_threshold,
+                    "filtro_trend_moneta": cfg.xrp_acc_require_coin_trend, "filtro_trend_btc": cfg.xrp_acc_require_btc_trend,
+                    "filtro_sopra_media_lunga": cfg.xrp_acc_require_above_long_ema},
+        "s3360": {"timeframes": cfg.s3360_timeframes, "soglia": cfg.s3360_low_threshold,
+                  "filtro_trend_moneta": cfg.s3360_require_coin_trend, "filtro_trend_btc": cfg.s3360_require_btc_trend,
+                  "filtro_sopra_media_lunga": cfg.s3360_require_above_long_ema},
+    }
+
+
 @api.post("/real/stop")
 async def real_stop() -> dict[str, Any]:
     """Tasto STOP: spegne il reale (nessun nuovo ordine). Le posizioni aperte restano gestite e si possono chiudere."""
@@ -4424,6 +4451,40 @@ async def _xrp_acc_candles(tf: str) -> list[list[float]]:
     return []
 
 
+_rsi_watch_state: dict[str, float] = {}
+_rsi_watch_prune_at = 0.0
+
+
+async def rsi_watch(strategy: str, symbol: str, tf: str, rsi: Optional[float]) -> None:
+    """Diagnosi: tiene l'RSI MINIMO visto dal bot in ogni ora, per ogni timeframe.
+    Scrive solo quando il minimo scende (o al massimo una volta al minuto): pochissimo carico."""
+    global _rsi_watch_prune_at
+    if rsi is None:
+        return
+    now = datetime.now(timezone.utc)
+    hour = now.strftime("%Y-%m-%dT%H")
+    key = f"{strategy}|{symbol}|{tf}|{hour}"
+    last = _rsi_watch_state.get(key)
+    if last is not None and rsi >= last - 0.05 and time.time() - _rsi_watch_state.get(key + "|t", 0.0) < 60:
+        return
+    _rsi_watch_state[key] = min(rsi, last) if last is not None else rsi
+    _rsi_watch_state[key + "|t"] = time.time()
+    try:
+        await db.rsi_watch.update_one(
+            {"_id": key},
+            {"$min": {"rsi_min": round(rsi, 2)}, "$set": {"strategy": strategy, "symbol": symbol, "tf": tf, "hour": hour, "last": round(rsi, 2), "at": now.isoformat()}},
+            upsert=True,
+        )
+        if time.time() - _rsi_watch_prune_at > 3600:
+            _rsi_watch_prune_at = time.time()
+            old = (now - timedelta(days=3)).strftime("%Y-%m-%dT%H")
+            await db.rsi_watch.delete_many({"hour": {"$lt": old}})
+            for k in [k for k in _rsi_watch_state if k.split("|")[-1] < old and not k.endswith("|t")]:
+                _rsi_watch_state.pop(k, None)
+    except Exception:  # noqa: BLE001
+        pass
+
+
 async def run_xrp_acc_scan() -> None:
     cfg = await get_config()
     if not cfg.xrp_acc_enabled:
@@ -4447,6 +4508,7 @@ async def run_xrp_acc_scan() -> None:
         closes = [c[2] for c in candles]
         live_rsis = rsi_wilder(closes + [live_price], cfg.xrp_acc_rsi_period)
         live_rsi = live_rsis[-1]
+        await rsi_watch("xrp_acc", XRP_ACC_SYMBOL, tf, live_rsi)
         if live_rsi > cfg.xrp_acc_low_threshold:
             await _xrp_acc_log(tf, "nessun nuovo ingresso sotto soglia bassa")
             continue
