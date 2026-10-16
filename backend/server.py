@@ -3641,7 +3641,7 @@ async def open_s3360_position(symbol: str, tf: str, signal: dict[str, Any], cfg:
         return
     real_info = None
     if mode == "real":
-        rb = await real_open_buy(symbol, notional, cfg, "s3360")
+        rb = await real_open_buy(symbol, notional, cfg, "s3360", cash_cap=cash)
         if not rb:
             await log_reject(symbol, tf, "s3360", "ordine reale non eseguito (vedi registro reale)")
             return
@@ -4175,7 +4175,7 @@ async def real_execute(symbol: str, side: str, amount: Any, tag: str) -> Optiona
         return res
 
 
-async def real_open_buy(symbol: str, notional: float, cfg: Config, tag: str) -> Optional[dict[str, Any]]:
+async def real_open_buy(symbol: str, notional: float, cfg: Config, tag: str, cash_cap: Optional[float] = None) -> Optional[dict[str, Any]]:
     """Acquisto reale per aprire una posizione: rispetta tetto per ordine, tetto totale e saldo."""
     inst = await get_instrument(symbol)
     if not inst:
@@ -4186,6 +4186,14 @@ async def real_open_buy(symbol: str, notional: float, cfg: Config, tag: str) -> 
     if bal is None:
         return None
     amount = min(amount, bal * 0.995)
+    min_need = float(inst["min_amt"]) * 1.1
+    if amount < min_need:
+        # con capitali piccoli l'importo calcolato puo' stare sotto il minimo di Bybit:
+        # lo alzo al minimo (+10%) se budget, tetti e saldo lo permettono
+        upper = min(cfg.real_max_order_usdc, REAL_HARD_MAX_ORDER, room, bal * 0.995, cash_cap if cash_cap is not None else 1e12)
+        if upper >= min_need:
+            await rlog(f"{symbol}: importo {amount:.2f} sotto il minimo di Bybit ({inst['min_amt']}): lo porto a {min_need:.2f}")
+            amount = min_need
     if amount < float(inst["min_amt"]) or amount < 1.0:
         await rlog(f"{symbol}: importo {amount:.2f} troppo basso (minimo {inst['min_amt']}, saldo {bal:.2f}, spazio {room:.2f})", "errore")
         return None
