@@ -188,6 +188,16 @@ class Config(BaseModel):
     xrp_acc_min_net_profit_pct: float = 0.3  # exit rule: the sale must leave at least this NET profit (%) after the fees on both legs; the bot works out the price needed (only used with hold_below_entry)
     xrp_acc_trailing_enabled: bool = True  # once the minimum net profit is reached, follow the highest price and sell if it falls back by xrp_acc_trailing_pct — never below break-even (fees covered); only used with hold_below_entry
     xrp_acc_trailing_pct: float = 0.3  # how far (%) below the highest price the trailing sells
+    # --- ICT (meccanico, solo long): sweep -> MSS -> ritorno nel gap. Paper di default.
+    ict_enabled: bool = True
+    ict_symbols: list[str] = Field(default_factory=lambda: ["BTCUSDC", "ETHUSDC", "SOLUSDC", "XRPUSDC"])
+    ict_timeframe: str = "15m"
+    ict_rr: float = 2.0
+    ict_kill_zones: bool = True
+    ict_alloc_pct: float = 25.0
+    ict_max_open: int = 2
+    ict_max_hold_h: float = 48.0
+    ict_capital: float = 200.0
     sim_realistic_fills: bool = True  # paper fills of 33/60 and XRP Accumulation use the REAL order book (buy at the ask side, sell at the bid side, walking the depth) instead of the last traded price
     sim_fallback_slippage_pct: float = 0.05  # when the order book cannot be read (or is too thin for the order), the fill is the last price made worse by this % per side
     sim_fee_pct: float = 0.25  # exchange fee per side (%), charged on both legs of every paper trade — the Bybit EU rate the account actually pays (taker)
@@ -594,6 +604,7 @@ class PriceFeed:
         for coll in (
             db.s3360_positions,
             db.xrp_acc_positions,
+            db.ict_positions,
         ):
             rows = await coll.find({"status": "open"}, {"symbol": 1, "_id": 0}).to_list(1000)
             symbols |= {d["symbol"] for d in rows}
@@ -601,6 +612,9 @@ class PriceFeed:
         # be followed live permanently, not only while a position is open.
         if (await get_config()).xrp_acc_enabled:
             symbols.add(XRP_ACC_SYMBOL)
+        _c = await get_config()
+        if _c.ict_enabled:
+            symbols |= set(_c.ict_symbols)
         return sorted(symbols)
 
     def _ws_url(self) -> str:
@@ -1942,6 +1956,7 @@ async def lifespan(_app: FastAPI):
     monitor_task = asyncio.create_task(paper_monitor_loop())
     s3360_monitor_task = asyncio.create_task(s3360_monitor_loop())
     xrp_acc_monitor_task = asyncio.create_task(xrp_acc_monitor_loop())
+    ict_monitor_task = asyncio.create_task(ict_monitor_loop())
     ws_task = asyncio.create_task(price_feed.run())
     premature_task = asyncio.create_task(premature_stop_loop())
     entry_timing_task = asyncio.create_task(entry_timing_loop())
@@ -1949,6 +1964,7 @@ async def lifespan(_app: FastAPI):
     yield
     scan_task.cancel()
     monitor_task.cancel()
+    ict_monitor_task.cancel()
     ws_task.cancel()
     premature_task.cancel()
     entry_timing_task.cancel()
@@ -3999,7 +4015,7 @@ except ImportError:  # pragma: no cover
 REAL_HARD_MAX_ORDER = 100.0    # nessuna impostazione puo' superare questi tetti
 REAL_HARD_MAX_TOTAL = 200.0
 REAL_HARD_MAX_DAILY_LOSS = 50.0
-REAL_ALLOWED_STRATEGIES = ("s3360",)
+REAL_ALLOWED_STRATEGIES = ("s3360", "ict")
 REAL_SETTING_KEYS = ("real_trading_enabled", "real_max_order_usdc", "real_max_total_usdc",
                      "real_daily_loss_usdc", "live_strategies")
 
@@ -4078,12 +4094,16 @@ async def real_daily_pnl() -> float:
     rows = await db.s3360_positions.find(
         {"status": "closed", "real": {"$exists": True}, "closed_at": {"$gte": start}}, {"pnl_usdt": 1, "_id": 0}
     ).to_list(1000)
+    rows += await db.ict_positions.find(
+        {"status": "closed", "real": {"$exists": True}, "closed_at": {"$gte": start}}, {"pnl_usdt": 1, "_id": 0}
+    ).to_list(1000)
     extra = await db.real_roundtrips.find({"at": {"$gte": start}}, {"pnl": 1, "_id": 0}).to_list(1000)
     return float(sum(r.get("pnl_usdt", 0.0) for r in rows) + sum(r.get("pnl", 0.0) for r in extra))
 
 
 async def real_open_exposure() -> float:
     rows = await db.s3360_positions.find({"status": "open", "real": {"$exists": True}}, {"notional": 1, "_id": 0}).to_list(500)
+    rows += await db.ict_positions.find({"status": "open", "real": {"$exists": True}}, {"notional": 1, "_id": 0}).to_list(500)
     return float(sum(r.get("notional", 0.0) for r in rows))
 
 
@@ -4252,6 +4272,7 @@ async def real_status() -> dict[str, Any]:
     creds = bool(await db.exchange_creds.find_one({"_id": "bybit"}, {"_id": 1}))
     log = await db.real_log.find({}, {"_id": 0}).sort("at", -1).to_list(30)
     open_rows = await db.s3360_positions.find({"status": "open", "real": {"$exists": True}}, {"_id": 0}).to_list(50)
+    open_rows += await db.ict_positions.find({"status": "open", "real": {"$exists": True}}, {"_id": 0}).to_list(50)
     return {
         "enabled": cfg.real_trading_enabled,
         "live_strategies": cfg.live_strategies,
@@ -4390,7 +4411,8 @@ async def real_close_all() -> dict[str, Any]:
         }})
         await close_track(p["id"], cur)
         done += 1
-    return {"chiuse": done, "non_riuscite": failed}
+    d2, f2 = await _ict_close_all_real()
+    return {"chiuse": done + d2, "non_riuscite": failed + f2}
 
 
 # ============================================================================
@@ -4779,6 +4801,322 @@ async def xrp_acc_reset() -> dict[str, Any]:
         {"$set": {"cash": 0.0, "permanent_xrp": 0.0, "total_transferred_in": 0.0}, "$inc": {"reset_seq": 1}},
         upsert=True,
     )
+    return {"ok": True}
+
+
+# ============================================================================
+# ICT (Inner Circle Trader) — versione MECCANICA, solo long, spot.
+# Sweep dei minimi -> rottura della struttura (MSS) -> ritorno nel gap (FVG).
+# Le regole stanno in ict_logic.py (funzioni pure, provate a parte).
+# Paper per impostazione predefinita; reale solo se "ict" e' in live_strategies
+# (si accende dalla pagina Trading reale) e passa tutti i controlli di real_guard.
+# NON e' una strategia dimostrata: e' una prova dal vivo.
+# ============================================================================
+try:
+    import ict_logic as ICT
+except ImportError:  # pragma: no cover
+    from backend import ict_logic as ICT
+
+ICT_WALLET_ID = "ict_wallet_singleton"
+ICT_SETTING_KEYS = ("ict_enabled", "ict_symbols", "ict_timeframe", "ict_rr", "ict_kill_zones",
+                    "ict_alloc_pct", "ict_max_open", "ict_max_hold_h")
+ICT_TIMEFRAMES = ("5m", "15m", "30m", "1h")
+_ict_candle_cache: dict[str, tuple[float, list[list[float]]]] = {}
+_ict_seen: set[str] = set()
+_ict_log_at: dict[str, float] = {}
+_ict_status: dict[str, Any] = {"at": None, "watching": {}}
+
+
+async def get_ict_wallet(cfg: Optional[Config] = None) -> dict[str, Any]:
+    doc = await db.ict_wallet.find_one({"_id": ICT_WALLET_ID}, {"_id": 0})
+    if not doc:
+        cfg = cfg or await get_config()
+        doc = {"cash": float(cfg.ict_capital), "start_capital": float(cfg.ict_capital)}
+        await db.ict_wallet.update_one({"_id": ICT_WALLET_ID}, {"$set": doc}, upsert=True)
+    return doc
+
+
+async def _ict_log(symbol: str, tf: str, reason: str) -> None:
+    key = f"{symbol}|{tf}|{reason}"
+    now = time.time()
+    if now - _ict_log_at.get(key, 0.0) < 300:
+        return
+    _ict_log_at[key] = now
+    await log_reject(symbol, tf, "ict", reason)
+
+
+async def _ict_candles(symbol: str, tf: str) -> list[list[float]]:
+    now = time.time()
+    cached = _ict_candle_cache.get(f"{symbol}|{tf}")
+    if cached and cached[1] and now - cached[0] < 30:
+        return cached[1]
+    candles = await exchange.get_klines(symbol, tf)
+    if candles:
+        _ict_candle_cache[f"{symbol}|{tf}"] = (now, candles)
+        return candles
+    if cached and cached[1] and now - cached[0] < 300:
+        return cached[1]
+    return []
+
+
+async def run_ict_scan() -> None:
+    cfg = await get_config()
+    if not cfg.ict_enabled:
+        return
+    tf = cfg.ict_timeframe
+    watching: dict[str, Any] = {}
+    for symbol in cfg.ict_symbols:
+        candles = await _ict_candles(symbol, tf)
+        if len(candles) < 60:
+            await _ict_log(symbol, tf, "dati insufficienti")
+            continue
+        live = price_feed.get(symbol) or await price_feed.price_or_rest(symbol)
+        if not live or live <= 0:
+            await _ict_log(symbol, tf, "prezzo live non disponibile")
+            continue
+        setups = ICT.find_setups(candles)
+        watching[symbol] = {"setups": len(setups), "price": live,
+                            "fvg_top": setups[-1]["fvg_top"] if setups else None,
+                            "stop": setups[-1]["stop"] if setups else None}
+        if not setups:
+            continue
+        if cfg.ict_kill_zones and not ICT.in_kill_zone(datetime.now(timezone.utc).hour):
+            await _ict_log(symbol, tf, "setup pronto ma fuori dagli orari (kill zone)")
+            continue
+        if await db.ict_positions.find_one({"symbol": symbol, "status": "open"}):
+            continue
+        open_n = await db.ict_positions.count_documents({"status": "open"})
+        if open_n >= cfg.ict_max_open:
+            await _ict_log(symbol, tf, "numero massimo di posizioni aperte raggiunto")
+            continue
+        for st in reversed(setups):
+            sid = f"{symbol}|{tf}|{st['id']}"
+            if sid in _ict_seen or await db.ict_seen.find_one({"_id": sid}, {"_id": 1}):
+                continue
+            plan = ICT.entry_plan(st, live, cfg.ict_rr)
+            if not plan:
+                continue
+            _ict_seen.add(sid)
+            await db.ict_seen.update_one({"_id": sid}, {"$set": {"at": datetime.now(timezone.utc).isoformat()}}, upsert=True)
+            await open_ict_position(symbol, tf, st, plan, cfg)
+            break
+    _ict_status["at"] = datetime.now(timezone.utc).isoformat()
+    _ict_status["watching"] = watching
+
+
+async def open_ict_position(symbol: str, tf: str, st: dict[str, Any], plan: dict[str, Any], cfg: Config) -> None:
+    wallet = await get_ict_wallet(cfg)
+    cash = float(wallet.get("cash", 0.0))
+    open_rows = await db.ict_positions.find({"status": "open"}, {"notional": 1, "_id": 0}).to_list(50)
+    equity = cash + sum(r.get("notional", 0.0) for r in open_rows)
+    notional = min(equity * cfg.ict_alloc_pct / 100.0, cash)
+    if notional < 1.0:
+        await _ict_log(symbol, tf, "capitale ICT esaurito")
+        return
+    mode, why = await real_guard(cfg, "ict")
+    if mode == "blocked":
+        await log_reject(symbol, tf, "ict", f"reale bloccato: {why}")
+        return
+    real_info = None
+    if mode == "real":
+        rb = await real_open_buy(symbol, notional, cfg, "ict", cash_cap=cash)
+        if not rb:
+            await log_reject(symbol, tf, "ict", "ordine reale non eseguito (vedi registro reale)")
+            return
+        real_info = rb
+        notional = rb["value"]
+        fill_price = rb["avg_price"]
+        fill_info = {"fill_model": "reale", "cost_pct": 0.0, "spread_pct": None}
+        quantity = rb["net_qty"]
+    else:
+        fill_price, fill_info = await simulate_fill(symbol, "buy", plan["entry"], cfg, quote_budget=notional)
+        quantity = notional / fill_price
+    stop = plan["stop"]
+    if fill_price <= stop:
+        # il prezzo di riempimento e' gia' sotto lo stop: non apro (in paper); nel reale chiudero' subito allo stop
+        if not real_info:
+            await log_reject(symbol, tf, "ict", "prezzo di riempimento sotto lo stop: non apro")
+            return
+    target = fill_price + cfg.ict_rr * (fill_price - stop)
+    now = datetime.now(timezone.utc)
+    doc = {
+        "id": str(uuid.uuid4()), "symbol": symbol, "timeframe": tf, "side": "long",
+        "entry": plan["entry"], "fill_price": fill_price, "fill_model": fill_info["fill_model"],
+        "entry_cost_pct": fill_info["cost_pct"], "spread_pct": fill_info.get("spread_pct"),
+        "stop": stop, "target": target, "risk_pct": round((fill_price - stop) / fill_price * 100.0, 3), "rr": cfg.ict_rr,
+        "setup_id": st["id"], "sweep_low": st["sweep_low"], "fvg_top": st["fvg_top"], "fvg_bottom": st["fvg_bottom"],
+        "quantity": quantity, "notional": notional, "status": "open",
+        "opened_at": now.isoformat(), "opened_ts": now.timestamp(),
+    }
+    if real_info:
+        doc["real"] = {k: real_info[k] for k in ("order_id", "link_id", "net_qty", "fee_base", "fee_quote", "qty")}
+    await db.ict_positions.insert_one(dict(doc))
+    await db.ict_wallet.update_one({"_id": ICT_WALLET_ID}, {"$inc": {"cash": -notional}}, upsert=True)
+
+
+async def monitor_ict_positions() -> None:
+    cfg = await get_config()
+    open_positions = await db.ict_positions.find({"status": "open"}, {"_id": 0}).to_list(20)
+    for p in open_positions:
+        cur = price_feed.get(p["symbol"]) or await price_feed.price_or_rest(p["symbol"])
+        if not cur or cur <= 0:
+            continue
+        await record_track("ict", db.ict_positions, p, cur)
+        hit = ICT.exit_check(p, cur, time.time(), cfg.ict_max_hold_h)
+        if not hit:
+            continue
+        if p.get("real"):
+            if not real_sell_due(p["id"]):
+                continue
+            sell = await real_close_position(p, cfg, "ictx")
+            if not sell:
+                await rlog(f"Vendita reale ICT di {p['symbol']} non riuscita, riprovo tra 30 s", "errore")
+                continue
+            sell_price = sell["avg_price"]
+            pnl = sell["net_value"] + sell.get("dust_value", 0.0) - p["notional"]
+            await db.ict_wallet.update_one({"_id": ICT_WALLET_ID}, {"$inc": {"cash": p["notional"] + pnl}}, upsert=True)
+            await db.ict_positions.update_one({"id": p["id"]}, {"$set": {
+                "status": "closed", "close_price": sell_price, "close_reason": hit, "close_last_price": cur,
+                "exit_fill_model": "reale", "fee_pct": cfg.sim_fee_pct, "pnl_usdt": round(pnl, 4),
+                "closed_at": datetime.now(timezone.utc).isoformat(),
+                "real_exit": {k: v for k, v in sell.items() if k != "dust"},
+            }})
+            await close_track(p["id"], cur)
+            continue
+        if cfg.sim_realistic_fills and not book_recheck_due(p["id"]):
+            continue
+        sell_price, sell_info = await simulate_fill(p["symbol"], "sell", cur, cfg, base_qty=p["quantity"])
+        gross = (sell_price - p["fill_price"]) * p["quantity"]
+        exit_notional = sell_price * p["quantity"]
+        fees = (p["notional"] + exit_notional) * (cfg.sim_fee_pct / 100.0)
+        pnl = gross - fees
+        await db.ict_wallet.update_one({"_id": ICT_WALLET_ID}, {"$inc": {"cash": p["notional"] + pnl}}, upsert=True)
+        await db.ict_positions.update_one({"id": p["id"]}, {"$set": {
+            "status": "closed", "close_price": sell_price, "close_reason": hit, "close_last_price": cur,
+            "exit_fill_model": sell_info["fill_model"], "exit_cost_pct": sell_info["cost_pct"],
+            "exit_spread_pct": sell_info.get("spread_pct"), "fee_pct": cfg.sim_fee_pct,
+            "pnl_usdt": round(pnl, 4), "closed_at": datetime.now(timezone.utc).isoformat(),
+        }})
+        await close_track(p["id"], cur)
+
+
+async def ict_monitor_loop() -> None:
+    """Uscite ogni 3 s sul prezzo live; ricerca ingressi nello stesso ciclo (un solo chiamante: niente doppie aperture)."""
+    await asyncio.sleep(12)
+    while True:
+        try:
+            await monitor_ict_positions()
+        except Exception as e:  # noqa: BLE001
+            logger.exception("ICT monitor error: %s", e)
+        try:
+            await run_ict_scan()
+        except Exception as e:  # noqa: BLE001
+            logger.exception("ICT scan error: %s", e)
+        await asyncio.sleep(3)
+
+
+async def _ict_close_all_real() -> tuple[int, int]:
+    cfg = await get_config()
+    rows = await db.ict_positions.find({"status": "open", "real": {"$exists": True}}, {"_id": 0}).to_list(50)
+    done, failed = 0, 0
+    for p in rows:
+        sell = await real_close_position(p, cfg, "chiudi")
+        if not sell:
+            failed += 1
+            continue
+        cur = sell["avg_price"]
+        pnl = sell["net_value"] + sell.get("dust_value", 0.0) - p["notional"]
+        await db.ict_wallet.update_one({"_id": ICT_WALLET_ID}, {"$inc": {"cash": p["notional"] + pnl}}, upsert=True)
+        await db.ict_positions.update_one({"id": p["id"]}, {"$set": {
+            "status": "closed", "close_price": cur, "close_reason": "chiusura_manuale_reale", "close_last_price": cur,
+            "exit_fill_model": "reale", "fee_pct": cfg.sim_fee_pct, "pnl_usdt": round(pnl, 4),
+            "closed_at": datetime.now(timezone.utc).isoformat(), "real_exit": {k: v for k, v in sell.items() if k != "dust"},
+        }})
+        await close_track(p["id"], cur)
+        done += 1
+    return done, failed
+
+
+@api.get("/ict/portfolio")
+async def ict_portfolio() -> dict[str, Any]:
+    cfg = await get_config()
+    wallet = await get_ict_wallet(cfg)
+    open_docs = await db.ict_positions.find({"status": "open"}, {"_id": 0}).to_list(50)
+    closed_docs = await db.ict_positions.find({"status": "closed"}, {"_id": 0}).sort("closed_at", -1).to_list(300)
+    open_out, open_value, unreal = [], 0.0, 0.0
+    for p in open_docs:
+        cur = price_feed.get(p["symbol"]) or await price_feed.price_or_rest(p["symbol"]) or p["entry"]
+        val = cur * p["quantity"]
+        fl = val - p["notional"] - (p["notional"] + val) * (cfg.sim_fee_pct / 100.0)
+        open_value += val
+        unreal += fl
+        open_out.append({**p, "current_price": cur, "floating_pnl": round(fl, 4), "is_real": bool(p.get("real"))})
+    closed_out = [{**c, "is_real": bool(c.get("real"))} for c in closed_docs]
+    wins = [c for c in closed_docs if c.get("pnl_usdt", 0.0) > 0]
+    realized = sum(c.get("pnl_usdt", 0.0) for c in closed_docs)
+    return {
+        "enabled": cfg.ict_enabled,
+        "mode": "real" if "ict" in cfg.live_strategies else "paper",
+        "real_switch_on": cfg.real_trading_enabled and "ict" in cfg.live_strategies,
+        "settings": {k: getattr(cfg, k) for k in ICT_SETTING_KEYS},
+        "cash": round(float(wallet.get("cash", 0.0)), 4),
+        "start_capital": float(wallet.get("start_capital", cfg.ict_capital)),
+        "equity": round(float(wallet.get("cash", 0.0)) + open_value, 4),
+        "unrealized": round(unreal, 4),
+        "realized": round(realized, 4),
+        "trades": len(closed_docs),
+        "win_rate": round(100.0 * len(wins) / len(closed_docs), 1) if closed_docs else None,
+        "open_positions": open_out,
+        "closed_positions": closed_out[:100],
+        "watching": _ict_status.get("watching", {}),
+        "last_scan": _ict_status.get("at"),
+        "disclaimer": "Strategia sperimentale, non dimostrata dai test.",
+    }
+
+
+@api.put("/ict/settings")
+async def ict_put_settings(body: dict[str, Any]) -> dict[str, Any]:
+    cfg = await get_config()
+    data = cfg.model_dump()
+    for k, v in body.items():
+        if k not in ICT_SETTING_KEYS:
+            raise HTTPException(status_code=400, detail=f"Impostazione sconosciuta: {k}")
+        data[k] = v
+    try:
+        new_cfg = Config(**data)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Valore non valido: {e}")
+    if new_cfg.ict_timeframe not in ICT_TIMEFRAMES:
+        raise HTTPException(status_code=400, detail="Timeframe ammessi: " + ", ".join(ICT_TIMEFRAMES))
+    if not (1.0 <= new_cfg.ict_rr <= 5.0):
+        raise HTTPException(status_code=400, detail="RR tra 1 e 5")
+    if not (5.0 <= new_cfg.ict_alloc_pct <= 100.0):
+        raise HTTPException(status_code=400, detail="Quota per operazione tra 5% e 100%")
+    if not (1 <= new_cfg.ict_max_open <= 4):
+        raise HTTPException(status_code=400, detail="Posizioni aperte massime tra 1 e 4")
+    if not (1.0 <= new_cfg.ict_max_hold_h <= 168.0):
+        raise HTTPException(status_code=400, detail="Durata massima tra 1 e 168 ore")
+    syms = [s.strip().upper() for s in new_cfg.ict_symbols]
+    if not (1 <= len(syms) <= 8) or any((not s.endswith("USDC")) or (not s.isalnum()) or len(s) > 14 for s in syms):
+        raise HTTPException(status_code=400, detail="Da 1 a 8 coppie USDC (es. BTCUSDC)")
+    new_cfg.ict_symbols = syms
+    body = dict(body)
+    if "ict_symbols" in body:
+        body["ict_symbols"] = syms
+    await db.config.update_one({"_id": CONFIG_ID}, {"$set": {k: getattr(new_cfg, k) for k in body}}, upsert=True)
+    return {k: getattr(new_cfg, k) for k in ICT_SETTING_KEYS}
+
+
+@api.post("/ict/reset")
+async def ict_reset() -> dict[str, Any]:
+    if await db.ict_positions.find_one({"status": "open", "real": {"$exists": True}}):
+        raise HTTPException(status_code=400, detail="Ci sono posizioni ICT reali aperte: chiudile prima (pagina Trading reale).")
+    cfg = await get_config()
+    await db.ict_positions.delete_many({})
+    await db.ict_seen.delete_many({})
+    _ict_seen.clear()
+    await db.ict_wallet.update_one(
+        {"_id": ICT_WALLET_ID}, {"$set": {"cash": float(cfg.ict_capital), "start_capital": float(cfg.ict_capital)}}, upsert=True)
     return {"ok": True}
 
 

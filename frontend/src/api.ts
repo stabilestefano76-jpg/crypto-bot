@@ -665,6 +665,29 @@ export type RealDiagnosi = {
   xrp_acc: Record<string, any>;
   s3360: Record<string, any>;
 };
+// ---- ICT (paper, con interruttore reale) ----
+export type IctPosition = {
+  id: string; symbol: string; timeframe: string; fill_price: number; stop: number; target: number;
+  risk_pct: number; rr: number; quantity: number; notional: number; opened_at: string;
+  current_price?: number; floating_pnl?: number; is_real: boolean;
+  status?: string; close_price?: number; close_reason?: string; pnl_usdt?: number; closed_at?: string;
+};
+export type IctPortfolio = {
+  enabled: boolean; mode: "paper" | "real"; real_switch_on: boolean;
+  settings: { ict_enabled: boolean; ict_symbols: string[]; ict_timeframe: string; ict_rr: number; ict_kill_zones: boolean; ict_alloc_pct: number; ict_max_open: number; ict_max_hold_h: number };
+  cash: number; start_capital: number; equity: number; unrealized: number; realized: number;
+  trades: number; win_rate: number | null;
+  open_positions: IctPosition[]; closed_positions: IctPosition[];
+  watching: Record<string, { setups: number; price: number; fvg_top: number | null; stop: number | null }>;
+  last_scan: string | null; disclaimer: string;
+};
+export const ictApi = {
+  portfolio: () => req<IctPortfolio>("/ict/portfolio"),
+  save: (patch: Record<string, unknown>) =>
+    req<Record<string, unknown>>("/ict/settings", { method: "PUT", body: JSON.stringify(patch) }),
+  reset: () => req<{ ok: boolean }>("/ict/reset", { method: "POST" }),
+};
+
 export const realApi = {
   diagnosi: () => req<RealDiagnosi>("/real/diagnosi"),
   status: () => req<RealStatus>("/real/status"),

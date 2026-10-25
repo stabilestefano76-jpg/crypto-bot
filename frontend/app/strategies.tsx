@@ -35,6 +35,13 @@ const STRATEGIES: StrategyEntry[] = [
     route: "/xrp-accumulation",
   },
   {
+    key: "ict",
+    title: "ICT",
+    subtitle: "Sweep dei minimi, rottura di struttura, ritorno nel gap (sperimentale)",
+    icon: "flash",
+    route: "/ict",
+  },
+  {
     key: "real",
     title: "Trading reale",
     subtitle: "Soldi veri su Bybit: interruttore, limiti e STOP",

@@ -60,6 +60,11 @@ export default function RealScreen() {
     );
 
   const live = st.live_strategies.includes("s3360");
+  const liveIct = st.live_strategies.includes("ict");
+  const toggleLive = (key: string, on: boolean) => {
+    const rest = st.live_strategies.filter((x) => x !== key);
+    return on ? [...rest, key] : rest;
+  };
   const ready = st.password_active && st.key_connected;
 
   return (
@@ -72,8 +77,10 @@ export default function RealScreen() {
         <View style={{ width: 26 }} />
       </View>
       <ScrollView contentContainerStyle={{ padding: spacing.lg, paddingBottom: 60 }}>
-        <View style={[styles.card, { borderColor: st.enabled && live ? colors.error : colors.border }]}>
-          <Text style={styles.big}>{st.enabled && live ? "REALE ACCESO su 33/60" : "Reale spento (solo simulazione)"}</Text>
+        <View style={[styles.card, { borderColor: st.enabled && (live || liveIct) ? colors.error : colors.border }]}>
+          <Text style={styles.big}>{st.enabled && (live || liveIct)
+              ? "REALE ACCESO su " + [live ? "33/60" : "", liveIct ? "ICT" : ""].filter(Boolean).join(" + ")
+              : "Reale spento (solo simulazione)"}</Text>
           <Text style={styles.line}>{st.password_active ? "✓ Password di accesso attiva" : "✗ Password di accesso NON attiva (serve BOT_ACCESS_KEY su Railway)"}</Text>
           <Text style={styles.line}>{st.key_connected ? "✓ Chiave Bybit collegata" : "✗ Chiave Bybit non collegata"}</Text>
         </View>
@@ -104,7 +111,20 @@ export default function RealScreen() {
             <Switch
               value={live}
               disabled={busy}
-              onValueChange={(v) => run(() => realApi.save({ live_strategies: v ? ["s3360"] : [] }))}
+              onValueChange={(v) => run(() => realApi.save({ live_strategies: toggleLive("s3360", v) }))}
+            />
+          </View>
+          <View style={styles.row}>
+            <Text style={styles.big}>ICT con soldi veri</Text>
+            <Switch
+              value={liveIct}
+              disabled={busy}
+              onValueChange={(v) =>
+                v
+                  ? ask("ICT con soldi veri?", "ICT e' sperimentale e NON e' stata dimostrata dai test. Usa soldi veri entro i limiti indicati.", "Accendi", () =>
+                      run(() => realApi.save({ live_strategies: toggleLive("ict", true) })))
+                  : run(() => realApi.save({ live_strategies: toggleLive("ict", false) }))
+              }
             />
           </View>
           <Text style={styles.note}>Il reale lavora solo se TUTTI e due sono accesi. Ricorda di mettere i soldi nel portafoglio di 33/60 (Deposita): e' il budget che il bot puo' usare.</Text>
