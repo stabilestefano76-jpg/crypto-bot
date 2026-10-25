@@ -664,6 +664,31 @@ export default function SettingsScreen() {
                 step={0.05}
                 testID="input-s3360-trailing-pct"
               />
+              <ToggleRow
+                label="Esci se l'RSI risale e poi ritorna giu'"
+                value={cfg.s3360_rsi_giveback_enabled}
+                onChange={(v) => update({ s3360_rsi_giveback_enabled: v })}
+                testID="toggle-s3360-rsi-giveback"
+              />
+              <NumRow
+                label="RSI da superare per armare l'uscita"
+                value={cfg.s3360_rsi_arm}
+                onChange={(v) => update({ s3360_rsi_arm: v })}
+                step={1}
+                testID="input-s3360-rsi-arm"
+              />
+              <NumRow
+                label="Chiudi se l'RSI scende sotto"
+                value={cfg.s3360_rsi_giveback}
+                onChange={(v) => update({ s3360_rsi_giveback: v })}
+                step={1}
+                testID="input-s3360-rsi-giveback"
+              />
+              <Text style={styles.scoreHintText}>
+                Uscita extra: dopo che l&apos;RSI ha superato {cfg.s3360_rsi_arm}, se poi scende sotto {cfg.s3360_rsi_giveback}{" "}
+                l&apos;operazione si chiude. Se non scende mai sotto, resta aperta fino al target. Con il guadagno minimo
+                acceso non vende mai sotto il pareggio (commissioni coperte): se il prezzo e&apos; piu&apos; basso aspetta.
+              </Text>
               <Text style={styles.scoreHintText}>
                 Trailing: appena il prezzo supera il livello del guadagno
                 netto minimo, il bot comincia a seguire il prezzo massimo. Se

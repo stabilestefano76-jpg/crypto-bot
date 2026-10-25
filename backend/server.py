@@ -179,6 +179,9 @@ class Config(BaseModel):
     s3360_min_net_profit_pct: float = 0.3  # exit rule: the sale must leave at least this NET profit (%) after the fees on both legs; the bot works out the price needed (only used with hold_below_entry)
     s3360_trailing_enabled: bool = True  # once the minimum net profit is reached, follow the highest price and sell if it falls back by s3360_trailing_pct — never below break-even (fees covered); only used with hold_below_entry
     s3360_trailing_pct: float = 0.3  # how far (%) below the highest price the trailing sells
+    s3360_rsi_giveback_enabled: bool = False  # extra exit: once the RSI has been above s3360_rsi_arm, selling as soon as it falls back below s3360_rsi_giveback (never below break-even when hold_below_entry is on)
+    s3360_rsi_arm: float = 52.0
+    s3360_rsi_giveback: float = 50.0
     xrp_acc_enabled: bool = True
     xrp_acc_timeframes: list[str] = Field(default_factory=lambda: ["1h"])
     xrp_acc_rsi_period: int = 14
@@ -3741,6 +3744,14 @@ async def monitor_s3360_positions() -> None:
         closes = [c[2] for c in candles] + [cur]
         rsis = rsi_wilder(closes, cfg.s3360_rsi_period) if len(closes) > cfg.s3360_rsi_period else []
         rsi_hit = bool(rsis and rsis[-1] >= cfg.s3360_high_threshold)
+        # Uscita extra "RSI di ritorno": dopo che l'RSI ha superato s3360_rsi_arm la posizione e' 'armata';
+        # se poi l'RSI scende sotto s3360_rsi_giveback si esce (stesso pavimento delle altre uscite).
+        giveback_hit = False
+        if cfg.s3360_rsi_giveback_enabled and rsis:
+            if not p.get("rsi_armed") and rsis[-1] > cfg.s3360_rsi_arm:
+                p["rsi_armed"] = True
+                await db.s3360_positions.update_one({"id": p["id"]}, {"$set": {"rsi_armed": True}})
+            giveback_hit = bool(p.get("rsi_armed")) and rsis[-1] < cfg.s3360_rsi_giveback
 
         fill = p.get("fill_price", p["entry"])
         margin_price = required_exit_price(fill, cfg.s3360_min_net_profit_pct, cfg.sim_fee_pct)
@@ -3759,6 +3770,8 @@ async def monitor_s3360_positions() -> None:
             hit, floor_price = "target_rsi_raggiunto", margin_price
         elif trail_hit:
             hit, floor_price = "trailing_stop", break_even
+        elif giveback_hit:
+            hit, floor_price = "rsi_ritorno", break_even
         elif rsi_hit:
             # RSI reached the target but selling now would lock in less than the
             # minimum net profit: keep waiting. Both conditions must be true
@@ -3768,7 +3781,7 @@ async def monitor_s3360_positions() -> None:
         else:
             continue
         if cfg.s3360_hold_below_entry and cur < floor_price:
-            await _s3360_hold_log(p, "Trailing: il prezzo non copre i costi, attendo" if hit == "trailing_stop" else "RSI al target ma prezzo sotto l'entrata: attendo il recupero")
+            await _s3360_hold_log(p, "RSI tornato sotto la soglia ma il prezzo non copre i costi: attendo" if hit == "rsi_ritorno" else "Trailing: il prezzo non copre i costi, attendo" if hit == "trailing_stop" else "RSI al target ma prezzo sotto l'entrata: attendo il recupero")
             continue
 
         # The last price clears the floor; now ask what a market sell would
@@ -3797,7 +3810,7 @@ async def monitor_s3360_positions() -> None:
         sell_price, sell_info = await simulate_fill(p["symbol"], "sell", cur, cfg, base_qty=p["quantity"])
         if cfg.s3360_hold_below_entry and sell_price < floor_price:
             # the price we would really get is still too low
-            await _s3360_hold_log(p, "Trailing: il prezzo di vendita vero non copre i costi, attendo" if hit == "trailing_stop" else "RSI al target ma prezzo sotto l'entrata: attendo il recupero")
+            await _s3360_hold_log(p, "RSI tornato sotto la soglia ma il prezzo di vendita vero non copre i costi: attendo" if hit == "rsi_ritorno" else "Trailing: il prezzo di vendita vero non copre i costi, attendo" if hit == "trailing_stop" else "RSI al target ma prezzo sotto l'entrata: attendo il recupero")
             continue
 
         gross_pnl = (sell_price - fill) * p["quantity"]

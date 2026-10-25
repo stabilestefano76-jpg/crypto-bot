@@ -131,6 +131,9 @@ export type Config = {
   s3360_min_net_profit_pct: number;
   s3360_trailing_enabled: boolean;
   s3360_trailing_pct: number;
+  s3360_rsi_giveback_enabled: boolean;
+  s3360_rsi_arm: number;
+  s3360_rsi_giveback: number;
   xrp_acc_enabled: boolean;
   xrp_acc_timeframes: string[];
   xrp_acc_rsi_period: number;
