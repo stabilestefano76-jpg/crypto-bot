@@ -1777,7 +1777,6 @@ async def scheduler_loop() -> None:
         try:
             await expire_stale_signals(cfg)
             await run_scan()
-            await run_s3360_scan()
         except Exception as e:  # noqa: BLE001
             logger.exception("Scan loop error: %s", e)
         await asyncio.sleep(max(60, cfg.scan_interval_minutes * 60))
@@ -1959,6 +1958,7 @@ async def lifespan(_app: FastAPI):
     monitor_task = asyncio.create_task(paper_monitor_loop())
     s3360_monitor_task = asyncio.create_task(s3360_monitor_loop())
     xrp_acc_monitor_task = asyncio.create_task(xrp_acc_monitor_loop())
+    s3360_entry_task = asyncio.create_task(s3360_entry_loop())
     ict_monitor_task = asyncio.create_task(ict_monitor_loop())
     ws_task = asyncio.create_task(price_feed.run())
     premature_task = asyncio.create_task(premature_stop_loop())
@@ -1968,6 +1968,7 @@ async def lifespan(_app: FastAPI):
     scan_task.cancel()
     monitor_task.cancel()
     ict_monitor_task.cancel()
+    s3360_entry_task.cancel()
     ws_task.cancel()
     premature_task.cancel()
     entry_timing_task.cancel()
@@ -3507,6 +3508,134 @@ async def get_daily_open_price(symbol: str) -> Optional[float]:
     return ref
 
 
+
+# ---------------------------------------------------------------------------
+# 33/60: controllo d'ingresso frequente (ogni ~20 s) con cache, e registro dei segnali.
+# ---------------------------------------------------------------------------
+_s3360_px_cache: dict[str, Any] = {"at": 0.0, "map": {}, "vol": {}}
+_s3360_cand_cache: dict[str, Any] = {"at": 0.0, "list": []}
+_s3360_candle_cache: dict[tuple[str, str], tuple[float, list[list[float]]]] = {}
+_s3360_log_at: dict[str, float] = {}
+_s3360_event_seen: set = set()
+_s3360_event_prune_at = 0.0
+
+
+async def _s3360_candidates(cfg: Config) -> tuple[list[str], dict[str, float]]:
+    """Elenco monete da controllare (ricalcolato ogni 5 minuti) e prezzi di tutte le monete (una sola richiesta ogni 10 s)."""
+    now = time.time()
+    px = _s3360_px_cache
+    if now - px["at"] > 10 or not px["map"]:
+        tickers = await exchange.get_tickers()
+        pm: dict[str, float] = {}
+        vm: dict[str, float] = {}
+        for t in tickers:
+            try:
+                vm[t["symbol"]] = float(t.get("volValue") or 0)
+            except (TypeError, ValueError, KeyError):
+                pass
+            try:
+                pm[t["symbol"]] = float(t.get("last") or 0)
+            except (TypeError, ValueError, KeyError):
+                pass
+        if pm:
+            px["at"], px["map"], px["vol"] = now, pm, vm
+    cc = _s3360_cand_cache
+    if now - cc["at"] > 300 or not cc["list"]:
+        vol_map = px.get("vol", {})
+        symbols = await exchange.get_symbols()
+        quotes = {q.strip() for q in (cfg.quote_filter or "").split(",") if q.strip()}
+        candidates: list[str] = []
+        for s in symbols:
+            if not s.get("enableTrading"):
+                continue
+            sym = s.get("symbol")
+            if not sym:
+                continue
+            if quotes and s.get("quoteCurrency") not in quotes:
+                continue
+            if any(sym.upper().startswith(base) for base in EXCLUDED_STABLE_BASES):
+                continue
+            if cfg.excluded_pairs and sym in cfg.excluded_pairs:
+                continue
+            if cfg.enabled_pairs and sym not in cfg.enabled_pairs:
+                continue
+            if vol_map.get(sym, 0) < cfg.min_24h_volume_usdt:
+                continue
+            candidates.append(sym)
+        candidates.sort(key=lambda s: vol_map.get(s, 0), reverse=True)
+        candidates = candidates[:30]
+        candidates = [c for c in candidates if await is_volume_stable(c, cfg)]
+        if candidates:
+            cc["at"], cc["list"] = now, candidates
+    return cc["list"], px["map"]
+
+
+async def _s3360_candles(symbol: str, tf: str) -> list[list[float]]:
+    """Candele chiuse: si riscaricano solo quando ne e' chiusa una nuova (non ad ogni controllo)."""
+    now = time.time()
+    tf_sec = TF_SECONDS.get(tf, 3600)
+    hit = _s3360_candle_cache.get((symbol, tf))
+    if hit and hit[1] and now < hit[1][-1][0] + 2 * tf_sec + 3 and now - hit[0] < tf_sec * 3:
+        return hit[1]
+    candles = await exchange.get_klines(symbol, tf)
+    if candles:
+        _s3360_candle_cache[(symbol, tf)] = (now, candles)
+        return candles
+    if hit and hit[1] and now - hit[0] < 600:
+        return hit[1]
+    return []
+
+
+async def _s3360_log(symbol: str, tf: str, reason: str) -> None:
+    """Come log_reject, ma al massimo una volta ogni 5 minuti (15 per il motivo piu' comune) per moneta/timeframe/motivo."""
+    key = f"{symbol}|{tf}|{reason}"
+    ttl = 900.0 if reason.startswith("nessun nuovo ingresso") else 300.0
+    now = time.time()
+    if now - _s3360_log_at.get(key, 0.0) < ttl:
+        return
+    _s3360_log_at[key] = now
+    await log_reject(symbol, tf, "s3360", reason)
+
+
+async def _s3360_event(symbol: str, tf: str, rsi: float, price: float, candle_t: float, outcome: str) -> None:
+    """Registro dei segnali: una riga ogni volta che una moneta tocca la soglia, con l'esito. Tenuto 14 giorni."""
+    global _s3360_event_prune_at
+    key = (symbol, tf, candle_t, outcome)
+    if key in _s3360_event_seen:
+        return
+    if len(_s3360_event_seen) > 5000:
+        _s3360_event_seen.clear()
+    _s3360_event_seen.add(key)
+    try:
+        now = datetime.now(timezone.utc)
+        await db.signal_events.insert_one({
+            "strategy": "s3360", "symbol": symbol, "tf": tf, "rsi": round(float(rsi), 2),
+            "price": price, "outcome": outcome, "at": now.isoformat(),
+        })
+        if time.time() - _s3360_event_prune_at > 3600:
+            _s3360_event_prune_at = time.time()
+            await db.signal_events.delete_many({"at": {"$lt": (now - timedelta(days=14)).isoformat()}})
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def s3360_entry_loop() -> None:
+    """Unico chiamante del controllo d'ingresso 33/60 (due chiamanti potrebbero aprire due posizioni insieme)."""
+    await asyncio.sleep(15)
+    while True:
+        try:
+            await run_s3360_scan()
+        except Exception as e:  # noqa: BLE001
+            logger.exception("33/60 entry loop error: %s", e)
+        await asyncio.sleep(20)
+
+
+@api.get("/s3360/segnali")
+async def s3360_signals() -> dict[str, Any]:
+    rows = await db.signal_events.find({"strategy": "s3360"}, {"_id": 0}).sort("at", -1).to_list(150)
+    return {"rows": rows}
+
+
 async def run_s3360_scan() -> None:
     cfg = await get_config()
     if not cfg.s3360_enabled:
@@ -3521,36 +3650,7 @@ async def run_s3360_scan() -> None:
     if cash <= 1.0:
         return
 
-    tickers = await exchange.get_tickers()
-    vol_map: dict[str, float] = {}
-    for t in tickers:
-        try:
-            vol_map[t["symbol"]] = float(t.get("volValue") or 0)
-        except (TypeError, ValueError):
-            continue
-    symbols = await exchange.get_symbols()
-    quotes = {q.strip() for q in (cfg.quote_filter or "").split(",") if q.strip()}
-    candidates: list[str] = []
-    for s in symbols:
-        if not s.get("enableTrading"):
-            continue
-        sym = s.get("symbol")
-        if not sym:
-            continue
-        if quotes and s.get("quoteCurrency") not in quotes:
-            continue
-        if any(sym.upper().startswith(base) for base in EXCLUDED_STABLE_BASES):
-            continue
-        if cfg.excluded_pairs and sym in cfg.excluded_pairs:
-            continue
-        if cfg.enabled_pairs and sym not in cfg.enabled_pairs:
-            continue
-        if vol_map.get(sym, 0) < cfg.min_24h_volume_usdt:
-            continue
-        candidates.append(sym)
-    candidates.sort(key=lambda s: vol_map.get(s, 0), reverse=True)
-    candidates = candidates[:30]
-    candidates = [c for c in candidates if await is_volume_stable(c, cfg)]
+    candidates, last_prices = await _s3360_candidates(cfg)
 
     for symbol in candidates:
         if open_count >= cfg.s3360_max_open_positions:
@@ -3558,9 +3658,9 @@ async def run_s3360_scan() -> None:
         if await db.s3360_positions.find_one({"symbol": symbol, "status": "open"}):
             continue
         for tf in cfg.s3360_timeframes:
-            candles = await exchange.get_klines(symbol, tf)
+            candles = await _s3360_candles(symbol, tf)
             if len(candles) < cfg.s3360_rsi_period + 3:
-                await log_reject(symbol, tf, "s3360", "dati insufficienti")
+                await _s3360_log(symbol, tf, "dati insufficienti")
                 continue
             # Live entry: react to the RSI value AS IT IS RIGHT NOW, using the
             # real-time price as a stand-in for the still-forming candle's
@@ -3568,15 +3668,15 @@ async def run_s3360_scan() -> None:
             # ticking in real time. Waiting for that candle to actually
             # close (the old behaviour) missed fast touches that recovered
             # before the candle finished.
-            live_price = price_feed.get(symbol) or await price_feed.price_or_rest(symbol)
+            live_price = price_feed.get(symbol) or last_prices.get(symbol) or await price_feed.price_or_rest(symbol)
             if not live_price:
-                await log_reject(symbol, tf, "s3360", "prezzo live non disponibile")
+                await _s3360_log(symbol, tf, "prezzo live non disponibile")
                 continue
             closes = [c[2] for c in candles]
             live_rsis = rsi_wilder(closes + [live_price], cfg.s3360_rsi_period)
             live_rsi = live_rsis[-1]
             if live_rsi > cfg.s3360_low_threshold:
-                await log_reject(symbol, tf, "s3360", "nessun nuovo ingresso sotto soglia bassa")
+                await _s3360_log(symbol, tf, "nessun nuovo ingresso sotto soglia bassa")
                 continue
             # Dedup against the CURRENT still-forming candle's start time —
             # not the last closed one — so a live touch only attempts once
@@ -3585,7 +3685,7 @@ async def run_s3360_scan() -> None:
             tf_sec = TF_SECONDS.get(tf, 3600)
             forming_candle_t = candles[-1][0] + tf_sec
             if _s3360_last_candle.get((symbol, tf)) == forming_candle_t:
-                await log_reject(symbol, tf, "s3360", "stessa candela già tentata")
+                await _s3360_log(symbol, tf, "stessa candela già tentata")
                 continue
             if cfg.s3360_min_atr_pct > 0:
                 atr_now = atr_wilder(
@@ -3594,7 +3694,8 @@ async def run_s3360_scan() -> None:
                 # If the ATR cannot be computed, let the trade through (as before the filter).
                 if atr_now is not None and atr_now / live_price * 100.0 < cfg.s3360_min_atr_pct:
                     # Not marked as "attempted": volatility may pick up within this candle.
-                    await log_reject(symbol, tf, "s3360", "mercato troppo piatto (filtro volatilità)")
+                    await _s3360_log(symbol, tf, "mercato troppo piatto (filtro volatilità)")
+                    await _s3360_event(symbol, tf, live_rsi, live_price, forming_candle_t, "scartato: mercato troppo piatto")
                     continue
             if cfg.s3360_require_coin_trend or cfg.s3360_require_btc_trend or cfg.s3360_require_above_long_ema:
                 why = await trend_filter_block_reason(
@@ -3603,7 +3704,8 @@ async def run_s3360_scan() -> None:
                 )
                 if why:
                     # Not marked as "attempted": the trend may turn within this candle.
-                    await log_reject(symbol, tf, "s3360", why)
+                    await _s3360_log(symbol, tf, why)
+                    await _s3360_event(symbol, tf, live_rsi, live_price, forming_candle_t, "scartato: " + str(why))
                     continue
             rise_pct: Optional[float] = None
             day_open = await get_daily_open_price(symbol)
@@ -3616,7 +3718,8 @@ async def run_s3360_scan() -> None:
             ):
                 # Not marked as "attempted": the coin may cool off within this
                 # same candle and qualify on a later scan.
-                await log_reject(symbol, tf, "s3360", "già salita troppo oggi (filtro crescita giornaliera)")
+                await _s3360_log(symbol, tf, "già salita troppo oggi (filtro crescita giornaliera)")
+                await _s3360_event(symbol, tf, live_rsi, live_price, forming_candle_t, "scartato: già salita troppo oggi")
                 continue
             _s3360_last_candle[(symbol, tf)] = forming_candle_t
             signal = {
@@ -3626,6 +3729,10 @@ async def run_s3360_scan() -> None:
                 "daily_rise_pct": rise_pct,
             }
             await open_s3360_position(symbol, tf, signal, cfg)
+            _op = await db.s3360_positions.find_one({"symbol": symbol, "status": "open"}, {"_id": 0, "opened_at": 1})
+            _fresh = bool(_op) and (datetime.now(timezone.utc) - datetime.fromisoformat(_op["opened_at"])).total_seconds() < 30
+            await _s3360_event(symbol, tf, live_rsi, live_price, forming_candle_t,
+                               "aperta" if _fresh else "non aperta (capitale, limiti o reale bloccato: vedi registro)")
             open_count += 1
             break
 

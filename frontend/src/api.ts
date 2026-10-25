@@ -691,6 +691,11 @@ export const ictApi = {
   reset: () => req<{ ok: boolean }>("/ict/reset", { method: "POST" }),
 };
 
+export type S3360Signal = { at: string; symbol: string; tf: string; rsi: number; price: number; outcome: string };
+export const signalsApi = {
+  s3360: () => req<{ rows: S3360Signal[] }>("/s3360/segnali"),
+};
+
 export const realApi = {
   diagnosi: () => req<RealDiagnosi>("/real/diagnosi"),
   status: () => req<RealStatus>("/real/status"),

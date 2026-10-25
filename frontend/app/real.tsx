@@ -3,7 +3,7 @@ import { ActivityIndicator, Alert, Pressable, ScrollView, StyleSheet, Switch, Te
 import { useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
-import { realApi, RealDiagnosi, RealStatus } from "@/src/api";
+import { realApi, RealDiagnosi, RealStatus, signalsApi, S3360Signal } from "@/src/api";
 import { colors, font, radius, spacing } from "@/src/theme";
 
 const money = (n?: number | null) => (n === undefined || n === null || isNaN(n) ? "-" : `${n.toFixed(2)} USDC`);
@@ -22,12 +22,16 @@ export default function RealScreen() {
   const [msg, setMsg] = useState("");
   const [busy, setBusy] = useState(false);
   const [dg, setDg] = useState<RealDiagnosi | null>(null);
+  const [sg, setSg] = useState<S3360Signal[]>([]);
 
   const load = useCallback(async () => {
     try {
       setSt(await realApi.status());
       try {
         setDg(await realApi.diagnosi());
+      } catch {}
+      try {
+        setSg((await signalsApi.s3360()).rows);
       } catch {}
     } catch (e: any) {
       setMsg(String(e?.message ?? "Errore"));
@@ -185,6 +189,14 @@ export default function RealScreen() {
             ))}
           </View>
         )}
+
+        <Text style={[styles.big, { marginTop: spacing.lg }]}>Segnali visti dalla 33/60 (14 giorni)</Text>
+        {sg.length === 0 && <Text style={styles.note}>Ancora nessuno: compaiono quando una moneta tocca la soglia.</Text>}
+        {sg.slice(0, 40).map((r, i) => (
+          <Text key={i} style={[styles.log, r.outcome === "aperta" && { color: colors.success }]}>
+            {new Date(r.at).toLocaleString("it-IT", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" })} · {r.symbol} {r.tf} · RSI {r.rsi} · {r.outcome}
+          </Text>
+        ))}
 
         <Text style={[styles.big, { marginTop: spacing.lg }]}>Posizioni reali aperte</Text>
         {st.open_positions.length === 0 && <Text style={styles.note}>Nessuna.</Text>}
