@@ -179,7 +179,7 @@ class Config(BaseModel):
     s3360_min_net_profit_pct: float = 0.3  # exit rule: the sale must leave at least this NET profit (%) after the fees on both legs; the bot works out the price needed (only used with hold_below_entry)
     s3360_trailing_enabled: bool = True  # once the minimum net profit is reached, follow the highest price and sell if it falls back by s3360_trailing_pct — never below break-even (fees covered); only used with hold_below_entry
     s3360_trailing_pct: float = 0.3  # how far (%) below the highest price the trailing sells
-    s3360_rsi_giveback_enabled: bool = False  # extra exit: once the RSI has been above s3360_rsi_arm, selling as soon as it falls back below s3360_rsi_giveback (never below break-even when hold_below_entry is on)
+    s3360_rsi_giveback_enabled: bool = False  # extra exit: once the RSI has been above s3360_rsi_arm, selling as soon as it falls back below s3360_rsi_giveback — at ANY price, ignoring the minimum net profit / break-even rules
     s3360_rsi_arm: float = 52.0
     s3360_rsi_giveback: float = 50.0
     xrp_acc_enabled: bool = True
@@ -3771,7 +3771,9 @@ async def monitor_s3360_positions() -> None:
         elif trail_hit:
             hit, floor_price = "trailing_stop", break_even
         elif giveback_hit:
-            hit, floor_price = "rsi_ritorno", break_even
+            # Voluto dall'utente: questa uscita chiude SEMPRE, a qualunque prezzo (anche in perdita),
+            # senza guardare il guadagno minimo ne' il pareggio.
+            hit, floor_price = "rsi_ritorno", 0.0
         elif rsi_hit:
             # RSI reached the target but selling now would lock in less than the
             # minimum net profit: keep waiting. Both conditions must be true

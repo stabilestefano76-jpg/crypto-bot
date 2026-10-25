@@ -686,8 +686,8 @@ export default function SettingsScreen() {
               />
               <Text style={styles.scoreHintText}>
                 Uscita extra: dopo che l&apos;RSI ha superato {cfg.s3360_rsi_arm}, se poi scende sotto {cfg.s3360_rsi_giveback}{" "}
-                l&apos;operazione si chiude. Se non scende mai sotto, resta aperta fino al target. Con il guadagno minimo
-                acceso non vende mai sotto il pareggio (commissioni coperte): se il prezzo e&apos; piu&apos; basso aspetta.
+                l&apos;operazione si chiude SUBITO, a qualunque prezzo, anche in perdita: questa uscita ignora il guadagno
+                minimo e il pareggio. Se non scende mai sotto, resta aperta fino al target.
               </Text>
               <Text style={styles.scoreHintText}>
                 Trailing: appena il prezzo supera il livello del guadagno
