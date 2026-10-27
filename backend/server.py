@@ -182,6 +182,7 @@ class Config(BaseModel):
     s3360_rsi_giveback_enabled: bool = False  # extra exit: once the RSI has been above s3360_rsi_arm, selling as soon as it falls back below s3360_rsi_giveback — at ANY price, ignoring the minimum net profit / break-even rules
     s3360_rsi_arm: float = 52.0
     s3360_rsi_giveback: float = 50.0
+    s3360_rsi_giveback_timeframes: list[str] = Field(default_factory=lambda: ["1h", "4h", "1d"])  # timeframe su cui vale l'uscita RSI di ritorno
     xrp_acc_enabled: bool = True
     xrp_acc_timeframes: list[str] = Field(default_factory=lambda: ["1h"])
     xrp_acc_rsi_period: int = 14
@@ -3854,7 +3855,7 @@ async def monitor_s3360_positions() -> None:
         # Uscita extra "RSI di ritorno": dopo che l'RSI ha superato s3360_rsi_arm la posizione e' 'armata';
         # se poi l'RSI scende sotto s3360_rsi_giveback si esce (stesso pavimento delle altre uscite).
         giveback_hit = False
-        if cfg.s3360_rsi_giveback_enabled and rsis:
+        if cfg.s3360_rsi_giveback_enabled and rsis and tf in cfg.s3360_rsi_giveback_timeframes:
             if not p.get("rsi_armed") and rsis[-1] > cfg.s3360_rsi_arm:
                 p["rsi_armed"] = True
                 await db.s3360_positions.update_one({"id": p["id"]}, {"$set": {"rsi_armed": True}})

@@ -137,6 +137,7 @@ export default function SettingsScreen() {
     field:
       | "rsi_reversion_timeframes"
       | "s3360_timeframes"
+      | "s3360_rsi_giveback_timeframes"
       | "xrp_acc_timeframes",
     t: string
   ) => {
@@ -670,6 +671,22 @@ export default function SettingsScreen() {
                 onChange={(v) => update({ s3360_rsi_giveback_enabled: v })}
                 testID="toggle-s3360-rsi-giveback"
               />
+              <Text style={styles.fieldLabel}>Timeframe su cui vale questa uscita</Text>
+              <View style={styles.chipsRow}>
+                {TIMEFRAMES_30M.map((t) => {
+                  const active = (cfg.s3360_rsi_giveback_timeframes || []).includes(t);
+                  return (
+                    <Pressable
+                      key={t}
+                      onPress={() => toggleTimeframeFor("s3360_rsi_giveback_timeframes", t)}
+                      style={[styles.chip, active && styles.chipActive]}
+                      testID={`tf-select-s3360-giveback-${t}`}
+                    >
+                      <Text style={[styles.chipText, active && styles.chipTextActive]}>{t}</Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
               <NumRow
                 label="RSI da superare per armare l'uscita"
                 value={cfg.s3360_rsi_arm}
