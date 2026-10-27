@@ -42,6 +42,13 @@ const STRATEGIES: StrategyEntry[] = [
     route: "/ict",
   },
   {
+    key: "manual",
+    title: "Setup manuale",
+    subtitle: "Incolli un segnale (ingresso, stop, target): il bot calcola e ti chiede conferma",
+    icon: "clipboard",
+    route: "/manual",
+  },
+  {
     key: "real",
     title: "Trading reale",
     subtitle: "Soldi veri su Bybit: interruttore, limiti e STOP",

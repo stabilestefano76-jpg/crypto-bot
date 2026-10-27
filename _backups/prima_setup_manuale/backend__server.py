@@ -1,0 +1,5246 @@
+"""KuSignal Bot - KuCoin crypto signals backend.
+
+Public KuCoin REST API is used for candles and pair lists. No authenticated
+endpoints or order execution in this MVP.
+"""
+from __future__ import annotations
+
+import asyncio
+import base64
+import hashlib
+import hmac
+import logging
+import os
+import time
+import uuid
+from contextlib import asynccontextmanager
+from datetime import datetime, timedelta, timezone
+from pathlib import Path
+from typing import Any, Optional
+
+import httpx
+from cryptography.fernet import Fernet, InvalidToken
+from dotenv import load_dotenv
+from fastapi import APIRouter, FastAPI, HTTPException, Query, Request
+from fastapi.responses import JSONResponse
+from motor.motor_asyncio import AsyncIOMotorClient
+from pydantic import BaseModel, Field
+from pymongo import ReturnDocument
+from starlette.middleware.cors import CORSMiddleware
+
+ROOT_DIR = Path(__file__).parent
+load_dotenv(ROOT_DIR / ".env")
+
+mongo_url = os.environ["MONGO_URL"]
+client = AsyncIOMotorClient(mongo_url)
+db = client[os.environ["DB_NAME"]]
+
+logging.basicConfig(
+    level=logging.INFO,
+    format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
+)
+logger = logging.getLogger("kusignal")
+
+# ---------------------------------------------------------------------------
+# KuCoin constants
+# ---------------------------------------------------------------------------
+# ---------------------------------------------------------------------------
+# Bybit EU (MiCA) v5 — market data endpoints
+# ---------------------------------------------------------------------------
+BYBIT_BASE = "https://api.bybit.eu"
+BYBIT_WS_PUBLIC = "wss://stream.bybit.eu/v5/public"
+TF_MAP = {
+ "5m": "5",
+    "15m": "15",
+    "30m": "30",
+    "1h": "60",
+    "4h": "240",
+    "1d": "D",
+}
+TF_SECONDS = {"5m": 300, "15m": 900, "30m": 1800, "1h": 3600, "4h": 14400, "1d": 86400}
+DEFAULT_TIMEFRAMES = ["1h", "4h"]
+
+CANDLE_LIMIT = 200  # candles fetched per pair/tf
+
+# ---------------------------------------------------------------------------
+# Pydantic models
+# ---------------------------------------------------------------------------
+class Config(BaseModel):
+    scan_interval_minutes: int = 1
+    timeframes: list[str] = Field(default_factory=lambda: DEFAULT_TIMEFRAMES.copy())  # kept for backward compatibility with old stored configs — no longer read directly by the scan loop, see the three per-strategy lists below
+    rsi_reversion_timeframes: list[str] = Field(default_factory=lambda: DEFAULT_TIMEFRAMES.copy())
+    quote_filter: str = "USDC,EUR"  # Bybit EU spot quotes (comma-separated)
+    min_24h_volume_usdt: float = 100_000.0
+    rsi_period: int = 14
+    rsi_overbought: float = 70.0
+    rsi_oversold: float = 30.0
+    pivot_window: int = 5
+    volume_ma_period: int = 20
+    volume_spike_multiplier: float = 1.5
+    rr_ratio: float = 2.0
+    sl_padding_pct: float = 0.3  # min % buffer beyond FVG edge (fallback)
+    atr_period: int = 14
+    atr_sl_multiplier: float = 1.5  # SL buffer = max(atr_mult*ATR, sl_padding_pct)
+    min_rr_ratio: float = 1.5  # reject setups below this estimated R:R
+    premature_lookahead: int = 20  # candles to check if target would've been hit
+
+    signal_validity_candles: int = 5  # a condition counts if it happened within N bars
+    fvg_lookback: int = 40  # how far back to look for an open FVG
+    reversal_rejection_wick_ratio: float = 1.5  # wick/body ratio for rejection candle
+    max_pairs_per_scan: int = 200  # cap for MVP performance
+    enabled_pairs: list[str] = Field(default_factory=list)  # empty = all matching filter
+    excluded_pairs: list[str] = Field(default_factory=list)
+    # --- Position management: timeout / breakeven / trailing ---
+    timeout_15m: int = 14
+    timeout_1h: int = 7
+    timeout_4h: int = 5
+    timeout_1d: int = 3
+    timeout_min_r: float = 0.3  # move to BE if profit_in_R below this at timeout
+    breakeven_safety_pct: float = 0.05  # % safety margin added to breakeven
+    default_fee_rate: float = 0.001  # LEGACY: no longer read, replaced by sim_fee_pct (kept so stored configs still load)
+    trailing_activation_r: float = 1.0  # activate trailing when profit_in_R >= this
+    partial_close_enabled: bool = True
+    partial_close_r: float = 1.0
+    partial_close_pct: float = 35.0  # % of position closed at partial_close_r
+    liq_min_distance_pct: float = 25.0  # leverage: min distance from liquidation (%)
+    # --- LEGACY (Rev Pre-FVG was removed; fields kept so the Settings screen and stored configs keep working) ---
+    consolidation_min_candles: int = 3
+    consolidation_max_atr: float = 1.5  # channel width <= this * ATR
+    tp1_pct: float = 65.0  # % closed at TP1
+    # --- LEGACY counter-trend RSI filters (strategy removed; kept for compatibility) ---
+    rsi_high_tf_ob: float = 80.0  # higher-TF overbought (short)
+    rsi_high_tf_os: float = 20.0  # higher-TF oversold (long)
+    trailing_pct_from_entry: float = 1.0  # counter-trend trailing distance %
+    post_tp1_advance_pct: float = 0.5  # % beyond TP1 before moving SL to TP1 (net fees)
+    # --- Parallel strategy selection ---
+    enabled_strategies: list[str] = Field(default_factory=list)  # only "rsi_reversion" is acted upon here (the other names are ignored); empty = ["rsi_reversion"]
+    real_trading_enabled: bool = False  # master switch for REAL orders (off by default)
+    real_max_order_usdc: float = 30.0
+    real_max_total_usdc: float = 30.0
+    real_daily_loss_usdc: float = 3.0
+    live_strategies: list[str] = Field(default_factory=list)  # which strategies currently trade with REAL money via Bybit — empty means ALL of them are in paper mode (the safe default). No trading logic reads this yet; it's wired strategy-by-strategy as each one gets connected to real order placement.
+    # --- LEGACY FVG Reversal params (strategy removed; kept for compatibility) ---
+    fvgr_rsi_high_tf_ob: float = 80.0
+    fvgr_rsi_high_tf_os: float = 20.0
+    fvgr_tp1_pct: float = 65.0
+    fvgr_tp2_pct: float = 35.0
+    fvgr_post_tp1_advance_pct: float = 0.5
+    fvgr_trailing_pct: float = 1.0  # trailing distance % (from best price), when in profit
+    fvgr_atr_sl_multiplier: float = 1.5
+    fvgr_min_rr_ratio: float = 1.5
+    # --- Trend Exhaustion Score (additive, COUNTER-TREND strategies only:
+    # "counter_trend" / Rev Pre-FVG and "fvg_reversal" / FVG Reversal). Not
+    # used by "scoring" or "impulse_fvg". ---
+    exhaustion_lookback: int = 20  # was 10 — too small a window left condition #3 (needs 2 confirmed RSI pivots) almost no room to ever find them
+    exhaustion_min_score: float = 1.0  # was 2.0 — lowered so it stops being an extra hard gate; raise back to 2.0 (or more) in Settings any time
+    rsi_divergence_check_enabled: bool = True  # Rev Pre-FVG, FVG Reversal, RSI Reversion: require RSI/price divergence coherent with the trade direction
+    trend_htf_check_enabled: bool = True  # Rev Pre-FVG, FVG Reversal: require a genuine (non-range) trend on the higher timeframe before considering a setup
+    exhaustion_check_enabled: bool = True  # Rev Pre-FVG, FVG Reversal: require the trend-exhaustion score to clear exhaustion_min_score
+    trend_structure_strict: bool = False  # False = only ONE of higher-high/higher-low (or the "down" mirror) is needed to call a trend, not both — set True in Settings to go back to the strict textbook definition
+    trailing_enabled: bool = True  # used by the 3 traditional strategies (Rev Pre-FVG, FVG Reversal, RSI Reversion): once price reaches the original target, arm a trailing stop instead of closing immediately, to let a strong run continue
+    trailing_atr_mult: float = 0.5  # how far (in ATR multiples) price may pull back from its post-target peak before the trailing stop closes the trade
+    # --- RSI Reversion strategy (independent, simple): RSI extreme -> confirmed
+    # reentry -> target back near RSI-50 (proxied by price returning to its own
+    # N-period average). Deliberately no tight stop, only a wide catastrophic
+    # one, on the assumption overbought/oversold eventually rebalances. ---
+    rsi_rev_overbought: float = 80.0
+    rsi_rev_oversold: float = 20.0
+    rsi_rev_min_extreme_candles: int = 3  # min candles RSI must stay beyond 80/20 before reentry counts
+    rsi_rev_catastrophic_atr_mult: float = 3.0  # wide safety stop, only for extreme/structural cases — lowered from 5-6: combined with the new min R:R gate below, an overly wide floor here was rejecting/mismatching too many otherwise-valid setups
+    rsi_rev_structural_lookback: int = 10  # candles used to find the recent swing high/low that now anchors the stop, with the ATR buffer above only as a minimum safety margin
+    rsi_rev_min_rr_ratio: float = 1.5  # was 3.0 — zero trades fired in days at that bar; still requires a genuinely favorable setup (reward at least 1.5x the risk), just not an extreme one that almost never occurs naturally
+    rsi_rev_trailing_atr_mult: float = 3.0  # wide trailing once in profit — only to catch a genuine sudden reversal, not to lock in small moves
+    rsi_rev_trailing_activation_margin_pct: float = 0.5  # trailing now activates only once profit clears an ESTIMATED round-trip fee cost plus this extra % — not at the very first cent of profit, which was too easy to trigger on pure noise
+    # --- Shared BTC market regime (built for the removed Top 10 Long strategy; kept on purpose because 33/60 and the position-size trim read it) ---
+    top10_universe_size: int = 10  # how many coins to consider each scan, ranked by 24h volume (proxy for market cap)
+    top10_ema_fast: int = 20
+    top10_ema_medium: int = 50
+    top10_ema_slow: int = 200
+    s3360_enabled: bool = True
+    s3360_timeframes: list[str] = Field(default_factory=lambda: ["1h"])
+    s3360_rsi_period: int = 14
+    s3360_low_threshold: float = 35.0  # entry: RSI crosses down through this
+    s3360_high_threshold: float = 60.0  # exit target: RSI reaching this closes the trade
+    s3360_max_open_positions: int = 4  # ALSO doubles as the capital-sizing divisor: each trade gets equity/max_open_positions — e.g. 2 slots = 50% each, 4 slots = 25% each. Not just a cap on count.
+    s3360_max_daily_rise_pct: float = 0.0  # entry filter: skip a coin that is already up more than this % since the current UTC day opened (0 = filter off, the old behaviour)
+    trend_filter_timeframe: str = "1h"  # trend filter: timeframe on which the coin's own trend is read (EMA fast above EMA slow = trend is long)
+    trend_filter_ema_fast: int = 20  # trend filter: fast EMA period
+    trend_filter_ema_slow: int = 50  # trend filter: slow EMA period
+    s3360_require_coin_trend: bool = False  # entry filter: open only if the coin's own trend is long (EMA fast > EMA slow on trend_filter_timeframe)
+    trend_filter_long_timeframe: str = "1d"  # trend filter: timeframe on which the long EMA is read (daily, to judge the big trend)
+    trend_filter_ema_long: int = 200  # trend filter: long EMA period; with the 'above long EMA' switches on, the price must be above it
+    s3360_require_above_long_ema: bool = False  # entry filter: live price must be above the long EMA (default 200) on trend_filter_timeframe
+    xrp_acc_require_above_long_ema: bool = False  # same, for XRP Accumulation
+    s3360_require_btc_trend: bool = False  # entry filter: open only if BTC's regime is bullish (same regime used for position sizing)
+    xrp_acc_require_coin_trend: bool = False  # same as s3360_require_coin_trend, for XRP Accumulation
+    xrp_acc_require_btc_trend: bool = False  # same as s3360_require_btc_trend, for XRP Accumulation
+    s3360_min_atr_pct: float = 0.0  # entry filter: skip when the timeframe's ATR (as % of price) is below this — in a dead-flat market the rebounds are tiny (0 = filter off)
+    s3360_hold_below_entry: bool = True  # exit rule: when RSI reaches the target but the price is still below the entry (plus the margin below), keep the position open instead of closing at a loss
+    s3360_min_net_profit_pct: float = 0.3  # exit rule: the sale must leave at least this NET profit (%) after the fees on both legs; the bot works out the price needed (only used with hold_below_entry)
+    s3360_trailing_enabled: bool = True  # once the minimum net profit is reached, follow the highest price and sell if it falls back by s3360_trailing_pct — never below break-even (fees covered); only used with hold_below_entry
+    s3360_trailing_pct: float = 0.3  # how far (%) below the highest price the trailing sells
+    s3360_rsi_giveback_enabled: bool = False  # extra exit: once the RSI has been above s3360_rsi_arm, selling as soon as it falls back below s3360_rsi_giveback — at ANY price, ignoring the minimum net profit / break-even rules
+    s3360_rsi_arm: float = 52.0
+    s3360_rsi_giveback: float = 50.0
+    s3360_rsi_giveback_timeframes: list[str] = Field(default_factory=lambda: ["1h", "4h", "1d"])  # timeframe su cui vale l'uscita RSI di ritorno
+    xrp_acc_enabled: bool = True
+    xrp_acc_timeframes: list[str] = Field(default_factory=lambda: ["1h"])
+    xrp_acc_rsi_period: int = 14
+    xrp_acc_low_threshold: float = 25.0  # entry: buy ALL trading capital when RSI drops to/below this
+    xrp_acc_high_threshold: float = 60.0  # exit: sell everything when RSI rises to/above this
+    xrp_acc_hold_below_entry: bool = True  # exit rule: when RSI reaches the target but the price is still below the entry (plus the margin below), keep the position open instead of selling at a loss
+    xrp_acc_min_net_profit_pct: float = 0.3  # exit rule: the sale must leave at least this NET profit (%) after the fees on both legs; the bot works out the price needed (only used with hold_below_entry)
+    xrp_acc_trailing_enabled: bool = True  # once the minimum net profit is reached, follow the highest price and sell if it falls back by xrp_acc_trailing_pct — never below break-even (fees covered); only used with hold_below_entry
+    xrp_acc_trailing_pct: float = 0.3  # how far (%) below the highest price the trailing sells
+    # --- ICT (meccanico, solo long): sweep -> MSS -> ritorno nel gap. Paper di default.
+    ict_enabled: bool = True
+    ict_symbols: list[str] = Field(default_factory=lambda: ["BTCUSDC", "ETHUSDC", "SOLUSDC", "XRPUSDC"])
+    ict_timeframe: str = "15m"
+    ict_rr: float = 2.0
+    ict_kill_zones: bool = True
+    ict_alloc_pct: float = 25.0
+    ict_max_open: int = 2
+    ict_max_hold_h: float = 48.0
+    ict_capital: float = 200.0
+    sim_realistic_fills: bool = True  # paper fills of 33/60 and XRP Accumulation use the REAL order book (buy at the ask side, sell at the bid side, walking the depth) instead of the last traded price
+    sim_fallback_slippage_pct: float = 0.05  # when the order book cannot be read (or is too thin for the order), the fill is the last price made worse by this % per side
+    sim_fee_pct: float = 0.25  # exchange fee per side (%), charged on both legs of every paper trade — the Bybit EU rate the account actually pays (taker)
+
+    regime_risk_reduction_pct: float = 50.0  # position size cut applied to RSI Reversion and 33/60 whenever BTC's regime isn't clearly bullish (range or bearish) — trims risk during an uncertain/consolidating phase instead of sizing every trade the same
+
+
+class Signal(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    symbol: str
+    timeframe: str
+    side: str  # "long" or "short"
+    entry: float
+    stop_loss: float
+    take_profit: float
+    rr_ratio: float
+    confirmations: list[str]
+    strength: int  # number of satisfied conditions
+    score: float = 0.0  # weighted confluence score
+    max_score: float = 0.0  # max achievable score with active weights
+    reversal_signals: list[str] = Field(default_factory=list)  # FVG reversal contributors
+    strategy: str = "counter_trend"  # "counter_trend" | "fvg_reversal" | "rsi_reversion" (the first two only appear in old records)
+    tp1: float = 0.0
+    tp2: float = 0.0
+    consolidation_high: float = 0.0
+    consolidation_low: float = 0.0
+    rsi_value: float
+    volume_ratio: float
+    created_at: str  # ISO string
+    fvg_top: float
+    fvg_bottom: float
+    atr: float = 0.0  # ATR value at entry (same units as price)
+    atr_multiplier: float = 0.0  # multiplier applied for the SL buffer
+    status: str = "active"  # active | hit_tp | hit_sl | expired
+    outcome: Optional[str] = None
+
+
+class ScanState(BaseModel):
+    last_scan_at: Optional[str] = None
+    last_scan_duration_s: Optional[float] = None
+    last_scanned_pairs: int = 0
+    last_signals_found: int = 0
+    is_scanning: bool = False
+
+
+# ---------------------------------------------------------------------------
+# Paper trading models
+# ---------------------------------------------------------------------------
+class PaperConfig(BaseModel):
+    initial_capital: float = 10000.0
+    risk_per_trade_pct: float = 1.0  # % of equity risked per position
+    auto_execute: bool = False
+    max_open_positions: int = 5
+    trading_mode: str = "spot"  # "spot" or "leverage"
+    max_position_size_usdt: float = 10.0  # HARD cap per single trade
+    one_position_per_pair: bool = True
+
+
+class PaperPosition(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    signal_id: str
+    symbol: str
+    timeframe: str
+    side: str  # long | short
+    entry: float  # signal entry (planned)
+    fill_price: float = 0.0  # actual execution price
+    slippage_usdt: float = 0.0
+    slippage_pct: float = 0.0
+    stop_loss: float
+    take_profit: float
+    quantity: float
+    risk_usdt: float
+    opened_at: str
+    # --- Position management (timeout / breakeven / trailing) ---
+    current_stop: float = 0.0  # active stop (0 = use stop_loss)
+    initial_risk: float = 0.0  # |entry - stop_loss| at open
+    breakeven_active: bool = False
+    trailing_active: bool = False
+    partial_closed: bool = False
+    last_trail_candle_t: float = 0.0  # last candle time used to recompute trailing
+    liquidation_price: float = 0.0  # leverage only (0 = unknown/spot)
+    strategy: str = "counter_trend"
+    tp1: float = 0.0
+    tp2: float = 0.0
+    atr: float = 0.0  # copied from the signal at open — used by RSI Reversion's trailing stop
+    peak_price: Optional[float] = None  # RSI Reversion trailing: best price seen since armed
+
+
+class PaperTrade(BaseModel):
+    id: str = Field(default_factory=lambda: str(uuid.uuid4()))
+    signal_id: str
+    symbol: str
+    side: str
+    entry: float
+    exit: float
+    quantity: float
+    pnl_usdt: float
+    pnl_pct: float
+    outcome: str  # win | loss
+    opened_at: str
+    closed_at: str
+    strategy: str = "counter_trend"
+    timeframe: Optional[str] = None
+    stop_loss: Optional[float] = None  # the ORIGINAL stop set on open — kept for the closed-trade record so screens don't have to fabricate a placeholder
+    take_profit: Optional[float] = None  # the ORIGINAL target set on open (may differ from the actual exit price if closed some other way, e.g. trailing)
+
+
+class ExchangeConnectRequest(BaseModel):
+    api_key: str
+    api_secret: str
+    api_passphrase: Optional[str] = None  # unused for Bybit; kept for compatibility
+
+
+# ---------------------------------------------------------------------------
+# Encryption for exchange credentials (at-rest)
+# ---------------------------------------------------------------------------
+KEY_PATH = ROOT_DIR / ".fernet_key"
+
+
+def _load_or_create_fernet() -> Fernet:
+    # Preferred: derive the key from the ENCRYPTION_SECRET variable (set on
+    # Railway). The container's filesystem is wiped on every deploy, so a key
+    # file alone would be regenerated each time and every stored credential
+    # would silently become undecryptable. A variable survives deploys.
+    secret = os.environ.get("ENCRYPTION_SECRET", "").strip()
+    if secret:
+        derived = base64.urlsafe_b64encode(hashlib.sha256(secret.encode()).digest())
+        return Fernet(derived)
+    if KEY_PATH.exists():
+        return Fernet(KEY_PATH.read_bytes())
+    key = Fernet.generate_key()
+    KEY_PATH.write_bytes(key)
+    try:
+        os.chmod(KEY_PATH, 0o600)
+    except OSError:
+        pass
+    return Fernet(key)
+
+
+fernet = _load_or_create_fernet()
+
+
+def encrypt_str(v: str) -> str:
+    return fernet.encrypt(v.encode()).decode()
+
+
+def decrypt_str(v: str) -> str:
+    return fernet.decrypt(v.encode()).decode()
+
+
+# ---------------------------------------------------------------------------
+# Technical analysis helpers (numpy free — pure python for MVP simplicity)
+# ---------------------------------------------------------------------------
+def rsi_wilder(closes: list[float], period: int = 14) -> list[Optional[float]]:
+    if len(closes) < period + 1:
+        return [None] * len(closes)
+    gains: list[float] = []
+    losses: list[float] = []
+    for i in range(1, len(closes)):
+        change = closes[i] - closes[i - 1]
+        gains.append(max(change, 0.0))
+        losses.append(max(-change, 0.0))
+    avg_gain = sum(gains[:period]) / period
+    avg_loss = sum(losses[:period]) / period
+    rsis: list[Optional[float]] = [None] * (period)
+    if avg_loss == 0:
+        rsis.append(100.0)
+    else:
+        rs = avg_gain / avg_loss
+        rsis.append(100.0 - 100.0 / (1.0 + rs))
+    for i in range(period, len(gains)):
+        avg_gain = (avg_gain * (period - 1) + gains[i]) / period
+        avg_loss = (avg_loss * (period - 1) + losses[i]) / period
+        if avg_loss == 0:
+            rsis.append(100.0)
+        else:
+            rs = avg_gain / avg_loss
+            rsis.append(100.0 - 100.0 / (1.0 + rs))
+    return rsis
+
+
+def detect_pivots(series: list[float], window: int = 5) -> tuple[list[int], list[int]]:
+    """Return (lows, highs) indices where index is a local pivot."""
+    lows: list[int] = []
+    highs: list[int] = []
+    for i in range(window, len(series) - window):
+        seg = series[i - window : i + window + 1]
+        v = series[i]
+        if v == min(seg) and seg.count(v) == 1:
+            lows.append(i)
+        if v == max(seg) and seg.count(v) == 1:
+            highs.append(i)
+    return lows, highs
+
+
+def detect_rsi_divergence(
+    closes: list[float], rsis: list[Optional[float]], window: int = 5
+) -> Optional[str]:
+    """Return 'bullish', 'bearish' or None based on last 2 relevant pivots."""
+    # Bullish: lower low in price, higher low in RSI
+    # Bearish: higher high in price, lower high in RSI
+    lows, highs = detect_pivots(closes, window)
+    # keep recent pivots only within lookback ~50 bars
+    lookback = 50
+    n = len(closes)
+    lows = [i for i in lows if i >= n - lookback and rsis[i] is not None]
+    highs = [i for i in highs if i >= n - lookback and rsis[i] is not None]
+
+    if len(lows) >= 2:
+        i1, i2 = lows[-2], lows[-1]
+        if closes[i2] < closes[i1] and (rsis[i2] or 0) > (rsis[i1] or 0):
+            return "bullish"
+    if len(highs) >= 2:
+        i1, i2 = highs[-2], highs[-1]
+        if closes[i2] > closes[i1] and (rsis[i2] or 0) < (rsis[i1] or 0):
+            return "bearish"
+    return None
+
+
+def volume_spike_ratio(volumes: list[float], period: int = 20) -> float:
+    if len(volumes) < period + 1:
+        return 1.0
+    avg = sum(volumes[-period - 1 : -1]) / period
+    if avg == 0:
+        return 1.0
+    return volumes[-1] / avg
+
+
+def atr_wilder(
+    highs: list[float], lows: list[float], closes: list[float], period: int = 14
+) -> Optional[float]:
+    """Average True Range (Wilder smoothing). Returns latest ATR value."""
+    n = len(closes)
+    if n < period + 1:
+        return None
+    trs: list[float] = []
+    for i in range(1, n):
+        tr = max(
+            highs[i] - lows[i],
+            abs(highs[i] - closes[i - 1]),
+            abs(lows[i] - closes[i - 1]),
+        )
+        trs.append(tr)
+    if len(trs) < period:
+        return None
+    atr = sum(trs[:period]) / period
+    for tr in trs[period:]:
+        atr = (atr * (period - 1) + tr) / period
+    return atr
+
+
+# ---------------------------------------------------------------------------
+# KuCoin client
+# ---------------------------------------------------------------------------
+def _bybit_category(trading_mode: str) -> str:
+    """Map the bot's trading_mode to a Bybit v5 market category."""
+    return "linear" if trading_mode == "leverage" else "spot"
+
+
+class BybitClient:
+    """Bybit EU v5 public market-data client. Returns data normalized to the
+    same shapes the rest of the bot expects (drop-in for the old KuCoin client):
+      - get_symbols(): [{symbol, quoteCurrency, enableTrading}]
+      - get_tickers(): [{symbol, last, volValue}]
+      - get_klines():  [[time_s, open, close, high, low, volume], ...] ascending
+    """
+
+    def __init__(self) -> None:
+        self._client = httpx.AsyncClient(base_url=BYBIT_BASE, timeout=15.0)
+        self._sema = asyncio.Semaphore(15)
+        self.category = "spot"  # updated from paper trading_mode
+
+    async def close(self) -> None:
+        await self._client.aclose()
+
+    async def _get(self, path: str, params: Optional[dict] = None) -> Any:
+        async with self._sema:
+            for attempt in range(3):
+                try:
+                    r = await self._client.get(path, params=params)
+                    if r.status_code == 429:
+                        await asyncio.sleep(1.0 + attempt)
+                        continue
+                    r.raise_for_status()
+                    return r.json()
+                except (httpx.HTTPError, httpx.ReadTimeout) as e:
+                    if attempt == 2:
+                        logger.warning("Bybit GET failed %s: %s", path, e)
+                        return None
+                    await asyncio.sleep(0.5)
+            return None
+
+    async def get_symbols(self) -> list[dict[str, Any]]:
+        data = await self._get(
+            "/v5/market/instruments-info", params={"category": self.category}
+        )
+        if not data or data.get("retCode") != 0:
+            return []
+        out: list[dict[str, Any]] = []
+        for it in data.get("result", {}).get("list", []):
+            out.append({
+                "symbol": it.get("symbol"),
+                "quoteCurrency": it.get("quoteCoin"),
+                "enableTrading": it.get("status") == "Trading",
+            })
+        return out
+
+    async def get_tickers(self) -> list[dict[str, Any]]:
+        data = await self._get(
+            "/v5/market/tickers", params={"category": self.category}
+        )
+        if not data or data.get("retCode") != 0:
+            return []
+        out: list[dict[str, Any]] = []
+        for t in data.get("result", {}).get("list", []):
+            out.append({
+                "symbol": t.get("symbol"),
+                "last": t.get("lastPrice"),
+                "volValue": t.get("turnover24h"),  # 24h quote volume
+                "changeRate": t.get("price24hPcnt"),  # 24h change (fraction)
+            })
+        return out
+
+    async def get_klines(self, symbol: str, tf: str, limit: int = CANDLE_LIMIT) -> list[list[float]]:
+        bybit_tf = TF_MAP.get(tf)
+        if not bybit_tf:
+            return []
+        data = await self._get(
+            "/v5/market/kline",
+            params={
+                "category": self.category,
+                "symbol": symbol,
+                "interval": bybit_tf,
+                "limit": limit + 1,
+            },
+        )
+        if not data or data.get("retCode") != 0:
+            return []
+        # Bybit returns newest-first: [start_ms, open, high, low, close, volume, turnover]
+        raw = data.get("result", {}).get("list", [])
+        raw = list(reversed(raw))  # ascending by time
+        # Drop the last, still-forming candle so signal logic and chart rendering
+        # both reference the same CLOSED candles.
+        if len(raw) > 1:
+            raw = raw[:-1]
+        candles: list[list[float]] = []
+        for row in raw[-limit:]:
+            try:
+                candles.append([
+                    float(row[0]) / 1000.0,  # time (ms -> s)
+                    float(row[1]),           # open
+                    float(row[4]),           # close
+                    float(row[2]),           # high
+                    float(row[3]),           # low
+                    float(row[5]),           # volume
+                ])
+            except (ValueError, IndexError):
+                continue
+        return candles
+
+
+exchange = BybitClient()
+
+
+# ---------------------------------------------------------------------------
+# Real-time price feed via Bybit v5 public WebSocket
+# ---------------------------------------------------------------------------
+class PriceFeed:
+    """Maintains a live cache of last prices via Bybit v5 public WS.
+
+    Subscribes to the tickers of currently open paper positions so SL/TP can
+    trigger with minimal delay. Falls back to REST if the socket drops.
+    """
+
+    def __init__(self) -> None:
+        self.prices: dict[str, float] = {}
+        self.updated_at: dict[str, float] = {}
+        self._ws: Optional[Any] = None
+        self._subscribed: set[str] = set()
+        self._connected = False
+        self._lock = asyncio.Lock()
+
+    def get(self, symbol: str) -> Optional[float]:
+        p = self.prices.get(symbol)
+        if p is None:
+            return None
+        # A price that hasn't been refreshed in 10s is NOT a live price: once a
+        # coin stops being followed over the websocket its last tick used to
+        # stay in this cache forever, and every caller kept reading it as if
+        # it were current — producing positions that "hit" a target or a stop
+        # within a second of opening, against a price that was hours old.
+        # Returning None here makes every caller fall back to a fresh REST
+        # price (they all already do).
+        if time.time() - self.updated_at.get(symbol, 0) > 10:
+            return None
+        return p
+
+    async def desired_symbols(self) -> list[str]:
+        docs = await db.paper_positions.find({}, {"symbol": 1, "_id": 0}).to_list(1000)
+        symbols = {d["symbol"] for d in docs}
+        # The independent strategies' open positions need live prices too —
+        # otherwise their floating P&L falls back to the entry price (shown
+        # as 0.00) for any coin the websocket isn't following.
+        for coll in (
+            db.s3360_positions,
+            db.xrp_acc_positions,
+            db.ict_positions,
+        ):
+            rows = await coll.find({"status": "open"}, {"symbol": 1, "_id": 0}).to_list(1000)
+            symbols |= {d["symbol"] for d in rows}
+        # XRP Accumulation checks its entry every few seconds, so XRPUSDC must
+        # be followed live permanently, not only while a position is open.
+        if (await get_config()).xrp_acc_enabled:
+            symbols.add(XRP_ACC_SYMBOL)
+        _c = await get_config()
+        if _c.ict_enabled:
+            symbols |= set(_c.ict_symbols)
+        return sorted(symbols)
+
+    def _ws_url(self) -> str:
+        return f"{BYBIT_WS_PUBLIC}/{exchange.category}"
+
+    async def run(self) -> None:
+        import websockets  # local import, dep added
+
+        while True:
+            url = self._ws_url()
+            try:
+                async with websockets.connect(url, ping_interval=None) as ws:
+                    self._ws = ws
+                    self._connected = True
+                    self._subscribed.clear()
+                    logger.info("Bybit WS connected: %s", url)
+                    ping_task = asyncio.create_task(self._ping_loop(ws))
+                    sub_task = asyncio.create_task(self._resub_loop(ws))
+                    try:
+                        async for raw in ws:
+                            self._handle(raw)
+                    finally:
+                        ping_task.cancel()
+                        sub_task.cancel()
+            except Exception as e:  # noqa: BLE001
+                logger.warning("Bybit WS error, reconnecting: %s", e)
+            self._connected = False
+            self._ws = None
+            await asyncio.sleep(3)
+
+    async def _ping_loop(self, ws: Any) -> None:
+        import json as _json
+        while True:
+            await asyncio.sleep(20)
+            try:
+                await ws.send(_json.dumps({"op": "ping"}))
+            except Exception:
+                return
+
+    async def _resub_loop(self, ws: Any) -> None:
+        """Keep subscriptions in sync with open positions."""
+        import json as _json
+        while True:
+            try:
+                want = set(await self.desired_symbols())
+                to_add = want - self._subscribed
+                to_remove = self._subscribed - want
+                if to_add:
+                    await ws.send(_json.dumps({
+                        "op": "subscribe",
+                        "args": [f"tickers.{s}" for s in to_add],
+                    }))
+                    self._subscribed |= to_add
+                if to_remove:
+                    await ws.send(_json.dumps({
+                        "op": "unsubscribe",
+                        "args": [f"tickers.{s}" for s in to_remove],
+                    }))
+                    self._subscribed -= to_remove
+            except Exception:
+                return
+            await asyncio.sleep(3)
+
+    def _handle(self, raw: str) -> None:
+        import json as _json
+        try:
+            msg = _json.loads(raw)
+        except (ValueError, TypeError):
+            return
+        topic = msg.get("topic", "")
+        if not topic.startswith("tickers."):
+            return
+        symbol = topic.split(".", 1)[1]
+        data = msg.get("data", {})
+        # spot pushes full snapshots; linear pushes deltas that may omit lastPrice
+        price = data.get("lastPrice")
+        if price is None:
+            return
+        try:
+            self.prices[symbol] = float(price)
+            self.updated_at[symbol] = time.time()
+        except (TypeError, ValueError):
+            pass
+
+    async def price_or_rest(self, symbol: str) -> Optional[float]:
+        """Return live WS price if fresh (<10s), else REST fallback."""
+        p = self.prices.get(symbol)
+        ts = self.updated_at.get(symbol, 0)
+        if p and (time.time() - ts) < 10:
+            return p
+        try:
+            async with httpx.AsyncClient(base_url=BYBIT_BASE, timeout=8.0) as c:
+                r = await c.get(
+                    "/v5/market/tickers",
+                    params={"category": exchange.category, "symbol": symbol},
+                )
+                d = r.json()
+                if d.get("retCode") == 0 and d.get("result", {}).get("list"):
+                    return float(d["result"]["list"][0]["lastPrice"])
+        except (httpx.HTTPError, KeyError, TypeError, ValueError):
+            pass
+        return None
+
+
+price_feed = PriceFeed()
+
+
+# ---------------------------------------------------------------------------
+# Config helpers
+# ---------------------------------------------------------------------------
+CONFIG_ID = "singleton"
+
+
+async def get_config() -> Config:
+    doc = await db.config.find_one({"_id": CONFIG_ID}, {"_id": 0})
+    if not doc:
+        cfg = Config()
+        await db.config.update_one(
+            {"_id": CONFIG_ID}, {"$set": cfg.model_dump()}, upsert=True
+        )
+        return cfg
+    return Config(**doc)
+
+
+async def save_config(cfg: Config) -> Config:
+    await db.config.update_one(
+        {"_id": CONFIG_ID}, {"$set": cfg.model_dump()}, upsert=True
+    )
+    return cfg
+
+
+# ---------------------------------------------------------------------------
+# Paper trading helpers
+# ---------------------------------------------------------------------------
+PAPER_CFG_ID = "singleton"
+PAPER_STATE_ID = "singleton"
+
+
+async def get_paper_config() -> PaperConfig:
+    doc = await db.paper_config.find_one({"_id": PAPER_CFG_ID}, {"_id": 0})
+    if not doc:
+        cfg = PaperConfig()
+        await db.paper_config.update_one(
+            {"_id": PAPER_CFG_ID}, {"$set": cfg.model_dump()}, upsert=True
+        )
+    else:
+        cfg = PaperConfig(**doc)
+    # Keep the Bybit market category in sync with the bot's trading mode.
+    exchange.category = _bybit_category(cfg.trading_mode)
+    return cfg
+
+
+async def save_paper_config(cfg: PaperConfig) -> PaperConfig:
+    await db.paper_config.update_one(
+        {"_id": PAPER_CFG_ID}, {"$set": cfg.model_dump()}, upsert=True
+    )
+    return cfg
+
+
+async def get_paper_cash() -> float:
+    """Return current cash (initial + realized PnL)."""
+    doc = await db.paper_state.find_one({"_id": PAPER_STATE_ID}, {"_id": 0})
+    if doc and "cash" in doc:
+        return float(doc["cash"])
+    cfg = await get_paper_config()
+    await db.paper_state.update_one(
+        {"_id": PAPER_STATE_ID},
+        {"$set": {"cash": cfg.initial_capital}},
+        upsert=True,
+    )
+    return cfg.initial_capital
+
+
+async def set_paper_cash(cash: float) -> None:
+    await db.paper_state.update_one(
+        {"_id": PAPER_STATE_ID}, {"$set": {"cash": cash}}, upsert=True
+    )
+
+
+# ---------------------------------------------------------------------------
+# Per-strategy fund isolation ("cross" by default, "isolated" on request) for
+# the three traditional strategies. By default a
+# strategy has no dedicated wallet and draws from/settles to the SHARED main
+# paper wallet (get_paper_cash/set_paper_cash above) exactly as before. If the
+# user allocates funds to a specific strategy, that strategy gets its own
+# isolated cash pool and stops touching the shared one, until deallocated.
+# ---------------------------------------------------------------------------
+STRATEGY_WALLET_NAMES = ("rsi_reversion",)
+
+
+async def get_strategy_wallet(strategy: str) -> Optional[dict[str, Any]]:
+    """Returns None if this strategy has no dedicated wallet (i.e. it's on
+    the shared pool). Returns the wallet doc (with 'cash') if isolated."""
+    doc = await db.strategy_wallets.find_one({"_id": strategy}, {"_id": 0})
+    if not doc or not doc.get("allocated"):
+        return None
+    return doc
+
+
+async def get_effective_cash(strategy: Optional[str]) -> float:
+    if strategy in STRATEGY_WALLET_NAMES:
+        w = await get_strategy_wallet(strategy)
+        if w is not None:
+            return w.get("cash", 0.0)
+    return await get_paper_cash()
+
+
+async def adjust_effective_cash(strategy: Optional[str], delta: float) -> None:
+    """Credit/debit the right pool for this strategy: its isolated wallet if
+    it has one, otherwise the shared main paper wallet."""
+    if strategy in STRATEGY_WALLET_NAMES:
+        w = await get_strategy_wallet(strategy)
+        if w is not None:
+            new_cash = w.get("cash", 0.0) + delta
+            await db.strategy_wallets.update_one(
+                {"_id": strategy}, {"$set": {"cash": new_cash}}
+            )
+            return
+    cash = await get_paper_cash()
+    await set_paper_cash(cash + delta)
+
+
+async def open_paper_position(signal: dict[str, Any]) -> Optional[PaperPosition]:
+    pcfg = await get_paper_config()
+    open_count = await db.paper_positions.count_documents({})
+    if open_count >= pcfg.max_open_positions:
+        return None
+    # Prevent duplicates on same signal
+    if await db.paper_positions.find_one({"signal_id": signal["id"]}):
+        return None
+    # SAFETY: never more than one position on the same pair at once
+    if pcfg.one_position_per_pair and await db.paper_positions.find_one(
+        {"symbol": signal["symbol"]}
+    ):
+        return None
+    # Spot mode restrictions: no shorts (spot cannot short natively)
+    if pcfg.trading_mode == "spot" and signal["side"] == "short":
+        return None
+    strategy = signal.get("strategy")
+    cash = await get_effective_cash(strategy)
+
+    # IMMEDIATE EXECUTION: fill at the current live market price (WS or REST),
+    # not the planned signal price — this is what produces real slippage.
+    fill_price = await price_feed.price_or_rest(signal["symbol"])
+    if not fill_price or fill_price <= 0:
+        fill_price = signal["entry"]
+
+    # Guard against a stale signal: stop_loss/take_profit are absolute market
+    # levels computed from the signal's (older) entry price, not adjusted for
+    # the fresh fill_price above. If price already moved past either level by
+    # the time we actually get here, the position would be born already
+    # "at/beyond target" (or already past its stop) — the very next check
+    # would then close it immediately using that stale level as the exit
+    # price, which can produce a NEGATIVE real pnl while still being labeled
+    # a "win" (target hit) simply because price is on the far side of it.
+    # Cleanest fix: skip opening entirely rather than open a trade whose
+    # premise the market has already invalidated.
+    if signal["side"] == "long":
+        if fill_price >= signal["take_profit"] or fill_price <= signal["stop_loss"]:
+            return None
+    else:
+        if fill_price <= signal["take_profit"] or fill_price >= signal["stop_loss"]:
+            return None
+
+    risk_usdt = max(1.0, cash * pcfg.risk_per_trade_pct / 100)
+    if strategy == "rsi_reversion":
+        cfg = await get_config()
+        risk_usdt *= await get_regime_size_multiplier(cfg)
+    risk_per_unit = abs(signal["entry"] - signal["stop_loss"])
+    if risk_per_unit <= 0:
+        return None
+    qty = risk_usdt / risk_per_unit
+
+    # SAFETY: hard cap the notional per single trade (e.g. 10 USDT)
+    notional = qty * fill_price
+    cap = pcfg.max_position_size_usdt
+    if cap > 0 and notional > cap:
+        qty = cap / fill_price
+        notional = qty * fill_price
+        risk_usdt = qty * risk_per_unit
+
+    if pcfg.trading_mode == "spot":
+        if notional > cash:
+            qty = cash / fill_price
+            notional = qty * fill_price
+        if qty <= 0 or notional < 1.0:
+            return None
+        await adjust_effective_cash(strategy, -notional)  # lock cash on open
+
+    # Slippage = actual fill vs planned signal entry
+    slip_usdt = (fill_price - signal["entry"]) * qty
+    slip_pct = ((fill_price - signal["entry"]) / signal["entry"]) * 100 if signal["entry"] else 0.0
+
+    pos = PaperPosition(
+        signal_id=signal["id"],
+        symbol=signal["symbol"],
+        timeframe=signal["timeframe"],
+        side=signal["side"],
+        entry=signal["entry"],
+        fill_price=round(fill_price, 8),
+        slippage_usdt=round(slip_usdt, 4),
+        slippage_pct=round(slip_pct, 4),
+        stop_loss=signal["stop_loss"],
+        take_profit=signal["take_profit"],
+        quantity=round(qty, 8),
+        risk_usdt=round(risk_usdt, 2),
+        opened_at=datetime.now(timezone.utc).isoformat(),
+        current_stop=round(signal["stop_loss"], 8),
+        initial_risk=round(abs(fill_price - signal["stop_loss"]), 8),
+        strategy=signal.get("strategy", "counter_trend"),
+        tp1=float(signal.get("tp1", 0.0)),
+        tp2=float(signal.get("tp2", 0.0)),
+        atr=float(signal.get("atr", 0.0)),
+    )
+    await db.paper_positions.insert_one(pos.model_dump())
+    # Persist slippage log entry
+    await db.slippage_log.insert_one({
+        "id": str(uuid.uuid4()),
+        "position_id": pos.id,
+        "signal_id": signal["id"],
+        "symbol": signal["symbol"],
+        "side": signal["side"],
+        "signal_price": signal["entry"],
+        "fill_price": round(fill_price, 8),
+        "slippage_usdt": round(slip_usdt, 4),
+        "slippage_pct": round(slip_pct, 4),
+        "quantity": round(qty, 8),
+        "source": "ws" if price_feed.get(signal["symbol"]) else "rest",
+        "at": datetime.now(timezone.utc).isoformat(),
+    })
+    logger.info(
+        "Opened paper[%s] %s %s qty=%.6f fill=%.8f slip=%.4f%%",
+        pcfg.trading_mode, pos.symbol, pos.side, pos.quantity, fill_price, slip_pct,
+    )
+    return pos
+
+
+async def close_paper_position(pos: dict[str, Any], exit_price: float, outcome: str) -> PaperTrade:
+    entry = float(pos.get("fill_price") or pos["entry"])  # real fill for PnL
+    qty = float(pos["quantity"])
+    pcfg = await get_paper_config()
+    # Fees on both legs, like the other strategies: this pipeline used to book
+    # the profit GROSS of fees.
+    fee = (entry * qty + exit_price * qty) * ((await get_config()).sim_fee_pct / 100.0)
+    if pos["side"] == "long":
+        pnl = (exit_price - entry) * qty - fee
+    else:
+        pnl = (entry - exit_price) * qty - fee
+    pnl_pct = (pnl / (entry * qty)) * 100 if entry > 0 and qty > 0 else 0.0
+    strategy = pos.get("strategy", "counter_trend")
+    trade = PaperTrade(
+        signal_id=pos["signal_id"],
+        symbol=pos["symbol"],
+        side=pos["side"],
+        entry=entry,
+        exit=round(exit_price, 8),
+        quantity=qty,
+        pnl_usdt=round(pnl, 2),
+        pnl_pct=round(pnl_pct, 2),
+        outcome=outcome,
+        opened_at=pos["opened_at"],
+        closed_at=datetime.now(timezone.utc).isoformat(),
+        strategy=strategy,
+        timeframe=pos.get("timeframe"),
+        stop_loss=pos.get("current_stop") or pos.get("stop_loss"),
+        take_profit=pos.get("tp2") or pos.get("tp1") or pos.get("take_profit"),
+    )
+    await db.paper_trades.insert_one(trade.model_dump())
+    await db.paper_positions.delete_one({"id": pos["id"]})
+    if pcfg.trading_mode == "spot" and pos["side"] == "long":
+        # Unlock notional and add PnL: cash += exit * qty - fees
+        await adjust_effective_cash(strategy, exit_price * qty - fee)
+    else:
+        await adjust_effective_cash(strategy, pnl)
+    await db.signals.update_one(
+        {"id": pos["signal_id"]},
+        {"$set": {"outcome": outcome, "status": "closed"}},
+    )
+    # DEBUG: on stop-loss, record data for premature-stop analysis. A background
+    # checker will later look ahead N candles to see if the ORIGINAL target
+    # would have been reached with a wider stop.
+    if outcome == "loss":
+        sig = await db.signals.find_one({"id": pos["signal_id"]}, {"_id": 0}) or {}
+        await db.stop_debug_log.insert_one({
+            "id": str(uuid.uuid4()),
+            "signal_id": pos["signal_id"],
+            "symbol": pos["symbol"],
+            "timeframe": pos.get("timeframe") or sig.get("timeframe", "1h"),
+            "side": pos["side"],
+            "entry": entry,
+            "stop_loss": float(pos["stop_loss"]),
+            "take_profit": float(pos["take_profit"]),
+            "atr_at_entry": float(sig.get("atr", 0.0)),
+            "atr_multiplier": float(sig.get("atr_multiplier", 0.0)),
+            "stop_distance": round(abs(entry - float(pos["stop_loss"])), 8),
+            "stop_distance_in_atr": round(
+                abs(entry - float(pos["stop_loss"])) / sig["atr"], 3
+            ) if sig.get("atr") else None,
+            "closed_at": datetime.now(timezone.utc).isoformat(),
+            "premature_status": "pending",  # pending | premature | valid
+            "would_hit_target": None,
+            "candles_to_target": None,
+        })
+    logger.info(
+        "Closed paper %s %s pnl=%.2f (%s)",
+        pos["symbol"], pos["side"], pnl, outcome,
+    )
+    return trade
+
+
+# ===========================================================================
+# POSITION MANAGEMENT: Timeout + Breakeven + Trailing Stop (additive modules)
+# ===========================================================================
+_funding_cache: dict[str, float] = {}
+
+
+async def get_trade_fees(symbol: str, cfg: Config) -> tuple[float, float]:
+    """Maker/taker fee rates (as fractions). Paper trading charges the single
+    configured rate `sim_fee_pct` on every strategy; reading the real
+    per-symbol rates from the signed Bybit API is part of the execution phase."""
+    rate = cfg.sim_fee_pct / 100.0
+    return rate, rate
+
+
+async def get_funding_rate(symbol: str, cfg: Config) -> float:
+    """Current funding rate via Bybit v5 (linear only). Spot has no funding.
+    Falls back to last known value (or 0); never blocks execution."""
+    if exchange.category != "linear":
+        return 0.0
+    try:
+        async with httpx.AsyncClient(base_url=BYBIT_BASE, timeout=8.0) as c:
+            r = await c.get(
+                "/v5/market/tickers",
+                params={"category": "linear", "symbol": symbol},
+            )
+            data = r.json()
+            if data.get("retCode") == 0 and data.get("result", {}).get("list"):
+                val = float(data["result"]["list"][0].get("fundingRate") or 0.0)
+                _funding_cache[symbol] = val
+                return val
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Funding rate unavailable for %s (%s); using last known", symbol, e)
+    return _funding_cache.get(symbol, 0.0)
+
+
+async def _current_spread(symbol: str) -> float:
+    """Approx bid-ask spread from Bybit v5 orderbook (best bid/ask)."""
+    try:
+        async with httpx.AsyncClient(base_url=BYBIT_BASE, timeout=8.0) as c:
+            r = await c.get(
+                "/v5/market/orderbook",
+                params={"category": exchange.category, "symbol": symbol, "limit": 1},
+            )
+            d = r.json()
+            if d.get("retCode") == 0 and d.get("result"):
+                res = d["result"]
+                bid = float(res["b"][0][0]) if res.get("b") else 0.0
+                ask = float(res["a"][0][0]) if res.get("a") else 0.0
+                if bid > 0 and ask > 0:
+                    return max(0.0, ask - bid)
+    except Exception:  # noqa: BLE001
+        pass
+    return 0.0
+
+
+async def compute_breakeven(pos: dict[str, Any], cfg: Config, trading_mode: str) -> float:
+    """BreakevenCalculator (spot & leverage). Returns the breakeven price."""
+    entry = float(pos.get("fill_price") or pos["entry"])
+    symbol = pos["symbol"]
+    maker, taker = await get_trade_fees(symbol, cfg)
+    spread = await _current_spread(symbol)
+    fee_cost = entry * (maker + taker)
+    safety = entry * (cfg.breakeven_safety_pct / 100)
+    cost = fee_cost + spread + safety
+    if trading_mode == "leverage":
+        funding_rate = await get_funding_rate(symbol, cfg)
+        opened = datetime.fromisoformat(pos["opened_at"]).timestamp()
+        hours_open = max(0.0, (time.time() - opened) / 3600)
+        funding_accumulato = entry * funding_rate * (hours_open / 8)
+        cost += funding_accumulato
+    if pos["side"] == "long":
+        return entry + cost
+    return entry - cost
+
+
+def _profit_in_r(pos: dict[str, Any], price: float) -> float:
+    entry = float(pos.get("fill_price") or pos["entry"])
+    risk = float(pos.get("initial_risk") or abs(entry - float(pos["stop_loss"])))
+    if risk <= 0:
+        return 0.0
+    if pos["side"] == "long":
+        return (price - entry) / risk
+    return (entry - price) / risk
+
+
+def _timeout_candles(tf: str, cfg: Config) -> int:
+    return {
+        "15m": cfg.timeout_15m,
+        "1h": cfg.timeout_1h,
+        "4h": cfg.timeout_4h,
+        "1d": cfg.timeout_1d,
+    }.get(tf, cfg.timeout_1h)
+
+
+async def apply_timeout_manager(pos: dict[str, Any], price: float, cfg: Config) -> Optional[float]:
+    """TimeoutManager: if enough candles elapsed with profit < timeout_min_r,
+    move stop to breakeven. Returns the new stop or None."""
+    if pos.get("breakeven_active"):
+        return None
+    tf = pos.get("timeframe", "1h")
+    tf_sec = TF_SECONDS.get(tf, 3600)
+    opened = datetime.fromisoformat(pos["opened_at"]).timestamp()
+    candles_elapsed = (time.time() - opened) / tf_sec
+    if candles_elapsed < _timeout_candles(tf, cfg):
+        return None
+    if _profit_in_r(pos, price) >= cfg.timeout_min_r:
+        return None
+    pcfg = await get_paper_config()
+    be = await compute_breakeven(pos, cfg, pcfg.trading_mode)
+    return be
+
+
+def _recent_swing(candles: list[list[float]], side: str, window: int) -> Optional[float]:
+    """Reuse pivot logic to get the last significant swing low (long) / high (short)."""
+    highs = [c[3] for c in candles]
+    lows = [c[4] for c in candles]
+    low_idx, high_idx = detect_pivots(lows if side == "long" else highs, window)
+    if side == "long":
+        pivots = low_idx
+        series = lows
+    else:
+        pivots = high_idx
+        series = highs
+    if not pivots:
+        return None
+    return series[pivots[-1]]
+
+
+async def apply_trailing_manager(pos: dict[str, Any], price: float, cfg: Config) -> Optional[float]:
+    """TrailingStopManager: activate at trailing_activation_r; recompute only on
+    a NEW candle close of the trade timeframe; never move against the position.
+    Leverage-only liquidation distance clamp when liquidation_price known."""
+    if _profit_in_r(pos, price) < cfg.trailing_activation_r:
+        return None
+    tf = pos.get("timeframe", "1h")
+    tf_sec = TF_SECONDS.get(tf, 3600)
+    current_candle = (time.time() // tf_sec) * tf_sec
+    if current_candle <= float(pos.get("last_trail_candle_t") or 0):
+        return None  # only recompute on new candle close
+    candles = await exchange.get_klines(pos["symbol"], tf)
+    if len(candles) < 20:
+        return None
+    ref = _recent_swing(candles, pos["side"], cfg.pivot_window)
+    if ref is None:
+        return None
+    atr = atr_wilder([c[3] for c in candles], [c[4] for c in candles],
+                     [c[2] for c in candles], cfg.atr_period)
+    if not atr or atr <= 0:
+        return None
+    buffer = atr * cfg.trailing_atr_mult
+    if pos["side"] == "long":
+        trailing = ref - buffer
+    else:
+        trailing = ref + buffer
+
+    # Leverage-only: keep the stop at least liq_min_distance_pct away from liquidation
+    liq = float(pos.get("liquidation_price") or 0)
+    if liq > 0:
+        min_dist = liq * (cfg.liq_min_distance_pct / 100)
+        if pos["side"] == "long" and trailing < liq + min_dist:
+            trailing = liq + min_dist
+        elif pos["side"] == "short" and trailing > liq - min_dist:
+            trailing = liq - min_dist
+
+    # Never move against the position
+    cur = float(pos.get("current_stop") or pos["stop_loss"])
+    if pos["side"] == "long":
+        new_stop = max(cur, trailing)
+    else:
+        new_stop = min(cur, trailing)
+    await db.paper_positions.update_one(
+        {"id": pos["id"]}, {"$set": {"last_trail_candle_t": current_candle}}
+    )
+    if new_stop != cur:
+        return new_stop
+    return None
+
+
+async def _close_fraction(pos: dict[str, Any], price: float, frac: float,
+                          outcome: str, set_partial: bool = True) -> float:
+    """Close `frac` of the position at `price`, log a trade, settle cash.
+    Returns the remaining quantity."""
+    close_qty = float(pos["quantity"]) * frac
+    remain_qty = float(pos["quantity"]) - close_qty
+    if close_qty <= 0:
+        return float(pos["quantity"])
+    entry = float(pos.get("fill_price") or pos["entry"])
+    fee = (entry * close_qty + price * close_qty) * ((await get_config()).sim_fee_pct / 100.0)
+    pnl = ((price - entry) * close_qty if pos["side"] == "long" else (entry - price) * close_qty) - fee
+    pnl_pct = (pnl / (entry * close_qty)) * 100 if entry > 0 else 0.0
+    pcfg = await get_paper_config()
+    strategy = pos.get("strategy", "counter_trend")
+    trade = PaperTrade(
+        signal_id=pos["signal_id"], symbol=pos["symbol"], side=pos["side"],
+        entry=entry, exit=round(price, 8), quantity=round(close_qty, 8),
+        pnl_usdt=round(pnl, 2), pnl_pct=round(pnl_pct, 2), outcome=outcome,
+        opened_at=pos["opened_at"], closed_at=datetime.now(timezone.utc).isoformat(),
+        strategy=strategy,
+        timeframe=pos.get("timeframe"),
+        stop_loss=pos.get("current_stop") or pos.get("stop_loss"),
+        take_profit=pos.get("tp2") or pos.get("tp1") or pos.get("take_profit"),
+    )
+    await db.paper_trades.insert_one(trade.model_dump())
+    if pcfg.trading_mode == "spot" and pos["side"] == "long":
+        await adjust_effective_cash(strategy, price * close_qty - fee)
+    else:
+        await adjust_effective_cash(strategy, pnl)
+    upd: dict[str, Any] = {"quantity": round(remain_qty, 8)}
+    if set_partial:
+        upd["partial_closed"] = True
+    await db.paper_positions.update_one({"id": pos["id"]}, {"$set": upd})
+    logger.info("Fraction close %s %.0f%% qty=%.6f pnl=%.2f (%s)",
+                pos["symbol"], frac * 100, close_qty, pnl, outcome)
+    return remain_qty
+
+
+async def maybe_partial_close(pos: dict[str, Any], price: float, cfg: Config) -> None:
+    """Close partial_close_pct of the position once profit reaches partial_close_r."""
+    if not cfg.partial_close_enabled or pos.get("partial_closed"):
+        return
+    if _profit_in_r(pos, price) < cfg.partial_close_r:
+        return
+    await _close_fraction(pos, price, cfg.partial_close_pct / 100, "partial")
+
+
+async def manage_rsi_reversion_position(pos: dict[str, Any], price: float, cfg: Config) -> dict[str, Any]:
+    """RSI Reversion: intentionally no partial close, no breakeven, no
+    timeout-to-breakeven — the whole premise is to wait for the rebalance
+    without being cut early by normal noise. The ONE addition here is a wide
+    ATR-based trailing stop, armed once profit clears an estimated round-trip
+    fee cost plus a small safety margin — meant purely to catch a genuine
+    sudden reversal once the trade has a real edge, not to lock in noise.
+    Before this, only the far-away catastrophic stop (3×ATR by default)
+    protected a winning trade from giving everything back."""
+    if not cfg.trailing_enabled:
+        return pos
+    entry = float(pos.get("fill_price") or pos.get("entry") or 0)
+    atr = float(pos.get("atr") or 0)
+    if entry <= 0 or atr <= 0:
+        return pos
+    long = pos["side"] == "long"
+    in_profit = (price > entry) if long else (price < entry)
+
+    if not pos.get("trailing_active"):
+        if not in_profit:
+            return pos
+        # Activate only once profit clears an estimated round-trip fee cost
+        # plus a small safety margin — not at the very first cent of profit,
+        # which was too easy to trigger on pure market noise right after entry.
+        qty = float(pos.get("quantity") or 0)
+        notional = entry * qty
+        gross_pnl_so_far = (price - entry) * qty if long else (entry - price) * qty
+        exit_notional_now = price * qty
+        fees_now = (notional + exit_notional_now) * (cfg.sim_fee_pct / 100.0)
+        margin_now = notional * cfg.rsi_rev_trailing_activation_margin_pct / 100
+        if gross_pnl_so_far <= fees_now + margin_now:
+            return pos
+        await db.paper_positions.update_one(
+            {"id": pos["id"]},
+            {"$set": {"trailing_active": True, "peak_price": price}},
+        )
+        return {**pos, "trailing_active": True, "peak_price": price}
+
+    peak = pos.get("peak_price") or price
+    new_peak = max(peak, price) if long else min(peak, price)
+    if new_peak != peak:
+        await db.paper_positions.update_one(
+            {"id": pos["id"]}, {"$set": {"peak_price": new_peak}}
+        )
+        pos = {**pos, "peak_price": new_peak}
+
+    trail_level = (
+        new_peak - cfg.rsi_rev_trailing_atr_mult * atr if long
+        else new_peak + cfg.rsi_rev_trailing_atr_mult * atr
+    )
+    hit = price <= trail_level if long else price >= trail_level
+    if hit:
+        outcome = "win" if ((price - entry) if long else (entry - price)) >= 0 else "loss"
+        await close_paper_position(pos, price, outcome)
+        return {**pos, "quantity": 0}
+    return pos
+
+
+async def manage_open_position(pos: dict[str, Any], price: float, cfg: Config) -> dict[str, Any]:
+    """Run the 3 additive managers + partial close. Returns the possibly-updated
+    position dict (with fresh current_stop)."""
+    updates: dict[str, Any] = {}
+    # RSI Reversion: plain SL/TP, no partial close, no timeout-to-breakeven —
+    # only a wide profit-protecting trailing stop (see above).
+    if pos.get("strategy") == "rsi_reversion":
+        return await manage_rsi_reversion_position(pos, price, cfg)
+    # Partial close first (does not affect stop)
+    await maybe_partial_close(pos, price, cfg)
+    # Timeout -> breakeven
+    be = await apply_timeout_manager(pos, price, cfg)
+    if be is not None:
+        cur = float(pos.get("current_stop") or pos["stop_loss"])
+        # never move against position
+        improved = be > cur if pos["side"] == "long" else be < cur
+        if improved or cur == float(pos["stop_loss"]):
+            updates["current_stop"] = be
+            updates["breakeven_active"] = True
+    # Trailing
+    working = {**pos, **updates}
+    trail = await apply_trailing_manager(working, price, cfg)
+    if trail is not None:
+        updates["current_stop"] = trail
+        updates["trailing_active"] = True
+    if updates:
+        await db.paper_positions.update_one({"id": pos["id"]}, {"$set": updates})
+        pos = {**pos, **updates}
+    return pos
+
+
+async def monitor_paper_positions() -> None:
+    """Close positions if SL/TP hit, using real-time WS prices when available."""
+    positions = await db.paper_positions.find({}, {"_id": 0}).to_list(1000)
+    if not positions:
+        return
+    # Build price map: prefer live WS cache, fallback to REST tickers once
+    rest_map: dict[str, float] = {}
+    need_rest = any(price_feed.get(p["symbol"]) is None for p in positions)
+    if need_rest:
+        tickers = await exchange.get_tickers()
+        for t in tickers:
+            try:
+                rest_map[t["symbol"]] = float(t.get("last") or 0)
+            except (TypeError, ValueError):
+                continue
+    cfg = await get_config()
+    for pos in positions:
+        price = price_feed.get(pos["symbol"]) or rest_map.get(pos["symbol"], 0.0)
+        if price <= 0:
+            continue
+        # Additive position management (timeout/breakeven/trailing/partial).
+        pos = await manage_open_position(pos, price, cfg)
+        if float(pos.get("quantity") or 0) <= 0:
+            continue  # position fully closed by the manager (e.g. TP2)
+        active_stop = float(pos.get("current_stop") or pos["stop_loss"])
+        # For impulse strategy the primary fixed target is TP2 (if any); the base
+        # take_profit equals TP1 which the manager already handles on candle close.
+        tp_check = pos["take_profit"]
+        if pos["side"] == "long":
+            if price <= active_stop:
+                await close_paper_position(pos, active_stop, "loss")
+            elif tp_check and price >= tp_check:
+                await close_paper_position(pos, tp_check, "win")
+        else:
+            if price >= active_stop:
+                await close_paper_position(pos, active_stop, "loss")
+            elif tp_check and price <= tp_check:
+                await close_paper_position(pos, tp_check, "win")
+
+
+# ===========================================================================
+# STRATEGY 2: Impulse FVG + Consolidation + Multi-TP (additive, selectable)
+# ===========================================================================
+def detect_market_structure(candles: list[list[float]], window: int, strict: bool = True) -> str:
+    """Return 'up' (HH+HL, or just HH/HL alone when `strict=False`), 'down'
+    (LH+LL, or just LH/LL alone when `strict=False`) or 'range' from swing
+    structure. Non-strict mode exists because requiring BOTH conditions at
+    once is the textbook definition, but real markets constantly have one
+    leg confirmed before the other (e.g. a fresh higher high during a
+    shallow pullback that hasn't yet made a higher low) — which the strict
+    version classifies as 'range' even though the market is clearly still
+    trending."""
+    highs = [c[3] for c in candles]
+    lows = [c[4] for c in candles]
+    low_idx, high_idx = detect_pivots(highs, window)  # highs pivots
+    lo2, hi2 = detect_pivots(lows, window)
+    swing_highs = [highs[i] for i in high_idx][-2:]
+    swing_lows = [lows[i] for i in lo2][-2:]
+    if len(swing_highs) < 2 or len(swing_lows) < 2:
+        return "range"
+    hh = swing_highs[-1] > swing_highs[-2]
+    hl = swing_lows[-1] > swing_lows[-2]
+    lh = swing_highs[-1] < swing_highs[-2]
+    ll = swing_lows[-1] < swing_lows[-2]
+    if strict:
+        if hh and hl:
+            return "up"
+        if lh and ll:
+            return "down"
+    else:
+        if hh or hl:
+            return "up"
+        if lh or ll:
+            return "down"
+    return "range"
+
+
+async def log_reject(symbol: str, tf: str, strategy: str, reason: str) -> None:
+    """Records why a candidate setup was discarded, WITHOUT waiting for it —
+    fire-and-forget so it never slows down the scan. Used to find the real
+    bottleneck across the three strategies instead of guessing at thresholds."""
+    try:
+        await db.strategy_debug_log.insert_one({
+            "id": str(uuid.uuid4()),
+            "symbol": symbol,
+            "timeframe": tf,
+            "strategy": strategy,
+            "reason": reason,
+            "at": datetime.now(timezone.utc).isoformat(),
+        })
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def prune_diagnostic_logs() -> None:
+    """Keep the diagnostic logs bounded — they exist to spot RECENT
+    bottlenecks (the debug log only ever reports on a rolling 3h window
+    anyway), not to be kept forever. `log_reject` fires on EVERY rejected
+    candidate on EVERY 1-minute scan (~hundreds of writes/minute across all
+    pairs/timeframes/strategies) — left unchecked this filled the entire
+    database quota and blocked ALL writes app-wide (paper trades, wallets,
+    Settings — everything). Timestamps are stored as ISO-8601 strings, not
+    native dates, so this uses a string-range delete rather than a MongoDB
+    TTL index (which only works on native Date fields)."""
+    now = datetime.now(timezone.utc)
+    try:
+        cutoff = (now - timedelta(hours=6)).isoformat()
+        await db.strategy_debug_log.delete_many({"at": {"$lt": cutoff}})
+    except Exception as e:  # noqa: BLE001
+        logger.warning("prune strategy_debug_log failed: %s", e)
+    try:
+        cutoff2 = (now - timedelta(days=3)).isoformat()
+        await db.entry_timing_log.delete_many({"signal_created_at": {"$lt": cutoff2}})
+    except Exception as e:  # noqa: BLE001
+        logger.warning("prune entry_timing_log failed: %s", e)
+
+
+async def log_prune_loop() -> None:
+    """Runs the diagnostic-log cleanup every 30 minutes, forever."""
+    while True:
+        try:
+            await prune_diagnostic_logs()
+        except Exception as e:  # noqa: BLE001
+            logger.warning("log_prune_loop error: %s", e)
+        await asyncio.sleep(1800)
+
+
+scan_state = ScanState()
+
+
+# ===========================================================================
+# STRATEGY: RSI Reversion (independent, simple mean-reversion on RSI extremes)
+# ===========================================================================
+async def analyze_pair_rsi_reversion(symbol: str, tf: str, cfg: Config) -> Optional[Signal]:
+    """RSI Reversion: when RSI comes back from an extreme (>80 or <20) after
+    spending at least `rsi_rev_min_extreme_candles` candles there, AND the
+    reversal is backed by a genuine RSI/price divergence (not just noise),
+    enter counter-trend targeting the RSI-50 zone — proxied here by price
+    returning to its own N-period average, N = rsi_period, since a full RSI
+    inversion has no closed-form price target. Deliberately has NO tight
+    stop: only a wide ATR-based catastrophic stop, on the assumption that
+    overbought/oversold in spot eventually rebalances — the catastrophic
+    stop exists only to cap the rare case where it doesn't (e.g. a
+    structural breakdown, not just ordinary volatility)."""
+    STRAT = "rsi_reversion"
+    candles = await exchange.get_klines(symbol, tf)
+    if len(candles) < 60:
+        await log_reject(symbol, tf, STRAT, "dati insufficienti")
+        return None
+    closes = [c[2] for c in candles]
+    highs = [c[3] for c in candles]
+    lows = [c[4] for c in candles]
+
+    rsis = rsi_wilder(closes, cfg.rsi_period)
+    if rsis[-1] is None:
+        await log_reject(symbol, tf, STRAT, "RSI non calcolabile")
+        return None
+
+    ob = cfg.rsi_rev_overbought
+    os_ = cfg.rsi_rev_oversold
+    min_extreme = cfg.rsi_rev_min_extreme_candles
+
+    def extreme_count_in_window(threshold: float, above: bool, window: int = 8) -> int:
+        """Count how many of the last `window` candles before the current
+        one were beyond `threshold` — NOT requiring an unbroken consecutive
+        run. Real RSI rarely holds a threshold with zero noise; a single
+        candle dipping back inside for one bar was resetting the whole count
+        to 0 under the old strict-consecutive check, even after a genuinely
+        sustained extreme move."""
+        count = 0
+        i = len(rsis) - 2
+        checked = 0
+        while i >= 0 and rsis[i] is not None and checked < window:
+            beyond = (rsis[i] >= threshold) if above else (rsis[i] <= threshold)
+            if beyond:
+                count += 1
+            checked += 1
+            i -= 1
+        return count
+
+    side: Optional[str] = None
+    # Filter 1 (candle-close confirmation) + Filter 3 (min time in extreme
+    # zone) are both checked here: the reentry must be on THIS closed candle,
+    # preceded by enough candles genuinely beyond the threshold recently.
+    if rsis[-1] < ob and extreme_count_in_window(ob, above=True) >= min_extreme:
+        side = "short"
+    elif rsis[-1] > os_ and extreme_count_in_window(os_, above=False) >= min_extreme:
+        side = "long"
+    if side is None:
+        await log_reject(symbol, tf, STRAT, "nessun rientro da zona estrema")
+        return None
+    if side == "short" and (await get_paper_config()).trading_mode == "spot":
+        await log_reject(symbol, tf, STRAT, "short non eseguibile in modalità spot")
+        return None
+
+    # Filter 2: genuine RSI/price divergence, not just a brief dip back inside
+    # the bands (reuses the same detector as the other strategies).
+    divergence = detect_rsi_divergence(closes, rsis, cfg.pivot_window)
+    if cfg.rsi_divergence_check_enabled and side == "short" and divergence != "bearish":
+        await log_reject(symbol, tf, STRAT, "divergenza RSI non coerente")
+        return None
+    if cfg.rsi_divergence_check_enabled and side == "long" and divergence != "bullish":
+        await log_reject(symbol, tf, STRAT, "divergenza RSI non coerente")
+        return None
+
+    atr = atr_wilder(highs, lows, closes, cfg.atr_period)
+    if not atr or atr <= 0:
+        await log_reject(symbol, tf, STRAT, "ATR non calcolabile")
+        return None
+
+    entry = closes[-1]
+    sma = sum(closes[-cfg.rsi_period:]) / cfg.rsi_period  # proxy for "RSI back to 50"
+    catastrophic_buffer = cfg.rsi_rev_catastrophic_atr_mult * atr
+    lookback_n = min(cfg.rsi_rev_structural_lookback, len(closes) - 1)
+
+    if side == "short":
+        if sma >= entry:
+            await log_reject(symbol, tf, STRAT, "nessun margine di rientro (prezzo già sulla media)")
+            return None  # price already at/below its average, no reversion left to capture
+        take_profit = sma
+        # Structural stop: above the recent swing high (the level whose
+        # break genuinely invalidates the reversal thesis), with the old
+        # ATR buffer only as a minimum safety margin if that level sits
+        # implausibly close to entry.
+        structural_level = max(highs[-lookback_n:]) * 1.002
+        stop_loss = max(structural_level, entry + catastrophic_buffer)
+    else:
+        if sma <= entry:
+            await log_reject(symbol, tf, STRAT, "nessun margine di rientro (prezzo già sulla media)")
+            return None
+        take_profit = sma
+        structural_level = min(lows[-lookback_n:]) * 0.998
+        stop_loss = min(structural_level, entry - catastrophic_buffer)
+
+    risk = abs(entry - stop_loss)
+    reward = abs(take_profit - entry)
+    if risk <= 0 or reward <= 0:
+        await log_reject(symbol, tf, STRAT, "target/stop non validi")
+        return None
+    if (reward / risk) < cfg.rsi_rev_min_rr_ratio:
+        await log_reject(symbol, tf, STRAT, f"R:R naturale insufficiente (sotto 1:{cfg.rsi_rev_min_rr_ratio:g})")
+        return None
+
+    vol_ratio = volume_spike_ratio([c[5] for c in candles], cfg.volume_ma_period)
+    return Signal(
+        symbol=symbol, timeframe=tf, side=side,
+        entry=round(entry, 8), stop_loss=round(stop_loss, 8),
+        take_profit=round(take_profit, 8), rr_ratio=round(reward / risk, 2),
+        confirmations=[
+            "RSI Ipercomprato" if side == "short" else "RSI Ipervenduto",
+            f"{min_extreme}+ candele in zona estrema",
+            "Rientro confermato su chiusura",
+            "Divergenza RSI/Prezzo",
+        ],
+        strength=4, score=0.0, max_score=0.0,
+        strategy="rsi_reversion",
+        tp1=0.0, tp2=0.0,
+        consolidation_high=0.0, consolidation_low=0.0,
+        rsi_value=round(rsis[-1], 2),
+        volume_ratio=round(vol_ratio, 2),
+        created_at=datetime.now(timezone.utc).isoformat(),
+        fvg_top=0.0, fvg_bottom=0.0,
+        atr=round(atr, 8), atr_multiplier=cfg.rsi_rev_catastrophic_atr_mult,
+    )
+
+
+def active_strategies(cfg: Config) -> set[str]:
+    """Set of strategies to run this scan, via `enabled_strategies`. Empty
+    defaults to RSI Reversion — the only strategy left in this pipeline (Rev
+    Pre-FVG, FVG Reversal, "scoring" and "impulse_fvg" were removed)."""
+    if cfg.enabled_strategies:
+        # The stored list may still name the strategies that were removed
+        # (Rev Pre-FVG, FVG Reversal): only RSI Reversion is acted upon.
+        return {"rsi_reversion"} & set(cfg.enabled_strategies)
+    return {"rsi_reversion"}
+
+
+async def run_scan() -> dict[str, Any]:
+    if scan_state.is_scanning:
+        return {"skipped": True, "reason": "already scanning"}
+    scan_state.is_scanning = True
+    started = datetime.now(timezone.utc)
+    try:
+        cfg = await get_config()
+        # 1) Fetch tickers with volume for filtering
+        tickers = await exchange.get_tickers()
+        # Build map symbol -> volValue (24h quote volume)
+        vol_map: dict[str, float] = {}
+        for t in tickers:
+            try:
+                vol_map[t["symbol"]] = float(t.get("volValue") or 0)
+            except (TypeError, ValueError):
+                continue
+
+        symbols = await exchange.get_symbols()
+        quotes = {q.strip() for q in (cfg.quote_filter or "").split(",") if q.strip()}
+        pairs: list[str] = []
+        for s in symbols:
+            if not s.get("enableTrading"):
+                continue
+            sym = s.get("symbol")
+            if not sym:
+                continue
+            if quotes and s.get("quoteCurrency") not in quotes:
+                continue
+            if cfg.excluded_pairs and sym in cfg.excluded_pairs:
+                continue
+            if cfg.enabled_pairs and sym not in cfg.enabled_pairs:
+                continue
+            if vol_map.get(sym, 0) < cfg.min_24h_volume_usdt:
+                continue
+            pairs.append(sym)
+
+        # Sort by volume descending and cap — THEN check stability, only on
+        # the already-capped shortlist. Checking stability before capping
+        # meant a full daily-candle fetch for every symbol that merely
+        # passed the basic volume filter (potentially 100+ pairs) instead
+        # of just the handful actually being considered — this alone could
+        # stall an entire scan cycle for minutes.
+        pairs.sort(key=lambda s: vol_map.get(s, 0), reverse=True)
+        pairs = pairs[: cfg.max_pairs_per_scan]
+        pairs = [p for p in pairs if await is_volume_stable(p, cfg)]
+
+        active = active_strategies(cfg)
+        all_tfs = sorted(set(cfg.rsi_reversion_timeframes))
+        logger.info("Scanning %d pairs across %s", len(pairs), all_tfs)
+        signals_found: list[Signal] = []
+
+        async def process(sym: str) -> None:
+            for tf in all_tfs:
+                try:
+                    if "rsi_reversion" in active and tf in cfg.rsi_reversion_timeframes:
+                        sig5 = await analyze_pair_rsi_reversion(sym, tf, cfg)
+                        if sig5:
+                            signals_found.append(sig5)
+                except Exception as e:  # noqa: BLE001
+                    logger.debug("analyze %s %s failed: %s", sym, tf, e)
+
+        # Batch concurrency to respect rate limits
+        BATCH = 20
+        for i in range(0, len(pairs), BATCH):
+            await asyncio.gather(*(process(p) for p in pairs[i : i + BATCH]))
+
+        # Deduplicate: replace existing active signal for same symbol+timeframe+side
+        if signals_found:
+            for sig in signals_found:
+                await db.signals.update_many(
+                    {
+                        "symbol": sig.symbol,
+                        "timeframe": sig.timeframe,
+                        "side": sig.side,
+                        "status": "active",
+                    },
+                    {"$set": {"status": "expired"}},
+                )
+            await db.signals.insert_many([s.model_dump() for s in signals_found])
+            # Instrumentation: track how many candles it actually takes for
+            # price to reach the entry zone after a signal fires, so the
+            # generation/expiration timing can later be calibrated on real
+            # data instead of a guessed number of candles.
+            await db.entry_timing_log.insert_many([
+                {
+                    "id": str(uuid.uuid4()),
+                    "signal_id": s.id,
+                    "symbol": s.symbol,
+                    "timeframe": s.timeframe,
+                    "side": s.side,
+                    "strategy": s.strategy,
+                    "entry": s.entry,
+                    "signal_created_at": s.created_at,
+                    "status": "pending",  # pending | reached | not_reached
+                    "candles_to_entry": None,
+                }
+                for s in signals_found
+            ])
+
+            # Auto-execute paper trades if enabled
+            pcfg = await get_paper_config()
+            if pcfg.auto_execute:
+                # Best signals first (higher strength)
+                for sig in sorted(signals_found, key=lambda s: -s.strength):
+                    await open_paper_position(sig.model_dump())
+
+        duration = (datetime.now(timezone.utc) - started).total_seconds()
+        scan_state.last_scan_at = datetime.now(timezone.utc).isoformat()
+        scan_state.last_scan_duration_s = round(duration, 2)
+        scan_state.last_scanned_pairs = len(pairs)
+        scan_state.last_signals_found = len(signals_found)
+        logger.info(
+            "Scan complete: %d pairs, %d signals in %.1fs",
+            len(pairs),
+            len(signals_found),
+            duration,
+        )
+        return {
+            "scanned_pairs": len(pairs),
+            "signals_found": len(signals_found),
+            "duration_s": round(duration, 2),
+        }
+    finally:
+        scan_state.is_scanning = False
+
+
+# ---------------------------------------------------------------------------
+# Background scheduler
+# ---------------------------------------------------------------------------
+async def expire_stale_signals(cfg: Config) -> None:
+    """Expire a signal after `signal_validity_candles` candles of its OWN
+    timeframe have elapsed (not a fixed hour count) — e.g. 5 candles on 1h
+    means 5 hours of validity, giving price real room to reach the entry
+    zone instead of expiring after essentially a single candle."""
+    now = datetime.now(timezone.utc)
+    cursor = db.signals.find({"status": "active"})
+    async for sig in cursor:
+        try:
+            created = datetime.fromisoformat(sig["created_at"])
+        except Exception:  # noqa: BLE001
+            continue
+        tf_sec = TF_SECONDS.get(sig.get("timeframe"), 3600)
+        max_age_sec = tf_sec * max(1, cfg.signal_validity_candles)
+        age_sec = (now - created).total_seconds()
+        if age_sec > max_age_sec:
+            await db.signals.update_one(
+                {"_id": sig["_id"]}, {"$set": {"status": "expired"}}
+            )
+
+
+async def scheduler_loop() -> None:
+    # small warm-up delay
+    await asyncio.sleep(5)
+    while True:
+        cfg = await get_config()
+        try:
+            await expire_stale_signals(cfg)
+            await run_scan()
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Scan loop error: %s", e)
+        await asyncio.sleep(max(60, cfg.scan_interval_minutes * 60))
+
+
+async def paper_monitor_loop() -> None:
+    """Check SL/TP hits every 3s using the real-time WS price cache."""
+    await asyncio.sleep(8)
+    while True:
+        try:
+            await monitor_paper_positions()
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Paper monitor error: %s", e)
+        await asyncio.sleep(3)
+
+
+async def s3360_monitor_loop() -> None:
+    """Check 33/60's live-RSI target every 3s using the real-time WS price
+    cache — same reasoning as the other monitors."""
+    await asyncio.sleep(8)
+    while True:
+        try:
+            await monitor_s3360_positions()
+        except Exception as e:  # noqa: BLE001
+            logger.exception("33/60 monitor error: %s", e)
+        await asyncio.sleep(3)
+
+
+async def xrp_acc_monitor_loop() -> None:
+    """Check XRP Accumulation every 3s using the real-time WS price cache:
+    the exit (RSI target) AND the entry (RSI dip). The entry used to run only
+    inside the main scan cycle, which takes 3-4 minutes, so a dip under the
+    threshold that lasted less than that could be missed. This is the ONLY
+    caller of the entry check, on purpose: two callers could both see 'no open
+    position' and open two at once."""
+    await asyncio.sleep(8)
+    while True:
+        try:
+            await monitor_xrp_acc_positions()
+        except Exception as e:  # noqa: BLE001
+            logger.exception("XRP Accumulation monitor error: %s", e)
+        try:
+            await run_xrp_acc_scan()
+        except Exception as e:  # noqa: BLE001
+            logger.exception("XRP Accumulation entry check error: %s", e)
+        await asyncio.sleep(3)
+
+
+async def resolve_premature_stops() -> None:
+    """For each pending SL log, look ahead N candles to see if the ORIGINAL
+    target would have been reached — i.e. whether the stop was premature."""
+    cfg = await get_config()
+    lookahead = cfg.premature_lookahead
+    pending = await db.stop_debug_log.find(
+        {"premature_status": "pending"}, {"_id": 0}
+    ).to_list(500)
+    for log in pending:
+        tf = log.get("timeframe", "1h")
+        tf_sec = TF_SECONDS.get(tf, 3600)
+        closed_epoch = datetime.fromisoformat(log["closed_at"]).timestamp()
+        candles = await exchange.get_klines(log["symbol"], tf)
+        # candles: [t, o, c, h, l, v] ascending, t in seconds
+        after = [c for c in candles if c[0] >= closed_epoch]
+        if not after:
+            continue
+        window = after[:lookahead]
+        tp = log["take_profit"]
+        side = log["side"]
+        hit_idx = None
+        for i, c in enumerate(window):
+            high, low = c[3], c[4]
+            if side == "long" and high >= tp:
+                hit_idx = i + 1
+                break
+            if side == "short" and low <= tp:
+                hit_idx = i + 1
+                break
+        # Only conclude once we either found a hit or the full window elapsed
+        elapsed = time.time() - closed_epoch
+        window_complete = elapsed >= lookahead * tf_sec
+        if hit_idx is not None:
+            await db.stop_debug_log.update_one(
+                {"id": log["id"]},
+                {"$set": {
+                    "premature_status": "premature",
+                    "would_hit_target": True,
+                    "candles_to_target": hit_idx,
+                }},
+            )
+        elif window_complete:
+            await db.stop_debug_log.update_one(
+                {"id": log["id"]},
+                {"$set": {
+                    "premature_status": "valid",
+                    "would_hit_target": False,
+                    "candles_to_target": None,
+                }},
+            )
+
+
+async def premature_stop_loop() -> None:
+    await asyncio.sleep(30)
+    while True:
+        try:
+            await resolve_premature_stops()
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Premature stop checker error: %s", e)
+        await asyncio.sleep(120)
+
+
+ENTRY_TIMING_MAX_LOOKAHEAD = 50  # candles to check before giving up on "reached"
+
+
+async def resolve_entry_timing() -> None:
+    """For each pending entry-timing log, look at the candles that closed
+    AFTER the signal, and find how many candles it took for price to first
+    touch the entry level. Marks 'not_reached' once the lookahead window
+    elapses without a touch. This builds real data on how long price
+    typically takes to reach the entry zone, per symbol/timeframe/strategy —
+    used to calibrate signal generation/expiration timing later."""
+    pending = await db.entry_timing_log.find(
+        {"status": "pending"}, {"_id": 0}
+    ).to_list(1000)
+    for log in pending:
+        tf = log.get("timeframe", "1h")
+        tf_sec = TF_SECONDS.get(tf, 3600)
+        try:
+            created_epoch = datetime.fromisoformat(log["signal_created_at"]).timestamp()
+        except (ValueError, TypeError):
+            continue
+        candles = await exchange.get_klines(log["symbol"], tf)
+        # candles: [t, o, c, h, l, v] ascending, t in seconds
+        after = [c for c in candles if c[0] >= created_epoch]
+        if not after:
+            continue
+        window = after[:ENTRY_TIMING_MAX_LOOKAHEAD]
+        entry = log["entry"]
+        side = log["side"]
+        hit_idx = None
+        for i, c in enumerate(window):
+            high, low = c[3], c[4]
+            if side == "long" and low <= entry:
+                hit_idx = i + 1
+                break
+            if side == "short" and high >= entry:
+                hit_idx = i + 1
+                break
+        elapsed = time.time() - created_epoch
+        window_complete = elapsed >= ENTRY_TIMING_MAX_LOOKAHEAD * tf_sec
+        if hit_idx is not None:
+            await db.entry_timing_log.update_one(
+                {"id": log["id"]},
+                {"$set": {"status": "reached", "candles_to_entry": hit_idx}},
+            )
+        elif window_complete:
+            await db.entry_timing_log.update_one(
+                {"id": log["id"]},
+                {"$set": {"status": "not_reached", "candles_to_entry": None}},
+            )
+
+
+async def entry_timing_loop() -> None:
+    await asyncio.sleep(40)
+    while True:
+        try:
+            await resolve_entry_timing()
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Entry timing checker error: %s", e)
+        await asyncio.sleep(120)
+
+
+# ---------------------------------------------------------------------------
+# FastAPI app & routes
+# ---------------------------------------------------------------------------
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    await get_paper_config()  # sync exchange.category from trading_mode
+    scan_task = asyncio.create_task(scheduler_loop())
+    monitor_task = asyncio.create_task(paper_monitor_loop())
+    s3360_monitor_task = asyncio.create_task(s3360_monitor_loop())
+    xrp_acc_monitor_task = asyncio.create_task(xrp_acc_monitor_loop())
+    s3360_entry_task = asyncio.create_task(s3360_entry_loop())
+    ict_monitor_task = asyncio.create_task(ict_monitor_loop())
+    ws_task = asyncio.create_task(price_feed.run())
+    premature_task = asyncio.create_task(premature_stop_loop())
+    entry_timing_task = asyncio.create_task(entry_timing_loop())
+    log_prune_task = asyncio.create_task(log_prune_loop())
+    yield
+    scan_task.cancel()
+    monitor_task.cancel()
+    ict_monitor_task.cancel()
+    s3360_entry_task.cancel()
+    ws_task.cancel()
+    premature_task.cancel()
+    entry_timing_task.cancel()
+    log_prune_task.cancel()
+    await exchange.close()
+    client.close()
+
+
+# Optional access code for the whole API. Active ONLY when the BOT_ACCESS_KEY
+# variable is set on Railway, so deploying this code changes nothing until a
+# code is chosen. With a code set, the auto-generated API pages (/docs, /redoc,
+# /openapi.json) are hidden too: they would list every endpoint to a stranger.
+BOT_ACCESS_KEY = os.environ.get("BOT_ACCESS_KEY", "").strip()
+_HIDE_DOCS = {"docs_url": None, "redoc_url": None, "openapi_url": None} if BOT_ACCESS_KEY else {}
+app = FastAPI(lifespan=lifespan, **_HIDE_DOCS)
+api = APIRouter(prefix="/api")
+
+
+@api.get("/")
+async def root() -> dict[str, str]:
+    return {"service": "bitsignal-bot", "status": "ok"}
+
+
+@api.get("/status", response_model=ScanState)
+async def status() -> ScanState:
+    return scan_state
+
+
+@api.get("/config", response_model=Config)
+async def read_config() -> Config:
+    return await get_config()
+
+
+@api.put("/config", response_model=Config)
+async def update_config(cfg: Config) -> Config:
+    return await save_config(cfg)
+
+
+@api.get("/events")
+async def get_events(limit: int = 100) -> dict[str, Any]:
+    """Unified chronological feed of open/close events for the strategies
+    sharing paper_positions/paper_trades (today only RSI Reversion; older
+    entries from the removed strategies are still listed) — powers the
+    app's single 'Eventi' screen."""
+    events: list[dict[str, Any]] = []
+
+    opens = await db.paper_positions.find({}, {"_id": 0}).sort("opened_at", -1).to_list(limit)
+    for p in opens:
+        events.append({
+            "id": f"{p['id']}_open", "type": "open",
+            "section": p.get("strategy", "counter_trend"),
+            "symbol": p["symbol"], "side": p.get("side"),
+            "pnl_usdt": None, "at": p["opened_at"],
+        })
+    closes = await db.paper_trades.find({}, {"_id": 0}).sort("closed_at", -1).limit(limit).to_list(limit)
+    for t in closes:
+        events.append({
+            "id": f"{t['id']}_close", "type": "close",
+            "section": t.get("strategy", "counter_trend"),
+            "symbol": t["symbol"], "side": t.get("side"),
+            "pnl_usdt": t.get("pnl_usdt"), "at": t["closed_at"],
+        })
+
+    events.sort(key=lambda e: e["at"], reverse=True)
+    trimmed = events[:limit]
+    return {"events": trimmed, "count": len(trimmed)}
+
+
+@api.get("/pairs")
+async def list_pairs(limit: int = 200) -> dict[str, Any]:
+    cfg = await get_config()
+    tickers = await exchange.get_tickers()
+    quotes = {q.strip() for q in (cfg.quote_filter or "").split(",") if q.strip()}
+    out: list[dict[str, Any]] = []
+    for t in tickers:
+        sym = t.get("symbol", "")
+        if quotes and not any(sym.endswith(q) for q in quotes):
+            continue
+        try:
+            vol = float(t.get("volValue") or 0)
+            price = float(t.get("last") or 0)
+            change = float(t.get("changeRate") or 0)
+        except (TypeError, ValueError):
+            continue
+        out.append(
+            {
+                "symbol": sym,
+                "price": price,
+                "change_pct": round(change * 100, 2),
+                "volume_24h_usdt": vol,
+            }
+        )
+    out.sort(key=lambda x: x["volume_24h_usdt"], reverse=True)
+    return {"pairs": out[:limit]}
+
+
+@api.delete("/signals")
+async def clear_signals() -> dict[str, Any]:
+    """Reset the Signal History: delete all stored signals. Does not affect
+    signal generation, Portfolio, or Settings."""
+    res = await db.signals.delete_many({})
+    return {"ok": True, "deleted": res.deleted_count}
+
+
+@api.get("/signals")
+async def list_signals(
+    side: Optional[str] = Query(None, pattern="^(long|short)$"),
+    timeframe: Optional[str] = None,
+    status: str = "active",
+    limit: int = 100,
+) -> dict[str, Any]:
+    q: dict[str, Any] = {}
+    if status != "all":
+        q["status"] = status
+    if side:
+        q["side"] = side
+    if timeframe:
+        q["timeframe"] = timeframe
+    cursor = db.signals.find(q, {"_id": 0}).sort("created_at", -1).limit(limit)
+    items = await cursor.to_list(length=limit)
+    return {"signals": items, "count": len(items)}
+
+
+@api.get("/signals/{signal_id}")
+async def get_signal(signal_id: str) -> dict[str, Any]:
+    doc = await db.signals.find_one({"id": signal_id}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=404, detail="Signal not found")
+    return doc
+
+
+@api.get("/candles/{symbol}")
+async def get_candles(symbol: str, timeframe: str = "1h", limit: int = CANDLE_LIMIT) -> dict[str, Any]:
+    limit = max(1, min(limit, 1000))  # Bybit's own hard cap per request
+    candles = await exchange.get_klines(symbol, timeframe, limit=limit)
+    closes = [c[2] for c in candles]
+    cfg = await get_config()
+    rsis = rsi_wilder(closes, cfg.rsi_period) if closes else []
+    return {
+        "symbol": symbol,
+        "timeframe": timeframe,
+        "candles": [
+            {"t": c[0], "o": c[1], "c": c[2], "h": c[3], "l": c[4], "v": c[5]}
+            for c in candles
+        ],
+        "rsi": [r if r is not None else 0 for r in rsis],
+    }
+
+
+@api.post("/scan")
+async def trigger_scan() -> dict[str, Any]:
+    # Fire-and-forget so client isn't blocked for minutes
+    asyncio.create_task(run_scan())
+    return {"started": True}
+
+
+@api.get("/history/stats")
+async def history_stats() -> dict[str, Any]:
+    total = await db.signals.count_documents({})
+    active = await db.signals.count_documents({"status": "active"})
+    wins = await db.signals.count_documents({"outcome": "win"})
+    losses = await db.signals.count_documents({"outcome": "loss"})
+    settled = wins + losses
+    win_rate = round((wins / settled) * 100, 1) if settled else 0.0
+    return {
+        "total": total,
+        "active": active,
+        "wins": wins,
+        "losses": losses,
+        "win_rate": win_rate,
+    }
+
+
+# ---------------------------------------------------------------------------
+# Paper Trading endpoints
+# ---------------------------------------------------------------------------
+@api.get("/paper/config", response_model=PaperConfig)
+async def read_paper_config() -> PaperConfig:
+    return await get_paper_config()
+
+
+@api.put("/paper/config", response_model=PaperConfig)
+async def update_paper_config(cfg: PaperConfig) -> PaperConfig:
+    return await save_paper_config(cfg)
+
+
+@api.get("/paper/portfolio")
+async def paper_portfolio() -> dict[str, Any]:
+    pcfg = await get_paper_config()
+    cash = await get_paper_cash()
+    positions = await db.paper_positions.find({}, {"_id": 0}).to_list(1000)
+    # Mark to market
+    tickers = await exchange.get_tickers()
+    price_map: dict[str, float] = {}
+    for t in tickers:
+        try:
+            price_map[t["symbol"]] = float(t.get("last") or 0)
+        except (TypeError, ValueError):
+            continue
+    unrealized = 0.0
+    spot_positions_value = 0.0
+    enriched: list[dict[str, Any]] = []
+    for p in positions:
+        cur = price_map.get(p["symbol"], p["entry"])
+        if p["side"] == "long":
+            pnl = (cur - p["entry"]) * p["quantity"]
+        else:
+            pnl = (p["entry"] - cur) * p["quantity"]
+        pnl_pct = (pnl / (p["entry"] * p["quantity"])) * 100 if p["entry"] * p["quantity"] > 0 else 0
+        unrealized += pnl
+        spot_positions_value += cur * p["quantity"]
+        enriched.append(
+            {
+                **p,
+                "current_price": round(cur, 8),
+                "unrealized_pnl": round(pnl, 2),
+                "unrealized_pnl_pct": round(pnl_pct, 2),
+            }
+        )
+    trades = await db.paper_trades.find({}, {"_id": 0}).to_list(1000)
+    realized = sum(t.get("pnl_usdt", 0.0) for t in trades)
+    wins = sum(1 for t in trades if t.get("outcome") == "win")
+    losses = sum(1 for t in trades if t.get("outcome") == "loss")
+    settled = wins + losses
+    win_rate = round((wins / settled) * 100, 1) if settled else 0.0
+    # In spot mode, cash is already locked when a position is opened,
+    # so equity = cash + market value of open positions.
+    # In leverage mode, positions carry no locked cash, equity = cash + unrealized PnL.
+    if pcfg.trading_mode == "spot":
+        equity = cash + spot_positions_value
+    else:
+        equity = cash + unrealized
+    return {
+        "initial_capital": pcfg.initial_capital,
+        "cash": round(cash, 2),
+        "equity": round(equity, 2),
+        "unrealized_pnl": round(unrealized, 2),
+        "realized_pnl": round(realized, 2),
+        "total_return_pct": round(((equity - pcfg.initial_capital) / pcfg.initial_capital) * 100, 2)
+        if pcfg.initial_capital > 0
+        else 0,
+        "open_positions_count": len(enriched),
+        "closed_trades_count": len(trades),
+        "wins": wins,
+        "losses": losses,
+        "win_rate": win_rate,
+        "auto_execute": pcfg.auto_execute,
+        "trading_mode": pcfg.trading_mode,
+        "positions": enriched,
+    }
+
+
+@api.get("/paper/trades")
+async def paper_trades(limit: int = 100) -> dict[str, Any]:
+    cursor = db.paper_trades.find({}, {"_id": 0}).sort("closed_at", -1).limit(limit)
+    trades = await cursor.to_list(length=limit)
+    return {"trades": trades, "count": len(trades)}
+
+
+@api.get("/slippage/log")
+async def slippage_log(limit: int = 100) -> dict[str, Any]:
+    cursor = db.slippage_log.find({}, {"_id": 0}).sort("at", -1).limit(limit)
+    logs = await cursor.to_list(length=limit)
+    total_abs = sum(abs(l.get("slippage_usdt", 0.0)) for l in logs)
+    avg_pct = (
+        round(sum(l.get("slippage_pct", 0.0) for l in logs) / len(logs), 4)
+        if logs
+        else 0.0
+    )
+    return {
+        "logs": logs,
+        "count": len(logs),
+        "total_abs_slippage_usdt": round(total_abs, 4),
+        "avg_slippage_pct": avg_pct,
+    }
+
+
+@api.get("/feed/status")
+async def feed_status() -> dict[str, Any]:
+    return {
+        "ws_connected": price_feed._connected,
+        "subscribed": sorted(price_feed._subscribed),
+        "cached_symbols": len(price_feed.prices),
+    }
+
+
+@api.get("/stop-debug/log")
+async def stop_debug_log(limit: int = 100) -> dict[str, Any]:
+    cursor = db.stop_debug_log.find({}, {"_id": 0}).sort("closed_at", -1).limit(limit)
+    logs = await cursor.to_list(length=limit)
+    total = len(logs)
+    premature = sum(1 for l in logs if l.get("premature_status") == "premature")
+    valid = sum(1 for l in logs if l.get("premature_status") == "valid")
+    pending = sum(1 for l in logs if l.get("premature_status") == "pending")
+    resolved = premature + valid
+    premature_rate = round((premature / resolved) * 100, 1) if resolved else 0.0
+    avg_atr_dist = [
+        l["stop_distance_in_atr"] for l in logs if l.get("stop_distance_in_atr")
+    ]
+    return {
+        "logs": logs,
+        "count": total,
+        "premature": premature,
+        "valid": valid,
+        "pending": pending,
+        "premature_rate": premature_rate,
+        "avg_stop_distance_atr": round(sum(avg_atr_dist) / len(avg_atr_dist), 3)
+        if avg_atr_dist
+        else 0.0,
+    }
+
+
+@api.get("/entry-timing/log")
+async def entry_timing_log(limit: int = 300) -> dict[str, Any]:
+    """Real data on how many candles it took price to reach the entry zone
+    after a signal fired — broken down by timeframe, to calibrate signal
+    generation/expiration timing instead of guessing."""
+    cursor = db.entry_timing_log.find({}, {"_id": 0}).sort("signal_created_at", -1).limit(limit)
+    logs = await cursor.to_list(length=limit)
+    total = len(logs)
+    reached = [l for l in logs if l.get("status") == "reached"]
+    not_reached = sum(1 for l in logs if l.get("status") == "not_reached")
+    pending = sum(1 for l in logs if l.get("status") == "pending")
+    reach_rate = round((len(reached) / (len(reached) + not_reached)) * 100, 1) if (reached or not_reached) else 0.0
+
+    by_timeframe: dict[str, list[int]] = {}
+    for l in reached:
+        by_timeframe.setdefault(l["timeframe"], []).append(l["candles_to_entry"])
+    avg_candles_by_tf = {
+        tf: round(sum(vals) / len(vals), 2) for tf, vals in by_timeframe.items()
+    }
+
+    return {
+        "logs": logs,
+        "count": total,
+        "reached": len(reached),
+        "not_reached": not_reached,
+        "pending": pending,
+        "reach_rate": reach_rate,
+        "avg_candles_to_entry_by_timeframe": avg_candles_by_tf,
+    }
+
+
+@api.get("/strategy-debug/log")
+async def strategy_debug_log(
+    limit: int = 1000, minutes: int = 180, symbol: Optional[str] = None
+) -> dict[str, Any]:
+    """Bottleneck analysis for the 3 traditional strategies: which specific
+    check rejects the most candidates, broken down per strategy. Looks at
+    the last `minutes` of scans (default 3h) so it reflects current market
+    conditions rather than the whole history. Pass `symbol` (e.g. HYPEUSDT)
+    to see exactly why one specific pair was rejected across every strategy
+    that scanned it, instead of only the aggregate counts."""
+    since = (datetime.now(timezone.utc) - timedelta(minutes=minutes)).isoformat()
+    query: dict[str, Any] = {"at": {"$gte": since}}
+    if symbol:
+        query["symbol"] = symbol.upper()
+    cursor = db.strategy_debug_log.find(query, {"_id": 0}).sort("at", -1).limit(limit)
+    logs = await cursor.to_list(length=limit)
+
+    by_strategy: dict[str, dict[str, int]] = {}
+    for l in logs:
+        strat = l.get("strategy", "unknown")
+        reason = l.get("reason", "unknown")
+        by_strategy.setdefault(strat, {})
+        by_strategy[strat][reason] = by_strategy[strat].get(reason, 0) + 1
+
+    bottleneck_by_strategy = {
+        strat: max(reasons, key=reasons.get) if reasons else None
+        for strat, reasons in by_strategy.items()
+    }
+
+    result: dict[str, Any] = {
+        "window_minutes": minutes,
+        "count": len(logs),
+        "reason_counts_by_strategy": by_strategy,
+        "bottleneck_by_strategy": bottleneck_by_strategy,
+    }
+    if symbol:
+        result["symbol"] = symbol.upper()
+        result["entries"] = logs  # raw, timestamped entries for this one pair
+    return result
+
+
+@api.post("/paper/execute/{signal_id}")
+async def paper_execute(signal_id: str) -> dict[str, Any]:
+    signal = await db.signals.find_one({"id": signal_id}, {"_id": 0})
+    if not signal:
+        raise HTTPException(status_code=404, detail="Signal not found")
+    pos = await open_paper_position(signal)
+    if not pos:
+        raise HTTPException(
+            status_code=400,
+            detail="Cannot open (max positions reached or duplicate)",
+        )
+    return {"position": pos.model_dump()}
+
+
+@api.post("/paper/positions/{position_id}/close")
+async def paper_close_manual(position_id: str) -> dict[str, Any]:
+    pos = await db.paper_positions.find_one({"id": position_id}, {"_id": 0})
+    if not pos:
+        raise HTTPException(status_code=404, detail="Position not found")
+    tickers = await exchange.get_tickers()
+    price = 0.0
+    for t in tickers:
+        if t.get("symbol") == pos["symbol"]:
+            try:
+                price = float(t.get("last") or 0)
+            except (TypeError, ValueError):
+                pass
+            break
+    if price <= 0:
+        price = float(pos["entry"])
+    # Outcome purely by PnL sign
+    if pos["side"] == "long":
+        outcome = "win" if price >= pos["entry"] else "loss"
+    else:
+        outcome = "win" if price <= pos["entry"] else "loss"
+    trade = await close_paper_position(pos, price, outcome)
+    return {"trade": trade.model_dump()}
+
+
+@api.post("/paper/reset")
+async def paper_reset() -> dict[str, Any]:
+    pcfg = await get_paper_config()
+    await db.paper_positions.delete_many({})
+    await db.paper_trades.delete_many({})
+    await set_paper_cash(pcfg.initial_capital)
+    return {"ok": True, "cash": pcfg.initial_capital}
+
+
+@api.post("/paper/set-capital")
+async def paper_set_capital(payload: dict[str, float]) -> dict[str, Any]:
+    """Set new initial capital AND reset the paper portfolio."""
+    amount = float(payload.get("initial_capital", 0))
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="initial_capital must be > 0")
+    pcfg = await get_paper_config()
+    pcfg.initial_capital = amount
+    await save_paper_config(pcfg)
+    await db.paper_positions.delete_many({})
+    await db.paper_trades.delete_many({})
+    await set_paper_cash(amount)
+    return {"ok": True, "initial_capital": amount, "cash": amount}
+
+
+class AddFundsRequest(BaseModel):
+    amount: float
+
+
+@api.post("/paper/add-funds")
+async def paper_add_funds(req: AddFundsRequest) -> dict[str, Any]:
+    """Ricarica il portafoglio principale SENZA azzerare posizioni o storico
+    (a differenza di /paper/set-capital, che resetta tutto). Aumenta anche il
+    capitale iniziale della stessa cifra, così il rendimento % percentuale
+    resta corretto (non scambia una ricarica per un guadagno). Incremento
+    atomico: mai a rischio di sovrascrivere un cambio di saldo concorrente
+    (es. un'operazione che si chiude proprio in quell'istante)."""
+    amount = req.amount
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="L'importo deve essere positivo")
+
+    updated_state = await db.paper_state.find_one_and_update(
+        {"_id": PAPER_STATE_ID},
+        {"$inc": {"cash": amount}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    updated_cfg = await db.paper_config.find_one_and_update(
+        {"_id": PAPER_CFG_ID},
+        {"$inc": {"initial_capital": amount}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return {
+        "ok": True,
+        "cash": updated_state.get("cash", amount),
+        "initial_capital": updated_cfg.get("initial_capital", amount),
+    }
+
+
+class StrategyAllocateRequest(BaseModel):
+    amount: float
+
+
+@api.get("/strategy-wallets")
+async def strategy_wallets_status() -> dict[str, Any]:
+    """Allocation status of the three traditional strategies: whether each
+    has isolated funds or is still on the shared main pool."""
+    main_cash = await get_paper_cash()
+    out = []
+    for name in STRATEGY_WALLET_NAMES:
+        w = await get_strategy_wallet(name)
+        open_count = await db.paper_positions.count_documents({"strategy": name})
+        out.append({
+            "strategy": name,
+            "allocated": w is not None,
+            "cash": w.get("cash", 0.0) if w else None,
+            "open_positions": open_count,
+        })
+    return {"shared_cash": round(main_cash, 2), "strategies": out}
+
+
+@api.post("/strategy-wallets/{strategy}/allocate")
+async def strategy_wallet_allocate(strategy: str, req: StrategyAllocateRequest) -> dict[str, Any]:
+    """Move `amount` from the shared main wallet into a dedicated ('isolated')
+    wallet for this strategy. Refused while the strategy has open positions,
+    to avoid mixing up which pool they were opened against."""
+    if strategy not in STRATEGY_WALLET_NAMES:
+        raise HTTPException(status_code=400, detail="invalid strategy")
+    amount = req.amount
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="L'importo deve essere positivo")
+    open_count = await db.paper_positions.count_documents({"strategy": strategy})
+    if open_count > 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Chiudi prima le {open_count} posizioni aperte di questa strategia",
+        )
+    main_cash = await get_paper_cash()
+    if amount > main_cash:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Fondi insufficienti nel portafoglio principale (disponibili: {round(main_cash, 2)})",
+        )
+    await set_paper_cash(main_cash - amount)
+    existing = await get_strategy_wallet(strategy)
+    new_cash = (existing.get("cash", 0.0) if existing else 0.0) + amount
+    await db.strategy_wallets.update_one(
+        {"_id": strategy},
+        {"$set": {"cash": new_cash, "allocated": True}},
+        upsert=True,
+    )
+    return {"ok": True, "strategy": strategy, "cash": new_cash, "main_cash": main_cash - amount}
+
+
+@api.post("/strategy-wallets/{strategy}/deallocate")
+async def strategy_wallet_deallocate(strategy: str) -> dict[str, Any]:
+    """Move all of this strategy's isolated cash back to the shared main
+    wallet, and put the strategy back on the shared pool. Refused while the
+    strategy has open positions."""
+    if strategy not in STRATEGY_WALLET_NAMES:
+        raise HTTPException(status_code=400, detail="invalid strategy")
+    open_count = await db.paper_positions.count_documents({"strategy": strategy})
+    if open_count > 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Chiudi prima le {open_count} posizioni aperte di questa strategia",
+        )
+    w = await get_strategy_wallet(strategy)
+    amount = w.get("cash", 0.0) if w else 0.0
+    await db.strategy_wallets.update_one(
+        {"_id": strategy}, {"$set": {"cash": 0.0, "allocated": False}}, upsert=True
+    )
+    main_cash = await get_paper_cash()
+    await set_paper_cash(main_cash + amount)
+    return {"ok": True, "strategy": strategy, "main_cash": main_cash + amount}
+
+
+@api.post("/strategy-wallets/{strategy}/withdraw")
+async def strategy_wallet_withdraw(strategy: str, req: StrategyAllocateRequest) -> dict[str, Any]:
+    """Withdraw a SPECIFIC amount from this strategy's isolated wallet back
+    to the shared main wallet (unlike /deallocate, which always takes
+    everything). If the withdrawal empties the isolated wallet, the strategy
+    automatically goes back on the shared pool. Refused while the strategy
+    has open positions. Atomic: the debit only applies if the isolated
+    wallet still has at least `amount` at the moment of the write, so it can
+    never go negative even under concurrent activity."""
+    if strategy not in STRATEGY_WALLET_NAMES:
+        raise HTTPException(status_code=400, detail="invalid strategy")
+    amount = req.amount
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="L'importo deve essere positivo")
+    open_count = await db.paper_positions.count_documents({"strategy": strategy})
+    if open_count > 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Chiudi prima le {open_count} posizioni aperte di questa strategia",
+        )
+    # Rounding-display tolerance: the on-screen balance is rounded to cents,
+    # so the real stored value can sit a tiny fraction below it after many
+    # small accumulated operations. If the request is within a cent of
+    # what's actually there, withdraw exactly what's available instead of
+    # rejecting a withdrawal of "the whole displayed balance" — but never
+    # adjust upward, so this can't ever push cash negative.
+    w_check = await get_strategy_wallet(strategy)
+    available = w_check.get("cash", 0.0) if w_check else 0.0
+    if amount > available and (amount - available) <= 0.01:
+        amount = available
+    updated = await db.strategy_wallets.find_one_and_update(
+        {"_id": strategy, "allocated": True, "cash": {"$gte": amount}},
+        {"$inc": {"cash": -amount}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if updated is None:
+        w = await get_strategy_wallet(strategy)
+        avail = w.get("cash", 0.0) if w else 0.0
+        raise HTTPException(
+            status_code=400,
+            detail=f"Fondi insufficienti nel portafoglio isolato (disponibili: {round(avail, 2)})",
+        )
+    new_cash = updated.get("cash", 0.0)
+    if new_cash <= 0.0001:
+        # Fully emptied: revert to the shared pool automatically, same end
+        # state as /deallocate.
+        await db.strategy_wallets.update_one(
+            {"_id": strategy}, {"$set": {"cash": 0.0, "allocated": False}}
+        )
+        new_cash = 0.0
+    main_updated = await db.paper_state.find_one_and_update(
+        {"_id": PAPER_STATE_ID},
+        {"$inc": {"cash": amount}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return {
+        "ok": True,
+        "strategy": strategy,
+        "cash": round(new_cash, 4),
+        "main_cash": round(main_updated.get("cash", amount), 4),
+    }
+
+
+@api.post("/strategy/{strategy}/reset")
+async def strategy_reset(strategy: str) -> dict[str, Any]:
+    """Reset a single strategy's own history: removes its open positions and
+    closed trades. If it has an isolated wallet, undoes just the
+    accumulated trading P&L from its cash (keeps whatever was allocated
+    intact). Does NOT touch the
+    other two strategies, and does NOT touch the shared main wallet if this
+    strategy is currently on the shared pool (cash there isn't
+    attributable to a single strategy)."""
+    if strategy not in STRATEGY_WALLET_NAMES:
+        raise HTTPException(status_code=400, detail="invalid strategy")
+    w = await get_strategy_wallet(strategy)
+    if w is not None:
+        closed = await db.paper_trades.find({"strategy": strategy}, {"_id": 0}).to_list(10000)
+        realized = sum(t.get("pnl_usdt", 0.0) for t in closed)
+        open_positions = await db.paper_positions.find({"strategy": strategy}, {"_id": 0}).to_list(1000)
+        locked = sum(p["entry"] * p["quantity"] for p in open_positions)
+        new_cash = w.get("cash", 0.0) - realized + locked
+        await db.strategy_wallets.update_one({"_id": strategy}, {"$set": {"cash": new_cash}})
+    await db.paper_positions.delete_many({"strategy": strategy})
+    await db.paper_trades.delete_many({"strategy": strategy})
+    return {"ok": True, "strategy": strategy}
+
+
+@api.get("/strategy/{strategy}/portfolio")
+async def strategy_portfolio(strategy: str) -> dict[str, Any]:
+    """Portfolio view scoped to a single strategy: its positions/trades, and
+    either its own isolated cash or the shared main cash (labeled as such)."""
+    if strategy not in STRATEGY_WALLET_NAMES:
+        raise HTTPException(status_code=400, detail="invalid strategy")
+    w = await get_strategy_wallet(strategy)
+    is_isolated = w is not None
+    cash = w.get("cash", 0.0) if w else await get_paper_cash()
+
+    open_positions = await db.paper_positions.find(
+        {"strategy": strategy}, {"_id": 0}
+    ).to_list(1000)
+    tickers = await exchange.get_tickers()
+    price_map: dict[str, float] = {}
+    for t in tickers:
+        try:
+            price_map[t["symbol"]] = float(t.get("last") or 0)
+        except (TypeError, ValueError):
+            continue
+    unrealized = 0.0
+    allocated = 0.0
+    enriched: list[dict[str, Any]] = []
+    for p in open_positions:
+        cur = price_map.get(p["symbol"], p["entry"])
+        if p["side"] == "long":
+            pnl = (cur - p["entry"]) * p["quantity"]
+        else:
+            pnl = (p["entry"] - cur) * p["quantity"]
+        notional = p["entry"] * p["quantity"]
+        pnl_pct = (pnl / notional) * 100 if notional > 0 else 0
+        unrealized += pnl
+        allocated += cur * p["quantity"]
+        enriched.append({
+            **p, "current_price": round(cur, 8),
+            "unrealized_pnl": round(pnl, 2), "unrealized_pnl_pct": round(pnl_pct, 2),
+        })
+
+    closed = await db.paper_trades.find(
+        {"strategy": strategy}, {"_id": 0}
+    ).sort("closed_at", -1).to_list(500)
+    realized = sum(t.get("pnl_usdt", 0.0) for t in closed)
+    wins = sum(1 for t in closed if t.get("outcome") == "win")
+    losses = sum(1 for t in closed if t.get("outcome") == "loss")
+    settled = wins + losses
+    win_rate = round((wins / settled) * 100, 1) if settled else 0.0
+    equity = cash + allocated if is_isolated else cash
+
+    return {
+        "strategy": strategy,
+        "wallet_type": "isolated" if is_isolated else "shared",
+        "cash": round(cash, 2),
+        "equity": round(equity, 2),
+        "unrealized_pnl": round(unrealized, 2),
+        "realized_pnl": round(realized, 2),
+        "open_positions": enriched,
+        "closed_trades": closed,
+        "open_count": len(enriched),
+        "closed_count": len(closed),
+        "win_rate": win_rate,
+    }
+
+
+@api.post("/paper/mode")
+async def paper_set_mode(payload: dict[str, str]) -> dict[str, Any]:
+    """Simple toggle between manual and auto execution."""
+    mode = payload.get("mode", "").lower()
+    if mode not in ("manual", "auto"):
+        raise HTTPException(status_code=400, detail="mode must be 'manual' or 'auto'")
+    pcfg = await get_paper_config()
+    pcfg.auto_execute = mode == "auto"
+    await save_paper_config(pcfg)
+    return {"ok": True, "mode": mode, "auto_execute": pcfg.auto_execute}
+
+
+@api.post("/paper/trading-mode")
+async def paper_set_trading_mode(payload: dict[str, str]) -> dict[str, Any]:
+    """Switch between spot (cash-locked, no shorts) and leverage (futures-style PnL)."""
+    mode = payload.get("trading_mode", "").lower()
+    if mode not in ("spot", "leverage"):
+        raise HTTPException(
+            status_code=400, detail="trading_mode must be 'spot' or 'leverage'"
+        )
+    # Refuse to switch while there are open positions to avoid inconsistent cash accounting
+    open_count = await db.paper_positions.count_documents({})
+    if open_count > 0:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Close {open_count} open positions before switching mode",
+        )
+    pcfg = await get_paper_config()
+    pcfg.trading_mode = mode
+    await save_paper_config(pcfg)
+    return {"ok": True, "trading_mode": mode}
+
+
+# ---------------------------------------------------------------------------
+# Bybit EU authenticated integration (connection test + balance; execution
+# lives in the execution phase). Bybit v5 HMAC-SHA256 signing.
+# ---------------------------------------------------------------------------
+async def _bybit_signed_get(path: str, query: str = "") -> httpx.Response:
+    doc = await db.exchange_creds.find_one({"_id": "bybit"}, {"_id": 0})
+    if not doc:
+        raise HTTPException(status_code=400, detail="No Bybit credentials stored")
+    api_key = decrypt_str(doc["api_key"])
+    api_secret = decrypt_str(doc["api_secret"])
+    ts = str(int(time.time() * 1000))
+    recv = "5000"
+    pre_sign = ts + api_key + recv + query
+    sig = hmac.new(api_secret.encode(), pre_sign.encode(), hashlib.sha256).hexdigest()
+    headers = {
+        "X-BAPI-API-KEY": api_key,
+        "X-BAPI-TIMESTAMP": ts,
+        "X-BAPI-RECV-WINDOW": recv,
+        "X-BAPI-SIGN": sig,
+    }
+    url = path + (("?" + query) if query else "")
+    async with httpx.AsyncClient(base_url=BYBIT_BASE, timeout=10.0) as c:
+        return await c.get(url, headers=headers)
+
+
+@api.get("/exchange/status")
+async def exchange_status() -> dict[str, Any]:
+    doc = await db.exchange_creds.find_one({"_id": "bybit"}, {"_id": 0})
+    if not doc:
+        return {"connected": False, "exchange": "bybit"}
+    try:
+        r = await _bybit_signed_get(
+            "/v5/account/wallet-balance", "accountType=UNIFIED"
+        )
+        data = r.json()
+        if r.status_code != 200 or data.get("retCode") != 0:
+            return {
+                "connected": False,
+                "exchange": "bybit",
+                "error": data.get("retMsg", f"HTTP {r.status_code}"),
+                "api_key_masked": doc.get("api_key_masked", ""),
+            }
+        # The strategies trade USDC pairs, so USDC has to be reported too —
+        # summing only USDT showed 0 even with funds sitting in USDC.
+        totals = {"USDT": 0.0, "USDC": 0.0}
+        for acc in data.get("result", {}).get("list", []):
+            for coin in acc.get("coin", []):
+                name = coin.get("coin")
+                if name in totals:
+                    try:
+                        totals[name] += float(coin.get("walletBalance") or 0)
+                    except (TypeError, ValueError):
+                        continue
+        return {
+            "connected": True,
+            "exchange": "bybit",
+            "api_key_masked": doc.get("api_key_masked", ""),
+            "usdt_balance": round(totals["USDT"], 2),
+            "usdc_balance": round(totals["USDC"], 2),
+            "connected_at": doc.get("connected_at"),
+        }
+    except (httpx.HTTPError, InvalidToken) as e:
+        return {"connected": False, "exchange": "bybit", "error": str(e)}
+
+
+@api.post("/exchange/connect")
+async def exchange_connect(req: ExchangeConnectRequest) -> dict[str, Any]:
+    if not os.environ.get("ENCRYPTION_SECRET", "").strip():
+        # Without it the encryption key lives in a file that is wiped on every
+        # deploy, so the saved credentials would become unreadable. Refuse
+        # instead of saving something that silently disappears.
+        raise HTTPException(
+            status_code=400,
+            detail="Prima imposta la variabile ENCRYPTION_SECRET su Railway: senza, la chiave salvata andrebbe persa a ogni aggiornamento del bot.",
+        )
+    if not req.api_key or not req.api_secret:
+        raise HTTPException(status_code=400, detail="API key and secret required")
+    doc = {
+        "api_key": encrypt_str(req.api_key),
+        "api_secret": encrypt_str(req.api_secret),
+        "api_key_masked": (req.api_key[:4] + "…" + req.api_key[-4:])
+        if len(req.api_key) > 8
+        else "***",
+        "connected_at": datetime.now(timezone.utc).isoformat(),
+    }
+    await db.exchange_creds.update_one(
+        {"_id": "bybit"}, {"$set": doc}, upsert=True
+    )
+    # Test connection immediately
+    status_res = await exchange_status()
+    if not status_res.get("connected"):
+        await db.exchange_creds.delete_one({"_id": "bybit"})
+        raise HTTPException(
+            status_code=400,
+            detail=f"Connection failed: {status_res.get('error', 'unknown')}",
+        )
+    return status_res
+
+
+@api.post("/exchange/disconnect")
+async def exchange_disconnect() -> dict[str, Any]:
+    await db.exchange_creds.delete_one({"_id": "bybit"})
+    return {"ok": True}
+
+
+def _downsample_track(samples: list[list[float]], n: int) -> list[list[float]]:
+    """At most `n` points, always keeping the lowest and highest ones so the
+    chart never hides how deep or how high the price went."""
+    if len(samples) <= n:
+        return samples
+    step = len(samples) / n
+    picked = {int(i * step) for i in range(n)} | {len(samples) - 1}
+    picked.add(min(range(len(samples)), key=lambda i: samples[i][1]))
+    picked.add(max(range(len(samples)), key=lambda i: samples[i][1]))
+    return [samples[i] for i in sorted(picked)]
+
+
+@api.get("/positions/{kind}/{position_id}/track")
+async def position_track(kind: str, position_id: str, max_points: int = 400) -> dict[str, Any]:
+    """Everything the position-detail screen needs: the operation, the price
+    path recorded while it was open, the lowest/highest points, how long it
+    spent under its entry price, and the levels the bot is waiting for."""
+    cfg = await get_config()
+    if kind == "s3360":
+        coll, pre = db.s3360_positions, "s3360"
+    elif kind == "xrp_acc":
+        coll, pre = db.xrp_acc_positions, "xrp_acc"
+    else:
+        raise HTTPException(status_code=404, detail="Tipo di operazione sconosciuto")
+    pos = await coll.find_one({"id": position_id}, {"_id": 0})
+    if not pos:
+        raise HTTPException(status_code=404, detail="Operazione non trovata")
+    track = await db.position_tracks.find_one({"_id": position_id}) or {}
+    samples = sorted(([float(a), float(b)] for a, b in track.get("samples", [])), key=lambda x: x[0])
+    fill = pos.get("fill_price", pos["entry"])
+    is_open = pos.get("status") == "open"
+    now_ts = time.time()
+    cur = None
+    if is_open:
+        cur = price_feed.get(pos["symbol"]) or await price_feed.price_or_rest(pos["symbol"]) or None
+    else:
+        cur = pos.get("close_price")
+
+    prices = [x[1] for x in samples] + ([cur] if cur else [])
+    lo_candidates = [v for v in (pos.get("min_price"), *prices) if v]
+    hi_candidates = [v for v in (pos.get("max_price"), *prices) if v]
+    lo = min(lo_candidates) if lo_candidates else None
+    hi = max(hi_candidates) if hi_candidates else None
+    below = 0.0
+    for (t0, p0), (t1, _p1) in zip(samples, samples[1:]):
+        if p0 < fill:
+            below += t1 - t0
+    if is_open and samples and samples[-1][1] < fill:
+        below += max(0.0, now_ts - samples[-1][0])
+    try:
+        opened_ts = datetime.fromisoformat(pos["opened_at"]).timestamp()
+    except Exception:  # noqa: BLE001
+        opened_ts = samples[0][0] if samples else now_ts
+    try:
+        end_ts = now_ts if is_open else datetime.fromisoformat(pos["closed_at"]).timestamp()
+    except Exception:  # noqa: BLE001
+        end_ts = now_ts
+
+    min_net = getattr(cfg, f"{pre}_min_net_profit_pct")
+    levels: dict[str, Any] = {
+        "entry": fill,
+        "break_even": required_exit_price(fill, 0.0, cfg.sim_fee_pct),
+        "exit_level": required_exit_price(fill, min_net, cfg.sim_fee_pct),
+        "trailing_stop": None,
+        "rsi_target": getattr(cfg, f"{pre}_high_threshold"),
+    }
+    if pos.get("trailing_active") and getattr(cfg, f"{pre}_trailing_enabled"):
+        peak = float(pos.get("peak_price") or cur or fill)
+        levels["trailing_stop"] = trailing_stop_price(fill, peak, getattr(cfg, f"{pre}_trailing_pct"), cfg.sim_fee_pct)
+        levels["peak_price"] = peak
+    return {
+        "kind": kind,
+        "id": position_id,
+        "symbol": pos["symbol"],
+        "timeframe": pos.get("timeframe"),
+        "status": pos.get("status"),
+        "opened_at": pos.get("opened_at"),
+        "closed_at": pos.get("closed_at"),
+        "entry": pos["entry"],
+        "fill_price": fill,
+        "quantity": pos.get("quantity"),
+        "notional": pos.get("notional"),
+        "rsi_at_entry": pos.get("rsi_at_entry"),
+        "current_price": cur,
+        "pct_vs_entry": round((cur / fill - 1.0) * 100.0, 3) if cur and fill else None,
+        "close_price": pos.get("close_price"),
+        "close_reason": pos.get("close_reason"),
+        "pnl_usdt": pos.get("pnl_usdt", pos.get("profit_usdt")),
+        "profit_xrp": pos.get("profit_xrp"),
+        "fee_pct": pos.get("fee_pct", cfg.sim_fee_pct),
+        "levels": levels,
+        "stats": {
+            "min_price": lo,
+            "min_at": pos.get("min_at"),
+            "max_price": hi,
+            "max_at": pos.get("max_at"),
+            "max_drawdown_pct": round((lo / fill - 1.0) * 100.0, 3) if lo and fill else None,
+            "max_gain_pct": round((hi / fill - 1.0) * 100.0, 3) if hi and fill else None,
+            "time_below_entry_s": round(below),
+            "age_s": round(max(0.0, end_ts - opened_ts)),
+            "samples": len(samples),
+        },
+        "samples": _downsample_track(samples, max(50, min(max_points, 1000))),
+    }
+
+
+# --- ACCESS GUARD START ---
+# The app sends the code in the X-Access-Key header; for opening links in a
+# browser it can also be passed as ?key=CODE. 10 wrong codes from one address
+# in 15 minutes lock that address out for the rest of the window.
+_AUTH_WINDOW_SEC = 15 * 60
+_AUTH_MAX_FAILS = 10
+_auth_fails: dict[str, list[float]] = {}
+_AUTH_OPEN_PATHS = ("/api", "/api/")  # bare health answer ({"status": "ok"}): left open for Railway's checks
+
+
+def _client_ip(request: Request) -> str:
+    real = request.headers.get("x-real-ip")
+    if real:
+        return real.strip()
+    fwd = request.headers.get("x-forwarded-for")
+    if fwd:
+        # The LAST entry is the one added by the nearest proxy; the first ones
+        # are written by the client and can be faked.
+        return fwd.split(",")[-1].strip()
+    return request.client.host if request.client else "unknown"
+
+
+def install_access_guard(application: FastAPI, access_key: str) -> None:
+    @application.middleware("http")
+    async def access_guard(request: Request, call_next):
+        if (
+            not access_key
+            or request.method == "OPTIONS"
+            or not request.url.path.startswith("/api")
+            or request.url.path in _AUTH_OPEN_PATHS
+        ):
+            return await call_next(request)
+        ip = _client_ip(request)
+        now = time.time()
+        recent = [t for t in _auth_fails.get(ip, []) if now - t < _AUTH_WINDOW_SEC]
+        if recent:
+            _auth_fails[ip] = recent
+        else:
+            _auth_fails.pop(ip, None)
+        if len(recent) >= _AUTH_MAX_FAILS:
+            return JSONResponse(
+                {"detail": "Troppi tentativi sbagliati. Riprova tra qualche minuto."},
+                status_code=429,
+            )
+        provided = request.headers.get("x-access-key") or request.query_params.get("key") or ""
+        if not provided:
+            # A missing code is not a guess, so it does not count as a failure.
+            return JSONResponse({"detail": "Codice di accesso richiesto"}, status_code=401)
+        if not hmac.compare_digest(provided.encode(), access_key.encode()):
+            if len(_auth_fails) > 5000:
+                _auth_fails.clear()
+            _auth_fails.setdefault(ip, []).append(now)
+            logger.warning("Access refused: wrong code from %s (%d in the last 15 min)", ip, len(recent) + 1)
+            return JSONResponse({"detail": "Codice di accesso errato"}, status_code=401)
+        return await call_next(request)
+# --- ACCESS GUARD END ---
+
+
+# Registered BEFORE the CORS middleware on purpose: the last one added is the
+# outermost, so CORS wraps this guard and its 401/429 answers still carry the
+# CORS headers a browser needs.
+install_access_guard(app, BOT_ACCESS_KEY)
+
+
+@api.get("/auth/check")
+async def auth_check() -> dict[str, Any]:
+    """Reaching this point means the access code (if one is required) was
+    accepted — the login screen uses it to validate what the user typed."""
+    return {"ok": True, "protected": bool(BOT_ACCESS_KEY)}
+
+
+app.add_middleware(
+    CORSMiddleware,
+    allow_credentials=True,
+    allow_origins=["*"],
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
+# ---------------------------------------------------------------------------
+# Scalping Bot (independent strategy): VWAP + RSI(9) + Bollinger Bands + EMA9/21
+# ---------------------------------------------------------------------------
+def _ema(values: list[float], period: int) -> list[float]:
+    if not values:
+        return []
+    k = 2 / (period + 1)
+    out = [values[0]]
+    for v in values[1:]:
+        out.append(v * k + out[-1] * (1 - k))
+    return out
+
+
+# ============================================================================
+# SHARED BTC MARKET REGIME — built for the removed Top 10 Long strategy and
+# kept on purpose: 33/60 and the position-size trim read it through
+# get_regime_size_multiplier(). Do NOT delete the "top10" helpers below.
+# ============================================================================
+
+
+EXCLUDED_STABLE_BASES = ("USDC", "USDT", "BUSD", "DAI", "TUSD", "USDE", "FDUSD", "USDP", "GUSD")  # stablecoin base assets to skip — a stablecoin-vs-stablecoin pair has near-zero volatility and is useless for any of these strategies.
+
+
+async def is_volume_stable(symbol: str, cfg: Config) -> bool:
+    """True if 24h volume has stayed above the configured minimum for each
+    of the last 10 days — guards against picking a coin whose current
+    volume is just a short-lived spike about to collapse, rather than
+    genuine sustained liquidity."""
+    try:
+        daily = await exchange.get_klines(symbol, "1d")
+    except Exception:  # noqa: BLE001
+        return True  # fail open on a transient API hiccup — don't block all trading over it
+    if len(daily) < 10:
+        return False  # too new to have proven itself yet
+    recent = daily[-10:]
+    return all((c[5] * c[2]) >= cfg.min_24h_volume_usdt for c in recent)
+
+
+_shared_regime_cache: dict[str, Any] = {"regime": None, "at": 0.0}
+
+
+async def get_shared_market_regime(cfg: Config) -> str:
+    """BTC's regime (bullish/range/bearish) on 1h — shared by RSI Reversion
+    and 33/60 so position sizing can be trimmed during an
+    uncertain/consolidating phase, not just an outright downtrend. The
+    helpers it builds on still carry the "top10" name because they were
+    written for the (removed) Top 10 Long strategy — they are kept on purpose.
+    Cached for 5 minutes so every position-open across every strategy
+    doesn't each trigger a fresh BTC candle fetch."""
+    now = time.time()
+    if _shared_regime_cache["regime"] is not None and (now - _shared_regime_cache["at"]) < 300:
+        return _shared_regime_cache["regime"]
+    regime = "range"
+    try:
+        universe = await get_top10_universe(cfg)
+        btc_symbol = next((s for s in universe if s.startswith("BTC")), None)
+        if btc_symbol:
+            trend_score, _ = await compute_top10_trend_score(btc_symbol, cfg)
+            if trend_score >= 65:
+                regime = "bullish"
+            elif trend_score < 40:
+                regime = "bearish"
+            else:
+                regime = "range"
+    except Exception:  # noqa: BLE001
+        regime = "range"  # fail safe to cautious sizing rather than crash
+    _shared_regime_cache["regime"] = regime
+    _shared_regime_cache["at"] = now
+    return regime
+
+
+async def get_regime_size_multiplier(cfg: Config) -> float:
+    """1.0 in a clearly bullish regime; reduced (by
+    `regime_risk_reduction_pct`) otherwise — trims position size during a
+    consolidating or bearish phase instead of sizing every trade the same
+    regardless of how uncertain conditions currently are."""
+    regime = await get_shared_market_regime(cfg)
+    if regime == "bullish":
+        return 1.0
+    return max(0.0, 1.0 - cfg.regime_risk_reduction_pct / 100)
+
+
+_coin_trend_cache: dict[tuple[str, str, int, int], tuple[bool, float]] = {}
+
+
+async def coin_trend_is_long(symbol: str, cfg: Config) -> Optional[bool]:
+    """True if the coin's own trend is long: fast EMA above slow EMA on the
+    trend-filter timeframe. None when it cannot be worked out (not enough
+    candles / error) — callers then block the entry, because the filter is
+    meant to be strict. Cached 2 minutes per coin."""
+    tf = cfg.trend_filter_timeframe
+    fast, slow = cfg.trend_filter_ema_fast, cfg.trend_filter_ema_slow
+    key = (symbol, tf, fast, slow)
+    now = time.time()
+    hit = _coin_trend_cache.get(key)
+    if hit and now - hit[1] < 120:
+        return hit[0]
+    try:
+        candles = await exchange.get_klines(symbol, tf)
+    except Exception:  # noqa: BLE001
+        return None
+    if len(candles) < slow + 5 or fast >= slow:
+        return None
+    closes = [c[2] for c in candles]
+    ok = _ema(closes, fast)[-1] > _ema(closes, slow)[-1]
+    _coin_trend_cache[key] = (ok, now)
+    return ok
+
+
+_long_ema_cache: dict[tuple[str, str, int], tuple[Optional[float], float]] = {}
+
+
+async def long_ema_value(symbol: str, cfg: Config) -> Optional[float]:
+    """Current value of the long EMA (default 200 periods) on its own
+    timeframe (default daily). Fetches twice the period in candles so the EMA is properly
+    warmed up. None if there is not enough history. Cached 2 minutes."""
+    tf, period = cfg.trend_filter_long_timeframe, cfg.trend_filter_ema_long
+    key = (symbol, tf, period)
+    now = time.time()
+    hit = _long_ema_cache.get(key)
+    if hit and now - hit[1] < 120:
+        return hit[0]
+    try:
+        candles = await exchange.get_klines(symbol, tf, limit=max(CANDLE_LIMIT, period * 2))
+    except Exception:  # noqa: BLE001
+        return None
+    if period < 2 or len(candles) < period + 5:
+        return None
+    val = _ema([c[2] for c in candles], period)[-1]
+    _long_ema_cache[key] = (val, now)
+    return val
+
+
+async def trend_filter_block_reason(symbol: str, cfg: Config, need_coin: bool, need_btc: bool, need_above_long: bool = False, price: Optional[float] = None) -> Optional[str]:
+    """None = entry allowed; otherwise the reason (Italian, for the log)."""
+    if need_btc and await get_shared_market_regime(cfg) != "bullish":
+        return "trend BTC non rialzista (filtro trend)"
+    if need_above_long:
+        ema_l = await long_ema_value(symbol, cfg)
+        if ema_l is None or not price:
+            return f"media {cfg.trend_filter_ema_long} non calcolabile (filtro trend)"
+        if price <= ema_l:
+            return f"prezzo sotto la media {cfg.trend_filter_ema_long} su {cfg.trend_filter_long_timeframe} (filtro trend)"
+    if need_coin:
+        up = await coin_trend_is_long(symbol, cfg)
+        if up is None:
+            return "trend della moneta non calcolabile (filtro trend)"
+        if not up:
+            return f"trend della moneta non long su {cfg.trend_filter_timeframe} (filtro trend)"
+    return None
+
+
+async def get_top10_universe(cfg: Config) -> list[str]:
+    """Top N coins by 24h volume (proxy for market cap — this exchange has
+    no market-cap feed), deduplicated by base asset across all supported
+    quote currencies so we pick the single most-liquid pair per coin,
+    excluding stablecoins."""
+    tickers = await exchange.get_tickers()
+    vol_map: dict[str, float] = {}
+    for t in tickers:
+        try:
+            vol_map[t["symbol"]] = float(t.get("volValue") or 0)
+        except (TypeError, ValueError):
+            continue
+    symbols = await exchange.get_symbols()
+    quotes = {q.strip() for q in (cfg.quote_filter or "").split(",") if q.strip()}
+    best_per_base: dict[str, tuple[str, float]] = {}
+    for s in symbols:
+        if not s.get("enableTrading"):
+            continue
+        sym = s.get("symbol")
+        quote = s.get("quoteCurrency")
+        if not sym or not quote:
+            continue
+        if quotes and quote not in quotes:
+            continue
+        # Derive the base coin from the symbol string itself (strip the
+        # quote suffix) rather than trusting the exchange's baseCurrency
+        # field — that field isn't reliably populated for every pair (the
+        # same issue that broke the stablecoin exclusion in Scalping).
+        if not sym.upper().endswith(quote.upper()):
+            continue
+        base = sym.upper()[: -len(quote)]
+        if not base:
+            continue
+        if base in EXCLUDED_STABLE_BASES or sym.upper().startswith(tuple(EXCLUDED_STABLE_BASES)):
+            continue
+        vol = vol_map.get(sym, 0)
+        if vol < cfg.min_24h_volume_usdt:
+            continue
+        if base not in best_per_base or vol > best_per_base[base][1]:
+            best_per_base[base] = (sym, vol)
+    ranked = sorted(best_per_base.values(), key=lambda x: x[1], reverse=True)
+    # Stability check runs only while walking the ranked list, stopping once
+    # we have enough — not on every deduped coin up front.
+    out: list[str] = []
+    for sym, _ in ranked:
+        if len(out) >= cfg.top10_universe_size:
+            break
+        if await is_volume_stable(sym, cfg):
+            out.append(sym)
+    return out
+
+
+async def compute_top10_trend_score(symbol: str, cfg: Config) -> tuple[float, dict[str, Any]]:
+    """0-100 trend-strength gate on the 4H timeframe: price vs EMA200,
+    EMA20/50/200 alignment, HH/HL structure, momentum, volume coherence."""
+    candles = await exchange.get_klines(symbol, "4h")
+    if len(candles) < cfg.top10_ema_slow:
+        return 0.0, {}
+    closes = [c[2] for c in candles]
+    volumes = [c[5] for c in candles]
+    ema_fast = _ema(closes, cfg.top10_ema_fast)
+    ema_med = _ema(closes, cfg.top10_ema_medium)
+    ema_slow = _ema(closes, cfg.top10_ema_slow)
+    price = closes[-1]
+    structure = detect_market_structure(candles, window=5, strict=False)
+    vol_avg = sum(volumes[-20:]) / min(20, len(volumes))
+    vol_now = volumes[-1]
+
+    score = 0.0
+    if price > ema_slow[-1]:
+        score += 25
+    if ema_fast[-1] > ema_med[-1]:
+        score += 20
+    if ema_med[-1] > ema_slow[-1]:
+        score += 20
+    if structure == "up":
+        score += 20
+    elif structure == "range":
+        score += 5
+    momentum = (closes[-1] - closes[-6]) / closes[-6] * 100 if len(closes) > 6 and closes[-6] else 0.0
+    if momentum > 0:
+        score += 10
+    if vol_now >= vol_avg:
+        score += 5
+    return score, {"momentum_pct": momentum, "structure": structure}
+
+
+# ============================================================================
+# SIMULATED FILLS (paper) — buy at the real ask, sell at the real bid.
+# Used by 33/60 and XRP Accumulation. A paper trade used to fill exactly at the
+# last traded price, which is optimistic: a real market order pays the spread
+# and, when it is bigger than the best level, walks deeper into the book.
+# ============================================================================
+BOOK_DEPTH = 10  # order-book levels read per fill (a single request)
+_book_checked_at: dict[str, float] = {}
+
+
+def book_recheck_due(key: str, seconds: float = 10.0) -> bool:
+    """True at most once every `seconds` for the same key. The monitors tick
+    every 3s and must not hammer the order-book endpoint while a sale is
+    waiting for the real bid to clear the margin."""
+    now = time.time()
+    if now - _book_checked_at.get(key, 0.0) < seconds:
+        return False
+    _book_checked_at[key] = now
+    return True
+
+
+async def get_order_book(symbol: str, depth: int = BOOK_DEPTH) -> Optional[tuple[list[list[float]], list[list[float]]]]:
+    """Top `depth` levels of the Bybit order book as (bids, asks), each a list
+    of [price, size] with the best level first. None when it cannot be read or
+    looks broken (empty or crossed) — callers then use a safe fallback."""
+    try:
+        data = await exchange._get(
+            "/v5/market/orderbook",
+            params={"category": exchange.category, "symbol": symbol, "limit": depth},
+        )
+        if not data or data.get("retCode") != 0:
+            return None
+        res = data.get("result") or {}
+        bids = [[float(row[0]), float(row[1])] for row in res.get("b", [])]
+        asks = [[float(row[0]), float(row[1])] for row in res.get("a", [])]
+        if not bids or not asks or bids[0][0] <= 0 or asks[0][0] < bids[0][0]:
+            return None
+        return bids, asks
+    except Exception:  # noqa: BLE001
+        return None
+
+
+def walk_book(
+    levels: list[list[float]], *, quote_budget: Optional[float] = None, base_qty: Optional[float] = None
+) -> Optional[float]:
+    """Average price of a market order that eats `levels` (best first).
+    quote_budget: spend this much quote currency (a buy). base_qty: sell this
+    much base currency. None when the visible depth is not enough."""
+    if quote_budget is not None:
+        spent = got = 0.0
+        for price, size in levels:
+            take = min(quote_budget - spent, price * size)
+            got += take / price
+            spent += take
+            if spent >= quote_budget - 1e-9:
+                return spent / got
+        return None
+    if base_qty:
+        remaining, proceeds = base_qty, 0.0
+        for price, size in levels:
+            take = min(remaining, size)
+            proceeds += take * price
+            remaining -= take
+            if remaining <= 1e-12:
+                return proceeds / base_qty
+    return None
+
+
+def required_exit_price(fill: float, min_net_pct: float, fee_pct: float) -> float:
+    """Lowest sell price that still leaves `min_net_pct` NET profit after the
+    fee on BOTH legs (fee charged on the entry value and on the exit value, as
+    the closing code does). With N the entry value, q the quantity and f the fee:
+        sell*q - (N + sell*q)*f >= N*(1+m)   =>   sell >= fill*(1+m+f)/(1-f)
+    Exact for any fee level; the spread is not in here because the callers
+    compare it with the REAL bid, which already includes it."""
+    m = min_net_pct / 100.0
+    f = fee_pct / 100.0
+    return fill * (1.0 + m + f) / (1.0 - f)
+
+
+def trailing_stop_price(fill: float, peak: float, trail_pct: float, fee_pct: float) -> float:
+    """Price at which the trailing sells: `trail_pct` below the highest price
+    seen, but NEVER below break-even — the price where the fees on both legs are
+    exactly covered — so a trailing exit can never lock in a net loss."""
+    return max(peak * (1.0 - trail_pct / 100.0), required_exit_price(fill, 0.0, fee_pct))
+
+
+async def update_trailing_state(coll: Any, p: dict[str, Any], cur: float, activation_price: float) -> tuple[bool, float]:
+    """Arms the trailing the first time the last price clears `activation_price`
+    (the minimum-net-profit level) and from then on keeps the highest price
+    seen. Saved on the position, so it survives restarts. Returns (active, peak)."""
+    active = bool(p.get("trailing_active"))
+    peak = float(p.get("peak_price") or 0.0)
+    if not active:
+        if cur >= activation_price:
+            active, peak = True, max(peak, cur)
+            await coll.update_one({"id": p["id"]}, {"$set": {"trailing_active": True, "peak_price": peak}})
+    elif cur > peak * 1.0001:  # a new high; ignore sub-0.01% noise to keep database writes low
+        peak = cur
+        await coll.update_one({"id": p["id"]}, {"$set": {"peak_price": peak}})
+    return active, peak
+
+
+# ---- POSITION TRACKING: a "black box" for every open 33/60 and XRP operation ----
+TRACK_MAX_SAMPLES = 6000          # hard cap per operation (a few days at one sample a minute)
+TRACK_KEEP_DAYS = 60              # closed operations keep their path this long
+_track_last_at: dict[str, float] = {}
+_track_ext_at: dict[str, float] = {}
+_track_cleanup_at: float = 0.0
+
+
+def _track_interval(age_s: float) -> float:
+    """Seconds between price samples: one a minute on the first day, then
+    sparser as the operation ages, so a long one stays small."""
+    if age_s <= 86400:
+        return 60.0
+    if age_s <= 7 * 86400:
+        return 300.0
+    return 900.0
+
+
+async def record_track(kind: str, coll: Any, p: dict[str, Any], cur: float) -> None:
+    """Called by the monitors every 3s for each open operation. Writes at most
+    one price sample per interval into `position_tracks`, and keeps the lowest
+    and highest price seen on the operation itself. Never raises: a tracking
+    problem must not get in the way of a trade."""
+    global _track_cleanup_at
+    try:
+        now = time.time()
+        pid = p["id"]
+        iso = datetime.fromtimestamp(now, timezone.utc).isoformat()
+        lo = float(p.get("min_price") or 0.0)
+        hi = float(p.get("max_price") or 0.0)
+        upd: dict[str, Any] = {}
+        if lo == 0.0 or cur < lo * 0.9999:
+            upd["min_price"], upd["min_at"] = cur, iso
+        if hi == 0.0 or cur > hi * 1.0001:
+            upd["max_price"], upd["max_at"] = cur, iso
+        if upd and now - _track_ext_at.get(pid, 0.0) >= 10.0:
+            _track_ext_at[pid] = now
+            await coll.update_one({"id": pid}, {"$set": upd})
+        try:
+            age = now - datetime.fromisoformat(p["opened_at"]).timestamp()
+        except Exception:  # noqa: BLE001
+            age = 0.0
+        if now - _track_last_at.get(pid, 0.0) >= _track_interval(age):
+            _track_last_at[pid] = now
+            await db.position_tracks.update_one(
+                {"_id": pid},
+                {
+                    "$setOnInsert": {"kind": kind, "symbol": p.get("symbol"), "opened_at": p.get("opened_at")},
+                    "$push": {"samples": {"$each": [[round(now, 1), cur]], "$slice": -TRACK_MAX_SAMPLES}},
+                },
+                upsert=True,
+            )
+        if now - _track_cleanup_at > 3600:
+            _track_cleanup_at = now
+            cutoff = datetime.fromtimestamp(now - TRACK_KEEP_DAYS * 86400, timezone.utc).isoformat()
+            await db.position_tracks.delete_many({"closed_at": {"$lt": cutoff}})
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Position tracking skipped: %s", e)
+
+
+async def close_track(pid: str, last_price: float) -> None:
+    """Final price point and closing time: the path stays available for review."""
+    try:
+        now = time.time()
+        await db.position_tracks.update_one(
+            {"_id": pid},
+            {
+                "$set": {"closed_at": datetime.fromtimestamp(now, timezone.utc).isoformat()},
+                "$push": {"samples": {"$each": [[round(now, 1), last_price]], "$slice": -TRACK_MAX_SAMPLES}},
+            },
+        )
+        _track_last_at.pop(pid, None)
+        _track_ext_at.pop(pid, None)
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Closing the position track failed: %s", e)
+
+
+async def simulate_fill(
+    symbol: str, side: str, ref_price: float, cfg: Config,
+    *, quote_budget: Optional[float] = None, base_qty: Optional[float] = None,
+) -> tuple[float, dict[str, Any]]:
+    """Price a market order would really get. side "buy" spends `quote_budget`,
+    side "sell" sells `base_qty`. Returns (price, info); info.fill_model is
+    "last" (simulation off, no request), "book" (real order book) or
+    "fallback" (book unreadable / too thin: last price made worse by
+    `sim_fallback_slippage_pct`); info.cost_pct is how much WORSE than the
+    last price the fill is (positive = it costs money)."""
+    if not cfg.sim_realistic_fills:
+        return ref_price, {"fill_model": "last", "cost_pct": 0.0}
+    book = await get_order_book(symbol)
+    if book:
+        bids, asks = book
+        if side == "buy":
+            avg = walk_book(asks, quote_budget=quote_budget)
+        else:
+            avg = walk_book(bids, base_qty=base_qty)
+        if avg:
+            spread_pct = (asks[0][0] / bids[0][0] - 1.0) * 100.0
+            cost = (avg / ref_price - 1.0) * 100.0 if side == "buy" else (1.0 - avg / ref_price) * 100.0
+            return avg, {"fill_model": "book", "spread_pct": round(spread_pct, 4), "cost_pct": round(cost, 4)}
+    haircut = cfg.sim_fallback_slippage_pct / 100.0
+    price = ref_price * (1.0 + haircut) if side == "buy" else ref_price * (1.0 - haircut)
+    return price, {"fill_model": "fallback", "cost_pct": round(cfg.sim_fallback_slippage_pct, 4)}
+
+
+# ============================================================================
+# Strategy "33/60" — buy when RSI crosses down through 35 (a fresh dip into
+# oversold-adjacent territory), exit once RSI recovers up to 60. Backtested
+# on ~41 days of BTC 1h data: 14 dips found, 10/14 (71%) reached RSI 60
+# within 40 candles, average gain +1.58% (median +1.57%, max +2.51%) on the
+# ones that did — none went negative among the ones that reached target.
+# The other 29% never got there within the window; those exit on the
+# timeout below instead of being held indefinitely. This is a genuinely
+# different entry rule from a reversal-candle strategy — here entry fires
+# the moment RSI first dips below the threshold, no confirmation candle
+# required.
+# ============================================================================
+
+S3360_WALLET_ID = "s3360_wallet_singleton"
+
+
+async def get_s3360_wallet() -> dict[str, Any]:
+    doc = await db.s3360_wallet.find_one({"_id": S3360_WALLET_ID}, {"_id": 0})
+    if not doc:
+        doc = {"cash": 0.0, "total_transferred_in": 0.0, "reset_seq": 0}
+        await db.s3360_wallet.update_one(
+            {"_id": S3360_WALLET_ID}, {"$set": doc}, upsert=True
+        )
+    doc.setdefault("reset_seq", 0)
+    return doc
+
+
+_s3360_last_candle: dict[tuple[str, str], float] = {}  # per (symbol, timeframe): timestamp of the CURRENT still-forming candle a live-touch attempt was already made on — see run_s3360_scan
+
+
+_daily_ref_cache: dict[str, tuple[float, float]] = {}  # symbol -> (UTC day start, price the day opened at)
+
+
+async def get_daily_open_price(symbol: str) -> Optional[float]:
+    """Price the CURRENT UTC day opened at, taken as yesterday's close (this
+    market never closes, so the two are practically the same). get_klines drops
+    the still-forming candle, so the last daily candle it returns should be
+    yesterday's; if it is anything else (exchange lag around midnight, a gap)
+    return None instead of a wrong number — callers then let the trade through,
+    exactly as before the filter existed."""
+    day_start = (time.time() // 86400) * 86400
+    cached = _daily_ref_cache.get(symbol)
+    if cached and cached[0] == day_start:
+        return cached[1]
+    try:
+        daily = await exchange.get_klines(symbol, "1d")
+    except Exception:  # noqa: BLE001
+        return None
+    if not daily or abs(daily[-1][0] - (day_start - 86400)) > 1:
+        return None
+    ref = daily[-1][2]
+    if not ref or ref <= 0:
+        return None
+    _daily_ref_cache[symbol] = (day_start, ref)
+    return ref
+
+
+
+# ---------------------------------------------------------------------------
+# 33/60: controllo d'ingresso frequente (ogni ~20 s) con cache, e registro dei segnali.
+# ---------------------------------------------------------------------------
+_s3360_px_cache: dict[str, Any] = {"at": 0.0, "map": {}, "vol": {}}
+_s3360_cand_cache: dict[str, Any] = {"at": 0.0, "list": []}
+_s3360_candle_cache: dict[tuple[str, str], tuple[float, list[list[float]]]] = {}
+_s3360_log_at: dict[str, float] = {}
+_s3360_event_seen: set = set()
+_s3360_event_prune_at = 0.0
+
+
+async def _s3360_candidates(cfg: Config) -> tuple[list[str], dict[str, float]]:
+    """Elenco monete da controllare (ricalcolato ogni 5 minuti) e prezzi di tutte le monete (una sola richiesta ogni 10 s)."""
+    now = time.time()
+    px = _s3360_px_cache
+    if now - px["at"] > 10 or not px["map"]:
+        tickers = await exchange.get_tickers()
+        pm: dict[str, float] = {}
+        vm: dict[str, float] = {}
+        for t in tickers:
+            try:
+                vm[t["symbol"]] = float(t.get("volValue") or 0)
+            except (TypeError, ValueError, KeyError):
+                pass
+            try:
+                pm[t["symbol"]] = float(t.get("last") or 0)
+            except (TypeError, ValueError, KeyError):
+                pass
+        if pm:
+            px["at"], px["map"], px["vol"] = now, pm, vm
+    cc = _s3360_cand_cache
+    if now - cc["at"] > 300 or not cc["list"]:
+        vol_map = px.get("vol", {})
+        symbols = await exchange.get_symbols()
+        quotes = {q.strip() for q in (cfg.quote_filter or "").split(",") if q.strip()}
+        candidates: list[str] = []
+        for s in symbols:
+            if not s.get("enableTrading"):
+                continue
+            sym = s.get("symbol")
+            if not sym:
+                continue
+            if quotes and s.get("quoteCurrency") not in quotes:
+                continue
+            if any(sym.upper().startswith(base) for base in EXCLUDED_STABLE_BASES):
+                continue
+            if cfg.excluded_pairs and sym in cfg.excluded_pairs:
+                continue
+            if cfg.enabled_pairs and sym not in cfg.enabled_pairs:
+                continue
+            if vol_map.get(sym, 0) < cfg.min_24h_volume_usdt:
+                continue
+            candidates.append(sym)
+        candidates.sort(key=lambda s: vol_map.get(s, 0), reverse=True)
+        candidates = candidates[:30]
+        candidates = [c for c in candidates if await is_volume_stable(c, cfg)]
+        if candidates:
+            cc["at"], cc["list"] = now, candidates
+    return cc["list"], px["map"]
+
+
+async def _s3360_candles(symbol: str, tf: str) -> list[list[float]]:
+    """Candele chiuse: si riscaricano solo quando ne e' chiusa una nuova (non ad ogni controllo)."""
+    now = time.time()
+    tf_sec = TF_SECONDS.get(tf, 3600)
+    hit = _s3360_candle_cache.get((symbol, tf))
+    if hit and hit[1] and now < hit[1][-1][0] + 2 * tf_sec + 3 and now - hit[0] < tf_sec * 3:
+        return hit[1]
+    candles = await exchange.get_klines(symbol, tf)
+    if candles:
+        _s3360_candle_cache[(symbol, tf)] = (now, candles)
+        return candles
+    if hit and hit[1] and now - hit[0] < 600:
+        return hit[1]
+    return []
+
+
+async def _s3360_log(symbol: str, tf: str, reason: str) -> None:
+    """Come log_reject, ma al massimo una volta ogni 5 minuti (15 per il motivo piu' comune) per moneta/timeframe/motivo."""
+    key = f"{symbol}|{tf}|{reason}"
+    ttl = 900.0 if reason.startswith("nessun nuovo ingresso") else 300.0
+    now = time.time()
+    if now - _s3360_log_at.get(key, 0.0) < ttl:
+        return
+    _s3360_log_at[key] = now
+    await log_reject(symbol, tf, "s3360", reason)
+
+
+async def _s3360_event(symbol: str, tf: str, rsi: float, price: float, candle_t: float, outcome: str) -> None:
+    """Registro dei segnali: una riga ogni volta che una moneta tocca la soglia, con l'esito. Tenuto 14 giorni."""
+    global _s3360_event_prune_at
+    key = (symbol, tf, candle_t, outcome)
+    if key in _s3360_event_seen:
+        return
+    if len(_s3360_event_seen) > 5000:
+        _s3360_event_seen.clear()
+    _s3360_event_seen.add(key)
+    try:
+        now = datetime.now(timezone.utc)
+        await db.signal_events.insert_one({
+            "strategy": "s3360", "symbol": symbol, "tf": tf, "rsi": round(float(rsi), 2),
+            "price": price, "outcome": outcome, "at": now.isoformat(),
+        })
+        if time.time() - _s3360_event_prune_at > 3600:
+            _s3360_event_prune_at = time.time()
+            await db.signal_events.delete_many({"at": {"$lt": (now - timedelta(days=14)).isoformat()}})
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def s3360_entry_loop() -> None:
+    """Unico chiamante del controllo d'ingresso 33/60 (due chiamanti potrebbero aprire due posizioni insieme)."""
+    await asyncio.sleep(15)
+    while True:
+        try:
+            await run_s3360_scan()
+        except Exception as e:  # noqa: BLE001
+            logger.exception("33/60 entry loop error: %s", e)
+        await asyncio.sleep(20)
+
+
+@api.get("/s3360/segnali")
+async def s3360_signals() -> dict[str, Any]:
+    rows = await db.signal_events.find({"strategy": "s3360"}, {"_id": 0}).sort("at", -1).to_list(150)
+    return {"rows": rows}
+
+
+async def run_s3360_scan() -> None:
+    cfg = await get_config()
+    if not cfg.s3360_enabled:
+        return
+
+    open_count = await db.s3360_positions.count_documents({"status": "open"})
+    if open_count >= cfg.s3360_max_open_positions:
+        return
+
+    wallet = await get_s3360_wallet()
+    cash = wallet.get("cash", 0.0)
+    if cash <= 1.0:
+        return
+
+    candidates, last_prices = await _s3360_candidates(cfg)
+
+    for symbol in candidates:
+        if open_count >= cfg.s3360_max_open_positions:
+            break
+        if await db.s3360_positions.find_one({"symbol": symbol, "status": "open"}):
+            continue
+        for tf in cfg.s3360_timeframes:
+            candles = await _s3360_candles(symbol, tf)
+            if len(candles) < cfg.s3360_rsi_period + 3:
+                await _s3360_log(symbol, tf, "dati insufficienti")
+                continue
+            # Live entry: react to the RSI value AS IT IS RIGHT NOW, using the
+            # real-time price as a stand-in for the still-forming candle's
+            # close — same number the exchange's own live chart shows you
+            # ticking in real time. Waiting for that candle to actually
+            # close (the old behaviour) missed fast touches that recovered
+            # before the candle finished.
+            live_price = price_feed.get(symbol) or last_prices.get(symbol) or await price_feed.price_or_rest(symbol)
+            if not live_price:
+                await _s3360_log(symbol, tf, "prezzo live non disponibile")
+                continue
+            closes = [c[2] for c in candles]
+            live_rsis = rsi_wilder(closes + [live_price], cfg.s3360_rsi_period)
+            live_rsi = live_rsis[-1]
+            if live_rsi > cfg.s3360_low_threshold:
+                await _s3360_log(symbol, tf, "nessun nuovo ingresso sotto soglia bassa")
+                continue
+            # Dedup against the CURRENT still-forming candle's start time —
+            # not the last closed one — so a live touch only attempts once
+            # per forming candle, no matter how many scans happen while
+            # price stays under the threshold within it.
+            tf_sec = TF_SECONDS.get(tf, 3600)
+            forming_candle_t = candles[-1][0] + tf_sec
+            if _s3360_last_candle.get((symbol, tf)) == forming_candle_t:
+                await _s3360_log(symbol, tf, "stessa candela già tentata")
+                continue
+            if cfg.s3360_min_atr_pct > 0:
+                atr_now = atr_wilder(
+                    [c[3] for c in candles], [c[4] for c in candles], closes, cfg.s3360_rsi_period
+                )
+                # If the ATR cannot be computed, let the trade through (as before the filter).
+                if atr_now is not None and atr_now / live_price * 100.0 < cfg.s3360_min_atr_pct:
+                    # Not marked as "attempted": volatility may pick up within this candle.
+                    await _s3360_log(symbol, tf, "mercato troppo piatto (filtro volatilità)")
+                    await _s3360_event(symbol, tf, live_rsi, live_price, forming_candle_t, "scartato: mercato troppo piatto")
+                    continue
+            if cfg.s3360_require_coin_trend or cfg.s3360_require_btc_trend or cfg.s3360_require_above_long_ema:
+                why = await trend_filter_block_reason(
+                    symbol, cfg, cfg.s3360_require_coin_trend, cfg.s3360_require_btc_trend,
+                    cfg.s3360_require_above_long_ema, live_price,
+                )
+                if why:
+                    # Not marked as "attempted": the trend may turn within this candle.
+                    await _s3360_log(symbol, tf, why)
+                    await _s3360_event(symbol, tf, live_rsi, live_price, forming_candle_t, "scartato: " + str(why))
+                    continue
+            rise_pct: Optional[float] = None
+            day_open = await get_daily_open_price(symbol)
+            if day_open:
+                rise_pct = round((live_price / day_open - 1.0) * 100.0, 4)
+            if (
+                cfg.s3360_max_daily_rise_pct > 0
+                and rise_pct is not None
+                and rise_pct > cfg.s3360_max_daily_rise_pct
+            ):
+                # Not marked as "attempted": the coin may cool off within this
+                # same candle and qualify on a later scan.
+                await _s3360_log(symbol, tf, "già salita troppo oggi (filtro crescita giornaliera)")
+                await _s3360_event(symbol, tf, live_rsi, live_price, forming_candle_t, "scartato: già salita troppo oggi")
+                continue
+            _s3360_last_candle[(symbol, tf)] = forming_candle_t
+            signal = {
+                "entry": live_price,
+                "rsi": live_rsi,
+                "candle_t": forming_candle_t,
+                "daily_rise_pct": rise_pct,
+            }
+            await open_s3360_position(symbol, tf, signal, cfg)
+            _op = await db.s3360_positions.find_one({"symbol": symbol, "status": "open"}, {"_id": 0, "opened_at": 1})
+            _fresh = bool(_op) and (datetime.now(timezone.utc) - datetime.fromisoformat(_op["opened_at"])).total_seconds() < 30
+            await _s3360_event(symbol, tf, live_rsi, live_price, forming_candle_t,
+                               "aperta" if _fresh else "non aperta (capitale, limiti o reale bloccato: vedi registro)")
+            open_count += 1
+            break
+
+
+async def open_s3360_position(symbol: str, tf: str, signal: dict[str, Any], cfg: Config) -> None:
+    wallet = await get_s3360_wallet()
+    cash = wallet.get("cash", 0.0)
+    if cash <= 1.0:
+        return
+    entry = signal["entry"]
+    live_price = price_feed.get(symbol) or await price_feed.price_or_rest(symbol)
+    ref_price = live_price or entry
+    # Size each trade as a fixed share of TOTAL equity (cash + value of
+    # currently open positions), not just the free cash — so "N slots"
+    # always means "1/N of total capital per trade" regardless of how many
+    # positions happen to be open right now. E.g. max_open_positions=2 means
+    # each trade gets 50% of equity, whether it's the 1st or 2nd slot filled.
+    open_positions = await db.s3360_positions.find({"status": "open"}, {"_id": 0}).to_list(200)
+    open_value = sum(
+        (price_feed.get(p["symbol"]) or p["entry"]) * p["quantity"] for p in open_positions
+    )
+    equity = cash + open_value
+    slots = max(1, cfg.s3360_max_open_positions)
+    notional = min((equity / slots) * await get_regime_size_multiplier(cfg), cash)
+    if notional < 1.0:
+        return
+    # Paper fill at the real ask (walking the book if the order is bigger than
+    # the first level) instead of the last traded price.
+    mode, why = await real_guard(cfg, "s3360")
+    if mode == "blocked":
+        await log_reject(symbol, tf, "s3360", f"reale bloccato: {why}")
+        return
+    real_info = None
+    if mode == "real":
+        rb = await real_open_buy(symbol, notional, cfg, "s3360", cash_cap=cash)
+        if not rb:
+            await log_reject(symbol, tf, "s3360", "ordine reale non eseguito (vedi registro reale)")
+            return
+        real_info = rb
+        notional = rb["value"]
+        fill_price = rb["avg_price"]
+        fill_info = {"fill_model": "reale", "cost_pct": 0.0, "spread_pct": None}
+        quantity = rb["net_qty"]
+    else:
+        fill_price, fill_info = await simulate_fill(symbol, "buy", ref_price, cfg, quote_budget=notional)
+        quantity = notional / fill_price
+
+    candles = await exchange.get_klines(symbol, tf)
+    highs = [c[3] for c in candles]
+    lows = [c[4] for c in candles]
+    closes = [c[2] for c in candles]
+    atr = atr_wilder(highs, lows, closes, cfg.s3360_rsi_period) or 0.0
+
+    doc = {
+        "id": str(uuid.uuid4()),
+        "symbol": symbol,
+        "timeframe": tf,
+        "side": "long",
+        "entry": entry,
+        "fill_price": fill_price,
+        "fill_model": fill_info["fill_model"],
+        "entry_cost_pct": fill_info["cost_pct"],
+        "spread_pct": fill_info.get("spread_pct"),
+        "rsi_at_entry": signal.get("rsi"),
+        "daily_rise_pct": (
+            None if signal.get("daily_rise_pct") is None else round(signal["daily_rise_pct"], 2)
+        ),
+        "atr": atr,
+        "quantity": quantity,
+        "notional": notional,
+        "status": "open",
+        "opened_at": datetime.now(timezone.utc).isoformat(),
+    }
+    if real_info:
+        doc["real"] = {k: real_info[k] for k in ("order_id", "link_id", "net_qty", "fee_base", "fee_quote", "qty")}
+    await db.s3360_positions.insert_one(dict(doc))
+    await db.s3360_wallet.update_one(
+        {"_id": S3360_WALLET_ID}, {"$inc": {"cash": -notional}}, upsert=True
+    )
+
+
+_s3360_hold_log_at: dict[str, float] = {}
+
+
+async def _s3360_hold_log(p: dict[str, Any], reason: str = "RSI al target ma prezzo sotto l'entrata: attendo il recupero") -> None:
+    """The monitor runs every 3 seconds; write the 'waiting' note at most once
+    every 5 minutes per position so it stays visible without flooding the log."""
+    now = time.time()
+    if now - _s3360_hold_log_at.get(p["id"], 0.0) < 300:
+        return
+    _s3360_hold_log_at[p["id"]] = now
+    await log_reject(
+        p["symbol"], p.get("timeframe", "?"), "s3360",
+        reason,
+    )
+
+
+async def monitor_s3360_positions() -> None:
+    cfg = await get_config()
+    open_positions = await db.s3360_positions.find({"status": "open"}, {"_id": 0}).to_list(200)
+    for p in open_positions:
+        cur = price_feed.get(p["symbol"])
+        if not cur:
+            cur = await price_feed.price_or_rest(p["symbol"])
+        if not cur or cur <= 0:
+            continue
+        await record_track("s3360", db.s3360_positions, p, cur)
+
+        hit = None
+        tf = p.get("timeframe", "1h")
+        candles = await exchange.get_klines(p["symbol"], tf)
+        # Live exit: same principle as entry — use the real-time price as
+        # the still-forming candle's close, so a touch of the target RSI
+        # closes the trade immediately instead of waiting for the candle
+        # to finish (which could let the touch reverse away unrealized).
+        closes = [c[2] for c in candles] + [cur]
+        rsis = rsi_wilder(closes, cfg.s3360_rsi_period) if len(closes) > cfg.s3360_rsi_period else []
+        rsi_hit = bool(rsis and rsis[-1] >= cfg.s3360_high_threshold)
+        # Uscita extra "RSI di ritorno": dopo che l'RSI ha superato s3360_rsi_arm la posizione e' 'armata';
+        # se poi l'RSI scende sotto s3360_rsi_giveback si esce (stesso pavimento delle altre uscite).
+        giveback_hit = False
+        if cfg.s3360_rsi_giveback_enabled and rsis and tf in cfg.s3360_rsi_giveback_timeframes:
+            if not p.get("rsi_armed") and rsis[-1] > cfg.s3360_rsi_arm:
+                p["rsi_armed"] = True
+                await db.s3360_positions.update_one({"id": p["id"]}, {"$set": {"rsi_armed": True}})
+            giveback_hit = bool(p.get("rsi_armed")) and rsis[-1] < cfg.s3360_rsi_giveback
+
+        fill = p.get("fill_price", p["entry"])
+        margin_price = required_exit_price(fill, cfg.s3360_min_net_profit_pct, cfg.sim_fee_pct)
+        break_even = required_exit_price(fill, 0.0, cfg.sim_fee_pct)
+        # Trailing: armed when the last price first clears the minimum-net level,
+        # then it follows the highest price. It sells if the price falls back by
+        # s3360_trailing_pct, but never below break-even.
+        trail_hit = False
+        if cfg.s3360_hold_below_entry and cfg.s3360_trailing_enabled:
+            active, peak = await update_trailing_state(db.s3360_positions, p, cur, margin_price)
+            trail_hit = active and cur <= trailing_stop_price(fill, peak, cfg.s3360_trailing_pct, cfg.sim_fee_pct)
+
+        # The RSI target stays the main exit; the trailing protects the profit
+        # when the price turns back before the target is reached.
+        if rsi_hit and (not cfg.s3360_hold_below_entry or cur >= margin_price):
+            hit, floor_price = "target_rsi_raggiunto", margin_price
+        elif trail_hit:
+            hit, floor_price = "trailing_stop", break_even
+        elif giveback_hit:
+            # Voluto dall'utente: questa uscita chiude SEMPRE, a qualunque prezzo (anche in perdita),
+            # senza guardare il guadagno minimo ne' il pareggio.
+            hit, floor_price = "rsi_ritorno", 0.0
+        elif rsi_hit:
+            # RSI reached the target but selling now would lock in less than the
+            # minimum net profit: keep waiting. Both conditions must be true
+            # together — RSI at the target AND the price high enough.
+            await _s3360_hold_log(p)
+            continue
+        else:
+            continue
+        if cfg.s3360_hold_below_entry and cur < floor_price:
+            await _s3360_hold_log(p, "RSI tornato sotto la soglia ma il prezzo non copre i costi: attendo" if hit == "rsi_ritorno" else "Trailing: il prezzo non copre i costi, attendo" if hit == "trailing_stop" else "RSI al target ma prezzo sotto l'entrata: attendo il recupero")
+            continue
+
+        # The last price clears the floor; now ask what a market sell would
+        # REALLY get (best bid / depth). With the simulation off this is `cur`
+        # and costs no request. The book is read at most every 10s per position.
+        if p.get("real"):
+            if not real_sell_due(p["id"]):
+                continue
+            sell = await real_close_position(p, cfg, "s3360x")
+            if not sell:
+                await rlog(f"Vendita reale di {p['symbol']} non riuscita, riprovo tra 30 s", "errore")
+                continue
+            sell_price = sell["avg_price"]
+            pnl = sell["net_value"] + sell.get("dust_value", 0.0) - p["notional"]
+            await db.s3360_wallet.update_one({"_id": S3360_WALLET_ID}, {"$inc": {"cash": p["notional"] + pnl}}, upsert=True)
+            await db.s3360_positions.update_one({"id": p["id"]}, {"$set": {
+                "status": "closed", "close_price": sell_price, "close_reason": hit, "close_last_price": cur,
+                "exit_fill_model": "reale", "fee_pct": cfg.sim_fee_pct, "pnl_usdt": round(pnl, 4),
+                "closed_at": datetime.now(timezone.utc).isoformat(),
+                "real_exit": {k: v for k, v in sell.items() if k != "dust"},
+            }})
+            await close_track(p["id"], cur)
+            continue
+        if cfg.sim_realistic_fills and not book_recheck_due(p["id"]):
+            continue
+        sell_price, sell_info = await simulate_fill(p["symbol"], "sell", cur, cfg, base_qty=p["quantity"])
+        if cfg.s3360_hold_below_entry and sell_price < floor_price:
+            # the price we would really get is still too low
+            await _s3360_hold_log(p, "RSI tornato sotto la soglia ma il prezzo di vendita vero non copre i costi: attendo" if hit == "rsi_ritorno" else "Trailing: il prezzo di vendita vero non copre i costi, attendo" if hit == "trailing_stop" else "RSI al target ma prezzo sotto l'entrata: attendo il recupero")
+            continue
+
+        gross_pnl = (sell_price - fill) * p["quantity"]
+        exit_notional = sell_price * p["quantity"]
+        fees = (p["notional"] + exit_notional) * (cfg.sim_fee_pct / 100.0)
+        pnl = gross_pnl - fees
+        await db.s3360_wallet.update_one(
+            {"_id": S3360_WALLET_ID},
+            {"$inc": {"cash": p["notional"] + pnl}},
+            upsert=True,
+        )
+        await db.s3360_positions.update_one(
+            {"id": p["id"]},
+            {"$set": {
+                "status": "closed", "close_price": sell_price, "close_reason": hit,
+                "close_last_price": cur,
+                "exit_fill_model": sell_info["fill_model"],
+                "exit_cost_pct": sell_info["cost_pct"],
+                "exit_spread_pct": sell_info.get("spread_pct"),
+                "fee_pct": cfg.sim_fee_pct,
+                "pnl_usdt": round(pnl, 4),
+                "closed_at": datetime.now(timezone.utc).isoformat(),
+            }},
+        )
+        await close_track(p["id"], cur)
+
+
+class S3360TransferRequest(BaseModel):
+    amount: float
+
+
+@api.post("/s3360/deposit")
+async def s3360_deposit(req: S3360TransferRequest) -> dict[str, Any]:
+    amount = req.amount
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="L'importo deve essere positivo")
+    main_cash = await get_paper_cash()
+    if amount > main_cash:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Fondi insufficienti nel portafoglio principale (disponibili: {round(main_cash, 2)})",
+        )
+    await set_paper_cash(main_cash - amount)
+    updated = await db.s3360_wallet.find_one_and_update(
+        {"_id": S3360_WALLET_ID},
+        {"$inc": {"cash": amount, "total_transferred_in": amount}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return {"ok": True, "s3360_cash": updated.get("cash", amount), "main_cash": main_cash - amount}
+
+
+@api.post("/s3360/withdraw")
+async def s3360_withdraw(req: S3360TransferRequest) -> dict[str, Any]:
+    amount = req.amount
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="L'importo deve essere positivo")
+    w = await get_s3360_wallet()
+    available = w.get("cash", 0.0)
+    if amount > available and (amount - available) <= 0.01:
+        amount = available
+    updated = await db.s3360_wallet.find_one_and_update(
+        {"_id": S3360_WALLET_ID, "cash": {"$gte": amount}},
+        {"$inc": {"cash": -amount}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not updated:
+        raise HTTPException(status_code=400, detail="Fondi insufficienti nel portafoglio 33/60")
+    main_cash = await get_paper_cash()
+    await set_paper_cash(main_cash + amount)
+    return {"ok": True, "s3360_cash": updated.get("cash", 0.0), "main_cash": main_cash + amount}
+
+
+@api.get("/s3360/portfolio")
+async def s3360_portfolio() -> dict[str, Any]:
+    cfg = await get_config()
+    wallet = await get_s3360_wallet()
+    open_docs = await db.s3360_positions.find({"status": "open"}, {"_id": 0}).to_list(200)
+    closed_docs = await db.s3360_positions.find({"status": "closed"}, {"_id": 0}).sort("closed_at", -1).to_list(500)
+
+    unrealized = 0.0
+    open_out = []
+    open_value = 0.0
+    for p in open_docs:
+        cur = price_feed.get(p["symbol"]) or await price_feed.price_or_rest(p["symbol"]) or p["entry"]
+        # What the bot REALLY paid (the real ask) — the same basis its exit rule
+        # uses. `entry` is only the last price seen when the signal fired.
+        basis = p.get("fill_price", p["entry"])
+        upnl = (cur - basis) * p["quantity"]
+        unrealized += upnl
+        open_value += cur * p["quantity"]
+        item = {**p, "current_price": cur, "unrealized_pnl": round(upnl, 4)}
+        if cfg.s3360_hold_below_entry:
+            level = required_exit_price(basis, cfg.s3360_min_net_profit_pct, cfg.sim_fee_pct)
+            item["exit_level"] = level  # the real SELL price needed to close (with RSI at the target)
+            item["pct_to_exit_level"] = round((level / cur - 1.0) * 100.0, 2) if cur else None
+            item["break_even_price"] = required_exit_price(basis, 0.0, cfg.sim_fee_pct)
+            if cfg.s3360_trailing_enabled and p.get("trailing_active"):
+                peak = float(p.get("peak_price") or cur)
+                item["trailing_active"] = True
+                item["peak_price"] = peak
+                item["trailing_stop"] = trailing_stop_price(basis, peak, cfg.s3360_trailing_pct, cfg.sim_fee_pct)
+        open_out.append(item)
+
+    realized = sum(c.get("pnl_usdt", 0.0) for c in closed_docs)
+    equity = wallet.get("cash", 0.0) + open_value
+    wins = sum(1 for c in closed_docs if c.get("pnl_usdt", 0.0) > 0)
+    losses = sum(1 for c in closed_docs if c.get("pnl_usdt", 0.0) <= 0)
+    return {
+        "cash": round(wallet.get("cash", 0.0), 4),
+        "equity": round(equity, 4),
+        "total_transferred_in": wallet.get("total_transferred_in", 0.0),
+        "unrealized_pnl": round(unrealized, 4),
+        "realized_pnl": round(realized, 4),
+        "open_positions": open_out,
+        "closed_positions": closed_docs[:100],
+        "open_count": len(open_docs),
+        "closed_count": len(closed_docs),
+        "win_rate": round(wins / (wins + losses) * 100, 1) if (wins + losses) else 0.0,
+        # The app shows these instead of numbers written by hand in its text.
+        "rsi_low_threshold": cfg.s3360_low_threshold,
+        "rsi_target": cfg.s3360_high_threshold,
+        "hold_below_entry": cfg.s3360_hold_below_entry,
+        "min_net_profit_pct": cfg.s3360_min_net_profit_pct,
+        "fee_pct": cfg.sim_fee_pct,
+        "trailing_enabled": cfg.s3360_trailing_enabled and cfg.s3360_hold_below_entry,
+        "trailing_pct": cfg.s3360_trailing_pct,
+    }
+
+
+_RISE_BUCKETS = ["sotto 0%", "0-1%", "1-2%", "2-3%", "3-6%", "oltre 6%"]
+
+
+def _rise_bucket(rise: float) -> str:
+    if rise < 0:
+        return "sotto 0%"
+    if rise < 1:
+        return "0-1%"
+    if rise < 2:
+        return "1-2%"
+    if rise < 3:
+        return "2-3%"
+    if rise < 6:
+        return "3-6%"
+    return "oltre 6%"
+
+
+def summarize_by_daily_rise(closed: list[dict[str, Any]]) -> dict[str, Any]:
+    """Groups closed trades by how much the coin had already risen that UTC day
+    when the trade was opened. Trades opened before this data was recorded are
+    counted separately instead of being guessed."""
+    buckets: dict[str, dict[str, float]] = {}
+    without = 0
+    for p in closed:
+        rise = p.get("daily_rise_pct")
+        if rise is None:
+            without += 1
+            continue
+        b = buckets.setdefault(_rise_bucket(rise), {"n": 0, "wins": 0, "pnl": 0.0, "pct": 0.0})
+        pnl = p.get("pnl_usdt") or 0.0
+        notional = p.get("notional") or 0.0
+        b["n"] += 1
+        b["wins"] += 1 if pnl > 0 else 0
+        b["pnl"] += pnl
+        b["pct"] += (pnl / notional * 100.0) if notional else 0.0
+    rows = []
+    for name in _RISE_BUCKETS:
+        b = buckets.get(name)
+        if not b:
+            continue
+        rows.append({
+            "fascia": name,
+            "operazioni": int(b["n"]),
+            "vinte_pct": round(100.0 * b["wins"] / b["n"], 1),
+            "guadagno_medio_pct": round(b["pct"] / b["n"], 2),
+            "guadagno_totale_usd": round(b["pnl"], 2),
+        })
+    return {"con_dato": sum(r["operazioni"] for r in rows), "senza_dato": without, "fasce": rows}
+
+
+@api.get("/s3360/analysis")
+async def s3360_analysis() -> dict[str, Any]:
+    closed = await db.s3360_positions.find({"status": "closed"}, {"_id": 0}).to_list(5000)
+    return summarize_by_daily_rise(closed)
+
+
+@api.post("/s3360/reset")
+async def s3360_reset() -> dict[str, Any]:
+    await db.s3360_positions.delete_many({})
+    await db.s3360_wallet.update_one(
+        {"_id": S3360_WALLET_ID},
+        {"$set": {"cash": 0.0, "total_transferred_in": 0.0}, "$inc": {"reset_seq": 1}},
+        upsert=True,
+    )
+    return {"ok": True}
+
+
+# ============================================================================
+# TRADING REALE su Bybit (spot) — collegato SOLO a 33/60, con i freni:
+#   1. interruttore generale (spento di default) + la strategia deve essere nella lista "reali"
+#   2. serve la password di accesso al bot (BOT_ACCESS_KEY): senza, il reale non si accende
+#   3. tetto per ordine, tetto totale esposto e limite di perdita giornaliera
+#   4. un solo ordine reale alla volta (lock) e controllo vero dell'esecuzione
+#   5. se un ordine non e' chiaro, NON si apre nessuna posizione
+# Le uscite (vendite) restano sempre permesse, anche con l'interruttore spento,
+# cosi' una posizione reale non resta mai "bloccata".
+# ============================================================================
+import urllib.parse as _urlparse
+
+try:
+    import real_orders as RO
+except ImportError:  # pragma: no cover
+    from backend import real_orders as RO
+
+REAL_HARD_MAX_ORDER = 100.0    # nessuna impostazione puo' superare questi tetti
+REAL_HARD_MAX_TOTAL = 200.0
+REAL_HARD_MAX_DAILY_LOSS = 50.0
+REAL_ALLOWED_STRATEGIES = ("s3360", "ict")
+REAL_SETTING_KEYS = ("real_trading_enabled", "real_max_order_usdc", "real_max_total_usdc",
+                     "real_daily_loss_usdc", "live_strategies")
+
+_real_lock = asyncio.Lock()
+_real_sell_at: dict[str, float] = {}
+_inst_cache: dict[str, tuple[float, dict[str, Any]]] = {}
+
+
+async def rlog(text: str, level: str = "info") -> None:
+    try:
+        await db.real_log.insert_one({"at": datetime.now(timezone.utc).isoformat(), "level": level, "text": text})
+        logger.log(logging.WARNING if level != "info" else logging.INFO, "REALE: %s", text)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _bybit_signed(method: str, path: str, params: Optional[dict[str, Any]] = None,
+                        body: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """Chiamata firmata a Bybit. Ritorna il JSON; solleva eccezione se la rete non risponde."""
+    doc = await db.exchange_creds.find_one({"_id": "bybit"}, {"_id": 0})
+    if not doc:
+        raise RuntimeError("Nessuna chiave Bybit collegata")
+    api_key = decrypt_str(doc["api_key"])
+    api_secret = decrypt_str(doc["api_secret"])
+    ts = str(int(time.time() * 1000))
+    recv = "5000"
+    headers = {"X-BAPI-API-KEY": api_key, "X-BAPI-TIMESTAMP": ts, "X-BAPI-RECV-WINDOW": recv}
+    async with httpx.AsyncClient(base_url=BYBIT_BASE, timeout=12.0) as c:
+        if method == "GET":
+            query = _urlparse.urlencode(params or {})
+            headers["X-BAPI-SIGN"] = RO.sign(api_secret, ts, api_key, recv, query)
+            r = await c.get(path + (("?" + query) if query else ""), headers=headers)
+        else:
+            payload = RO.body_string(body or {})
+            headers["X-BAPI-SIGN"] = RO.sign(api_secret, ts, api_key, recv, payload)
+            headers["Content-Type"] = "application/json"
+            r = await c.post(path, content=payload, headers=headers)
+    try:
+        return r.json()
+    except Exception:  # noqa: BLE001
+        raise RuntimeError(f"Risposta Bybit non leggibile (HTTP {r.status_code})")
+
+
+async def get_instrument(symbol: str) -> Optional[dict[str, Any]]:
+    c = _inst_cache.get(symbol)
+    if c and time.time() - c[0] < 3600:
+        return c[1]
+    try:
+        resp = await _bybit_signed("GET", "/v5/market/instruments-info", {"category": "spot", "symbol": symbol})
+    except Exception as e:  # noqa: BLE001
+        await rlog(f"Regole della coppia {symbol} non lette: {e}", "errore")
+        return None
+    inst = RO.parse_instrument(resp, symbol)
+    if inst:
+        _inst_cache[symbol] = (time.time(), inst)
+    else:
+        await rlog(f"Regole della coppia {symbol} non trovate: {resp.get('retMsg')}", "errore")
+    return inst
+
+
+async def real_balance(coin: str) -> Optional[float]:
+    try:
+        resp = await _bybit_signed("GET", "/v5/account/wallet-balance", {"accountType": "UNIFIED", "coin": coin})
+    except Exception as e:  # noqa: BLE001
+        await rlog(f"Saldo {coin} non letto: {e}", "errore")
+        return None
+    if resp.get("retCode") != 0:
+        await rlog(f"Saldo {coin} non letto: {resp.get('retMsg')}", "errore")
+        return None
+    v = RO.coin_available(resp, coin)
+    return None if v is None else float(v)
+
+
+async def real_daily_pnl() -> float:
+    start = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0).isoformat()
+    rows = await db.s3360_positions.find(
+        {"status": "closed", "real": {"$exists": True}, "closed_at": {"$gte": start}}, {"pnl_usdt": 1, "_id": 0}
+    ).to_list(1000)
+    rows += await db.ict_positions.find(
+        {"status": "closed", "real": {"$exists": True}, "closed_at": {"$gte": start}}, {"pnl_usdt": 1, "_id": 0}
+    ).to_list(1000)
+    extra = await db.real_roundtrips.find({"at": {"$gte": start}}, {"pnl": 1, "_id": 0}).to_list(1000)
+    return float(sum(r.get("pnl_usdt", 0.0) for r in rows) + sum(r.get("pnl", 0.0) for r in extra))
+
+
+async def real_open_exposure() -> float:
+    rows = await db.s3360_positions.find({"status": "open", "real": {"$exists": True}}, {"notional": 1, "_id": 0}).to_list(500)
+    rows += await db.ict_positions.find({"status": "open", "real": {"$exists": True}}, {"notional": 1, "_id": 0}).to_list(500)
+    return float(sum(r.get("notional", 0.0) for r in rows))
+
+
+async def real_guard(cfg: Config, strategy: str) -> tuple[str, Optional[str]]:
+    """('paper'|'real'|'blocked', motivo). 'blocked' = la strategia e' reale ma non puo' operare ora."""
+    if strategy not in cfg.live_strategies:
+        return "paper", None
+    if not cfg.real_trading_enabled:
+        return "blocked", "reale spento (interruttore generale)"
+    if not BOT_ACCESS_KEY:
+        return "blocked", "manca la password di accesso al bot"
+    if not await db.exchange_creds.find_one({"_id": "bybit"}, {"_id": 1}):
+        return "blocked", "nessuna chiave Bybit collegata"
+    if await real_daily_pnl() <= -abs(cfg.real_daily_loss_usdc):
+        return "blocked", "limite di perdita giornaliera raggiunto"
+    return "real", None
+
+
+async def real_execute(symbol: str, side: str, amount: Any, tag: str) -> Optional[dict[str, Any]]:
+    """Manda UN ordine di mercato vero e ne verifica l'esecuzione. Ritorna i numeri veri, o None
+    se non e' stato eseguito con certezza (in quel caso nessuna posizione viene aperta/chiusa)."""
+    async with _real_lock:
+        inst = await get_instrument(symbol)
+        if not inst or not inst["trading"]:
+            await rlog(f"{symbol}: coppia non negoziabile o regole non disponibili", "errore")
+            return None
+        link = f"{tag}-{int(time.time())}-{uuid.uuid4().hex[:8]}"
+        body = RO.buy_body(symbol, amount, link, inst) if side == "Buy" else RO.sell_body(symbol, amount, link, inst)
+        q = RO.D(body["qty"])
+        if (side == "Buy" and q < inst["min_amt"]) or (side == "Sell" and q < inst["min_qty"]) or q <= 0:
+            await rlog(f"{symbol}: {side} {body['qty']} sotto il minimo ({inst['min_amt']} / {inst['min_qty']})", "errore")
+            return None
+        await rlog(f"INVIO {side} {symbol} {body['qty']} {'USD' if side == 'Buy' else inst['base']} [{link}]")
+        order_id = None
+        try:
+            r = await _bybit_signed("POST", "/v5/order/create", body=body)
+        except Exception as e:  # noqa: BLE001
+            r = None
+            await rlog(f"Rete incerta durante l'invio: {e}. Controllo se l'ordine e' partito.", "errore")
+        if r is not None:
+            if r.get("retCode") != 0:
+                await rlog(f"Ordine RIFIUTATO da Bybit: {r.get('retCode')} {r.get('retMsg')}", "errore")
+                return None
+            order_id = (r.get("result") or {}).get("orderId")
+        else:
+            await asyncio.sleep(2.0)
+            try:
+                st0, o0 = RO.order_status(await _bybit_signed("GET", "/v5/order/history", {"category": "spot", "orderLinkId": link}))
+            except Exception:  # noqa: BLE001
+                st0, o0 = "Error", {}
+            if st0 in ("NotFound", "Error"):
+                await rlog("Ordine NON partito (nessuna traccia su Bybit).", "errore")
+                return None
+            order_id = o0.get("orderId")
+        st, o = "New", {}
+        for _ in range(15):
+            await asyncio.sleep(0.8)
+            try:
+                st, o = RO.order_status(await _bybit_signed("GET", "/v5/order/history", {"category": "spot", "orderLinkId": link}))
+            except Exception:  # noqa: BLE001
+                continue
+            if st in RO.FINAL_STATUSES:
+                break
+        if st not in RO.FINAL_STATUSES:
+            try:
+                await _bybit_signed("POST", "/v5/order/cancel", body={"category": "spot", "symbol": symbol, "orderLinkId": link})
+            except Exception:  # noqa: BLE001
+                pass
+            await rlog(f"ATTENZIONE: ordine {link} senza esito definitivo (stato {st}); provato ad annullarlo. Controlla su Bybit.", "errore")
+            return None
+        ex = None
+        try:
+            ex = await _bybit_signed("GET", "/v5/execution/list", {"category": "spot", "orderId": order_id or o.get("orderId", "")})
+        except Exception:  # noqa: BLE001
+            ex = None
+        f = RO.parse_fills(ex, o, inst["base"], inst["quote"])
+        if f is None:
+            await rlog(f"Ordine {link} chiuso senza esecuzione (stato {st}, motivo {o.get('rejectReason') or '-'}).", "errore")
+            return None
+        res = {
+            "order_id": order_id, "link_id": link, "base": inst["base"], "quote": inst["quote"],
+            "avg_price": float(f["avg_price"]), "qty": float(f["qty"]), "value": float(f["value"]),
+            "fee_base": float(f["fee_base"]), "fee_quote": float(f["fee_quote"]),
+            "net_qty": float(RO.net_base_after_buy(f)), "net_value": float(RO.net_quote_after_sell(f)),
+            "status": st,
+        }
+        await rlog(f"ESEGUITO {side} {symbol}: {res['qty']} a {res['avg_price']:.6g} (valore {res['value']:.4f}, "
+                   f"commissioni {res['fee_base']:.6g} {inst['base']} + {res['fee_quote']:.6g} {inst['quote']})")
+        return res
+
+
+async def real_open_buy(symbol: str, notional: float, cfg: Config, tag: str, cash_cap: Optional[float] = None) -> Optional[dict[str, Any]]:
+    """Acquisto reale per aprire una posizione: rispetta tetto per ordine, tetto totale e saldo."""
+    inst = await get_instrument(symbol)
+    if not inst:
+        return None
+    room = cfg.real_max_total_usdc - await real_open_exposure()
+    amount = min(notional, cfg.real_max_order_usdc, REAL_HARD_MAX_ORDER, room)
+    bal = await real_balance(inst["quote"])
+    if bal is None:
+        return None
+    amount = min(amount, bal * 0.995)
+    min_need = float(inst["min_amt"]) * 1.1
+    if amount < min_need:
+        # con capitali piccoli l'importo calcolato puo' stare sotto il minimo di Bybit:
+        # lo alzo al minimo (+10%) se budget, tetti e saldo lo permettono
+        upper = min(cfg.real_max_order_usdc, REAL_HARD_MAX_ORDER, room, bal * 0.995, cash_cap if cash_cap is not None else 1e12)
+        if upper >= min_need:
+            await rlog(f"{symbol}: importo {amount:.2f} sotto il minimo di Bybit ({inst['min_amt']}): lo porto a {min_need:.2f}")
+            amount = min_need
+    if amount < float(inst["min_amt"]) or amount < 1.0:
+        await rlog(f"{symbol}: importo {amount:.2f} troppo basso (minimo {inst['min_amt']}, saldo {bal:.2f}, spazio {room:.2f})", "errore")
+        return None
+    res = await real_execute(symbol, "Buy", amount, tag)
+    if not res:
+        return None
+    res["value_spent"] = res["value"]
+    return res
+
+
+async def real_close_position(p: dict[str, Any], cfg: Config, tag: str) -> Optional[dict[str, Any]]:
+    """Vendita reale di una posizione. Ritorna net_value (dollari entrati) o None se non riuscita."""
+    r = p.get("real") or {}
+    inst = await get_instrument(p["symbol"])
+    if not inst:
+        return None
+    bal = await real_balance(inst["base"])
+    if bal is None:
+        return None
+    qty = min(float(r.get("net_qty") or p["quantity"]), bal)
+    qty_dec = RO.step_floor(qty, inst["base_step"])
+    if qty_dec < inst["min_qty"] or qty_dec <= 0:
+        await rlog(f"{p['symbol']}: nulla da vendere (saldo {bal}, minimo {inst['min_qty']}); posizione chiusa come polvere", "errore")
+        cur = price_feed.get(p["symbol"]) or p["entry"]
+        return {"avg_price": cur, "net_value": float(qty) * cur, "dust": True, "qty": float(qty)}
+    res = await real_execute(p["symbol"], "Sell", qty_dec, tag)
+    if res:
+        # i resti sotto il passo minimo restano nel conto: li conto al prezzo di vendita
+        res["dust_value"] = max(0.0, float(r.get("net_qty") or p["quantity"]) - float(qty_dec)) * res["avg_price"]
+    return res
+
+
+def real_sell_due(key: str, seconds: float = 30.0) -> bool:
+    now = time.time()
+    if now - _real_sell_at.get(key, 0.0) < seconds:
+        return False
+    _real_sell_at[key] = now
+    return True
+
+
+def _clamp_real_settings(new_cfg: Config) -> None:
+    if not (0 < new_cfg.real_max_order_usdc <= REAL_HARD_MAX_ORDER):
+        raise HTTPException(status_code=400, detail=f"Tetto per ordine tra 0 e {REAL_HARD_MAX_ORDER:g}")
+    if not (0 < new_cfg.real_max_total_usdc <= REAL_HARD_MAX_TOTAL):
+        raise HTTPException(status_code=400, detail=f"Tetto totale tra 0 e {REAL_HARD_MAX_TOTAL:g}")
+    if not (0 < new_cfg.real_daily_loss_usdc <= REAL_HARD_MAX_DAILY_LOSS):
+        raise HTTPException(status_code=400, detail=f"Perdita giornaliera tra 0 e {REAL_HARD_MAX_DAILY_LOSS:g}")
+    for s in new_cfg.live_strategies:
+        if s not in REAL_ALLOWED_STRATEGIES:
+            raise HTTPException(status_code=400, detail=f"La strategia '{s}' non e' ancora collegabile al reale")
+
+
+@api.get("/real/status")
+async def real_status() -> dict[str, Any]:
+    cfg = await get_config()
+    creds = bool(await db.exchange_creds.find_one({"_id": "bybit"}, {"_id": 1}))
+    log = await db.real_log.find({}, {"_id": 0}).sort("at", -1).to_list(30)
+    open_rows = await db.s3360_positions.find({"status": "open", "real": {"$exists": True}}, {"_id": 0}).to_list(50)
+    open_rows += await db.ict_positions.find({"status": "open", "real": {"$exists": True}}, {"_id": 0}).to_list(50)
+    return {
+        "enabled": cfg.real_trading_enabled,
+        "live_strategies": cfg.live_strategies,
+        "max_order": cfg.real_max_order_usdc,
+        "max_total": cfg.real_max_total_usdc,
+        "daily_loss_limit": cfg.real_daily_loss_usdc,
+        "daily_pnl": round(await real_daily_pnl(), 4),
+        "exposure": round(await real_open_exposure(), 4),
+        "password_active": bool(BOT_ACCESS_KEY),
+        "key_connected": creds,
+        "open_positions": [{"symbol": r["symbol"], "notional": r.get("notional"), "fill_price": r.get("fill_price"),
+                            "quantity": r.get("quantity"), "opened_at": r.get("opened_at")} for r in open_rows],
+        "log": log,
+    }
+
+
+@api.put("/real/settings")
+async def real_put_settings(body: dict[str, Any]) -> dict[str, Any]:
+    cfg = await get_config()
+    data = cfg.model_dump()
+    for k, v in body.items():
+        if k not in REAL_SETTING_KEYS:
+            raise HTTPException(status_code=400, detail=f"Impostazione sconosciuta: {k}")
+        data[k] = v
+    try:
+        new_cfg = Config(**data)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Valore non valido: {e}")
+    _clamp_real_settings(new_cfg)
+    if new_cfg.real_trading_enabled and not cfg.real_trading_enabled:
+        if not BOT_ACCESS_KEY:
+            raise HTTPException(status_code=400, detail="Prima attiva la password di accesso al bot (variabile BOT_ACCESS_KEY su Railway).")
+        if not await db.exchange_creds.find_one({"_id": "bybit"}, {"_id": 1}):
+            raise HTTPException(status_code=400, detail="Prima collega la chiave Bybit.")
+    await db.config.update_one({"_id": CONFIG_ID}, {"$set": {k: getattr(new_cfg, k) for k in body}}, upsert=True)
+    await rlog("Impostazioni reale cambiate: " + ", ".join(f"{k}={getattr(new_cfg, k)}" for k in body))
+    return {k: getattr(new_cfg, k) for k in REAL_SETTING_KEYS}
+
+
+@api.get("/real/diagnosi")
+async def real_diagnosi() -> dict[str, Any]:
+    """Perche' non apre? Motivi di scarto piu' frequenti (ultime 6 ore) e RSI minimo visto ogni ora."""
+    since = (datetime.now(timezone.utc) - timedelta(hours=6)).isoformat()
+    rows = await db.strategy_debug_log.find({"at": {"$gte": since}}, {"_id": 0}).to_list(20000)
+    out: dict[str, list[dict[str, Any]]] = {}
+    for strat in ("xrp_acc", "s3360"):
+        cnt: dict[str, int] = {}
+        for r in rows:
+            if r.get("strategy") == strat:
+                k = f"{r.get('symbol')} {r.get('timeframe')}: {r.get('reason')}"
+                cnt[k] = cnt.get(k, 0) + 1
+        out[strat] = [{"motivo": k, "volte": v} for k, v in sorted(cnt.items(), key=lambda x: -x[1])[:6]]
+    rsi_rows = await db.rsi_watch.find({"strategy": "xrp_acc"}, {"_id": 0}).sort("hour", -1).to_list(200)
+    cfg = await get_config()
+    return {
+        "motivi": out,
+        "rsi_ore": [{"ora": r["hour"], "tf": r["tf"], "rsi_min": r.get("rsi_min"), "ultimo": r.get("last")} for r in rsi_rows[:48]],
+        "xrp_acc": {"timeframes": cfg.xrp_acc_timeframes, "soglia": cfg.xrp_acc_low_threshold,
+                    "filtro_trend_moneta": cfg.xrp_acc_require_coin_trend, "filtro_trend_btc": cfg.xrp_acc_require_btc_trend,
+                    "filtro_sopra_media_lunga": cfg.xrp_acc_require_above_long_ema},
+        "s3360": {"timeframes": cfg.s3360_timeframes, "soglia": cfg.s3360_low_threshold,
+                  "filtro_trend_moneta": cfg.s3360_require_coin_trend, "filtro_trend_btc": cfg.s3360_require_btc_trend,
+                  "filtro_sopra_media_lunga": cfg.s3360_require_above_long_ema},
+    }
+
+
+@api.post("/real/stop")
+async def real_stop() -> dict[str, Any]:
+    """Tasto STOP: spegne il reale (nessun nuovo ordine). Le posizioni aperte restano gestite e si possono chiudere."""
+    await db.config.update_one({"_id": CONFIG_ID}, {"$set": {"real_trading_enabled": False}}, upsert=True)
+    await rlog("STOP: reale spento dall'utente", "errore")
+    return {"ok": True}
+
+
+class RealTestRequest(BaseModel):
+    symbol: str = "XRPUSDC"
+    amount: float = 6.0
+
+
+@api.post("/real/test-roundtrip")
+async def real_test_roundtrip(req: RealTestRequest) -> dict[str, Any]:
+    """Ordine di PROVA: compra per pochi dollari e rivende subito. Serve a vedere che tutto funziona e quanto costa."""
+    cfg = await get_config()
+    if not BOT_ACCESS_KEY:
+        raise HTTPException(status_code=400, detail="Serve la password di accesso al bot.")
+    if not cfg.real_trading_enabled:
+        raise HTTPException(status_code=400, detail="Accendi prima l'interruttore del reale.")
+    if not (0 < req.amount <= min(cfg.real_max_order_usdc, 25.0)):
+        raise HTTPException(status_code=400, detail="Importo di prova troppo alto (massimo 25 e non oltre il tetto per ordine).")
+    sym = req.symbol.upper()
+    inst = await get_instrument(sym)
+    if not inst:
+        raise HTTPException(status_code=400, detail="Regole della coppia non disponibili: vedi il registro.")
+    bal = await real_balance(inst["quote"])
+    if bal is None or bal < req.amount:
+        raise HTTPException(status_code=400, detail=f"Saldo {inst['quote']} insufficiente ({bal}).")
+    buy = await real_execute(sym, "Buy", req.amount, "prova")
+    if not buy:
+        raise HTTPException(status_code=502, detail="Acquisto di prova non eseguito: vedi il registro.")
+    bal_base = await real_balance(inst["base"])
+    qty = min(buy["net_qty"], bal_base if bal_base is not None else buy["net_qty"])
+    sell = None
+    for _ in range(3):
+        sell = await real_execute(sym, "Sell", qty, "prova")
+        if sell:
+            break
+        await asyncio.sleep(2.0)
+    if not sell:
+        raise HTTPException(status_code=502, detail=f"Comprato {buy['net_qty']} {inst['base']} ma la vendita NON e' riuscita: vendi a mano su Bybit.")
+    dust = max(0.0, buy["net_qty"] - sell["qty"]) * sell["avg_price"]
+    pnl = sell["net_value"] + dust - buy["value"]
+    await db.real_roundtrips.insert_one({"at": datetime.now(timezone.utc).isoformat(), "symbol": sym, "pnl": pnl})
+    return {"symbol": sym, "comprato_a": buy["avg_price"], "venduto_a": sell["avg_price"], "speso": round(buy["value"], 4),
+            "incassato": round(sell["net_value"], 4), "resti_rimasti": round(dust, 4), "costo_totale": round(-pnl, 4),
+            "costo_pct": round(-pnl / buy["value"] * 100.0, 3)}
+
+
+@api.post("/real/close-all")
+async def real_close_all() -> dict[str, Any]:
+    """Vende subito, a mercato, tutte le posizioni reali aperte di 33/60."""
+    cfg = await get_config()
+    rows = await db.s3360_positions.find({"status": "open", "real": {"$exists": True}}, {"_id": 0}).to_list(50)
+    done, failed = 0, 0
+    for p in rows:
+        sell = await real_close_position(p, cfg, "chiudi")
+        if not sell:
+            failed += 1
+            continue
+        cur = sell["avg_price"]
+        pnl = sell["net_value"] + sell.get("dust_value", 0.0) - p["notional"]
+        await db.s3360_wallet.update_one({"_id": S3360_WALLET_ID}, {"$inc": {"cash": p["notional"] + pnl}}, upsert=True)
+        await db.s3360_positions.update_one({"id": p["id"]}, {"$set": {
+            "status": "closed", "close_price": cur, "close_reason": "chiusura_manuale_reale", "close_last_price": cur,
+            "exit_fill_model": "reale", "fee_pct": cfg.sim_fee_pct, "pnl_usdt": round(pnl, 4),
+            "closed_at": datetime.now(timezone.utc).isoformat(), "real_exit": {k: v for k, v in sell.items() if k != "dust"},
+        }})
+        await close_track(p["id"], cur)
+        done += 1
+    d2, f2 = await _ict_close_all_real()
+    return {"chiuse": done + d2, "non_riuscite": failed + f2}
+
+
+# ============================================================================
+# XRP Accumulation — the goal here is NOT dollar profit, it's owning more XRP
+# over time. All trading capital buys XRPUSDC the instant RSI touches <=25,
+# sells everything the instant RSI touches >=60 (same live-touch mechanism
+# as 33/60 — no waiting for a candle to close). On every sale, the ORIGINAL
+# trading capital goes back to cash for the next cycle, and ONLY the profit
+# gets converted to XRP immediately and held forever — it never re-enters
+# the trading capital, so the tradeable USDC balance never inflates and the
+# permanent XRP stash only ever grows. No stop-loss, no timeout: this is a
+# pure accumulation philosophy — if RSI never comes back up, the position
+# just sits in XRP and waits, exactly as intended for something you'd want
+# to hold anyway.
+# ============================================================================
+
+XRP_ACC_WALLET_ID = "xrp_acc_wallet_singleton"
+XRP_ACC_SYMBOL = "XRPUSDC"
+
+
+async def get_xrp_acc_wallet() -> dict[str, Any]:
+    doc = await db.xrp_acc_wallet.find_one({"_id": XRP_ACC_WALLET_ID}, {"_id": 0})
+    if not doc:
+        doc = {"cash": 0.0, "permanent_xrp": 0.0, "total_transferred_in": 0.0, "reset_seq": 0}
+        await db.xrp_acc_wallet.update_one(
+            {"_id": XRP_ACC_WALLET_ID}, {"$set": doc}, upsert=True
+        )
+    doc.setdefault("permanent_xrp", 0.0)
+    doc.setdefault("reset_seq", 0)
+    return doc
+
+
+_xrp_acc_last_candle: dict[str, float] = {}  # per timeframe: timestamp of the CURRENT still-forming candle a live-touch attempt was already made on
+
+
+_xrp_acc_log_at: dict[str, float] = {}
+_xrp_acc_candle_cache: dict[str, tuple[float, list[list[float]]]] = {}
+
+
+async def _xrp_acc_log(tf: str, reason: str) -> None:
+    """The entry check now runs every few seconds; a diagnostic row each time
+    would flood the log (and the database), so each (timeframe, reason) is
+    written at most once a minute — enough to show the strategy is alive."""
+    key = f"{tf}|{reason}"
+    now = time.time()
+    if now - _xrp_acc_log_at.get(key, 0.0) < 60:
+        return
+    _xrp_acc_log_at[key] = now
+    await log_reject(XRP_ACC_SYMBOL, tf, "xrp_acc", reason)
+
+
+async def _xrp_acc_candles(tf: str) -> list[list[float]]:
+    """Closed candles only change when a candle closes, so re-downloading
+    ~200 of them every 3 seconds would be wasted traffic. Reuse them for 30s,
+    and fall back to the last good copy (up to 5 minutes) if a download fails."""
+    now = time.time()
+    cached = _xrp_acc_candle_cache.get(tf)
+    if cached and cached[1] and now - cached[0] < 30:
+        return cached[1]
+    candles = await exchange.get_klines(XRP_ACC_SYMBOL, tf)
+    if candles:
+        _xrp_acc_candle_cache[tf] = (now, candles)
+        return candles
+    if cached and cached[1] and now - cached[0] < 300:
+        return cached[1]
+    return []
+
+
+_rsi_watch_state: dict[str, float] = {}
+_rsi_watch_prune_at = 0.0
+
+
+async def rsi_watch(strategy: str, symbol: str, tf: str, rsi: Optional[float]) -> None:
+    """Diagnosi: tiene l'RSI MINIMO visto dal bot in ogni ora, per ogni timeframe.
+    Scrive solo quando il minimo scende (o al massimo una volta al minuto): pochissimo carico."""
+    global _rsi_watch_prune_at
+    if rsi is None:
+        return
+    now = datetime.now(timezone.utc)
+    hour = now.strftime("%Y-%m-%dT%H")
+    key = f"{strategy}|{symbol}|{tf}|{hour}"
+    last = _rsi_watch_state.get(key)
+    if last is not None and rsi >= last - 0.05 and time.time() - _rsi_watch_state.get(key + "|t", 0.0) < 60:
+        return
+    _rsi_watch_state[key] = min(rsi, last) if last is not None else rsi
+    _rsi_watch_state[key + "|t"] = time.time()
+    try:
+        await db.rsi_watch.update_one(
+            {"_id": key},
+            {"$min": {"rsi_min": round(rsi, 2)}, "$set": {"strategy": strategy, "symbol": symbol, "tf": tf, "hour": hour, "last": round(rsi, 2), "at": now.isoformat()}},
+            upsert=True,
+        )
+        if time.time() - _rsi_watch_prune_at > 3600:
+            _rsi_watch_prune_at = time.time()
+            old = (now - timedelta(days=3)).strftime("%Y-%m-%dT%H")
+            await db.rsi_watch.delete_many({"hour": {"$lt": old}})
+            for k in [k for k in _rsi_watch_state if k.split("|")[-1] < old and not k.endswith("|t")]:
+                _rsi_watch_state.pop(k, None)
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def run_xrp_acc_scan() -> None:
+    cfg = await get_config()
+    if not cfg.xrp_acc_enabled:
+        return
+    if await db.xrp_acc_positions.find_one({"status": "open"}):
+        return
+    wallet = await get_xrp_acc_wallet()
+    cash = wallet.get("cash", 0.0)
+    if cash <= 1.0:
+        return
+
+    for tf in cfg.xrp_acc_timeframes:
+        candles = await _xrp_acc_candles(tf)
+        if len(candles) < cfg.xrp_acc_rsi_period + 3:
+            await _xrp_acc_log(tf, "dati insufficienti")
+            continue
+        live_price = price_feed.get(XRP_ACC_SYMBOL) or await price_feed.price_or_rest(XRP_ACC_SYMBOL)
+        if not live_price:
+            await _xrp_acc_log(tf, "prezzo live non disponibile")
+            continue
+        closes = [c[2] for c in candles]
+        live_rsis = rsi_wilder(closes + [live_price], cfg.xrp_acc_rsi_period)
+        live_rsi = live_rsis[-1]
+        await rsi_watch("xrp_acc", XRP_ACC_SYMBOL, tf, live_rsi)
+        if live_rsi > cfg.xrp_acc_low_threshold:
+            await _xrp_acc_log(tf, "nessun nuovo ingresso sotto soglia bassa")
+            continue
+        tf_sec = TF_SECONDS.get(tf, 3600)
+        forming_candle_t = candles[-1][0] + tf_sec
+        if _xrp_acc_last_candle.get(tf) == forming_candle_t:
+            await _xrp_acc_log(tf, "stessa candela già tentata")
+            continue
+        if cfg.xrp_acc_require_coin_trend or cfg.xrp_acc_require_btc_trend or cfg.xrp_acc_require_above_long_ema:
+            why = await trend_filter_block_reason(
+                XRP_ACC_SYMBOL, cfg, cfg.xrp_acc_require_coin_trend, cfg.xrp_acc_require_btc_trend,
+                cfg.xrp_acc_require_above_long_ema, live_price,
+            )
+            if why:
+                await _xrp_acc_log(tf, why)
+                continue
+        _xrp_acc_last_candle[tf] = forming_candle_t
+
+        # Paper fill at the real ask (walking the book if needed) instead of
+        # the last traded price.
+        fill_price, fill_info = await simulate_fill(XRP_ACC_SYMBOL, "buy", live_price, cfg, quote_budget=cash)
+        quantity = cash / fill_price
+        doc = {
+            "id": str(uuid.uuid4()),
+            "symbol": XRP_ACC_SYMBOL,
+            "timeframe": tf,
+            "side": "long",
+            "entry": live_price,
+            "fill_price": fill_price,
+            "fill_model": fill_info["fill_model"],
+            "entry_cost_pct": fill_info["cost_pct"],
+            "spread_pct": fill_info.get("spread_pct"),
+            "rsi_at_entry": live_rsi,
+            "quantity": quantity,
+            "notional": cash,
+            "status": "open",
+            "opened_at": datetime.now(timezone.utc).isoformat(),
+        }
+        await db.xrp_acc_positions.insert_one(dict(doc))
+        await db.xrp_acc_wallet.update_one(
+            {"_id": XRP_ACC_WALLET_ID}, {"$inc": {"cash": -cash}}, upsert=True
+        )
+        break
+
+
+_xrp_acc_hold_log_at: dict[str, float] = {}
+
+
+async def _xrp_acc_hold_log(p: dict[str, Any], reason: str = "RSI al target ma prezzo sotto l'entrata: attendo il recupero") -> None:
+    """The monitor runs every 3 seconds; write the 'waiting' note at most once
+    every 5 minutes per position so it stays visible without flooding the log."""
+    now = time.time()
+    if now - _xrp_acc_hold_log_at.get(p["id"], 0.0) < 300:
+        return
+    _xrp_acc_hold_log_at[p["id"]] = now
+    await log_reject(
+        p["symbol"], p.get("timeframe", "?"), "xrp_acc",
+        reason,
+    )
+
+
+async def monitor_xrp_acc_positions() -> None:
+    cfg = await get_config()
+    open_positions = await db.xrp_acc_positions.find({"status": "open"}, {"_id": 0}).to_list(5)
+    for p in open_positions:
+        cur = price_feed.get(p["symbol"])
+        if not cur:
+            cur = await price_feed.price_or_rest(p["symbol"])
+        if not cur or cur <= 0:
+            continue
+        await record_track("xrp_acc", db.xrp_acc_positions, p, cur)
+        tf = p.get("timeframe", "1h")
+        candles = await exchange.get_klines(p["symbol"], tf)
+        closes = [c[2] for c in candles] + [cur]
+        rsis = rsi_wilder(closes, cfg.xrp_acc_rsi_period) if len(closes) > cfg.xrp_acc_rsi_period else []
+        rsi_hit = bool(rsis and rsis[-1] >= cfg.xrp_acc_high_threshold)
+
+        fill = p.get("fill_price", p["entry"])
+        margin_price = required_exit_price(fill, cfg.xrp_acc_min_net_profit_pct, cfg.sim_fee_pct)
+        break_even = required_exit_price(fill, 0.0, cfg.sim_fee_pct)
+        # Trailing: armed when the last price first clears the minimum-net level,
+        # then it follows the highest price. It sells if the price falls back by
+        # xrp_acc_trailing_pct, but never below break-even.
+        trail_hit = False
+        if cfg.xrp_acc_hold_below_entry and cfg.xrp_acc_trailing_enabled:
+            active, peak = await update_trailing_state(db.xrp_acc_positions, p, cur, margin_price)
+            trail_hit = active and cur <= trailing_stop_price(fill, peak, cfg.xrp_acc_trailing_pct, cfg.sim_fee_pct)
+
+        # The RSI target stays the main exit; the trailing protects the profit
+        # when the price turns back before the target is reached.
+        if rsi_hit and (not cfg.xrp_acc_hold_below_entry or cur >= margin_price):
+            hit, floor_price = "target_rsi_raggiunto", margin_price
+        elif trail_hit:
+            hit, floor_price = "trailing_stop", break_even
+        elif rsi_hit:
+            # RSI reached the target but selling now would lock in less than the
+            # minimum net profit: keep waiting. All the trading capital sits in
+            # this one position, so while it waits no new entry can open.
+            await _xrp_acc_hold_log(p)
+            continue
+        else:
+            continue
+        if cfg.xrp_acc_hold_below_entry and cur < floor_price:
+            await _xrp_acc_hold_log(p, "Trailing: il prezzo non copre i costi, attendo" if hit == "trailing_stop" else "RSI al target ma prezzo sotto l'entrata: attendo il recupero")
+            continue
+
+        # The last price clears the floor; now ask what a market sell would
+        # REALLY get (best bid / depth). With the simulation off this is `cur`
+        # and costs no request. The book is read at most every 10s.
+        if cfg.sim_realistic_fills and not book_recheck_due(p["id"]):
+            continue
+        sell_price, sell_info = await simulate_fill(p["symbol"], "sell", cur, cfg, base_qty=p["quantity"])
+        if cfg.xrp_acc_hold_below_entry and sell_price < floor_price:
+            # the price we would really get is still too low
+            await _xrp_acc_hold_log(p, "Trailing: il prezzo di vendita vero non copre i costi, attendo" if hit == "trailing_stop" else "RSI al target ma prezzo sotto l'entrata: attendo il recupero")
+            continue
+
+        proceeds = sell_price * p["quantity"]
+        fees = (p["notional"] + proceeds) * (cfg.sim_fee_pct / 100.0)
+        net_proceeds = proceeds - fees
+        profit_usdt = net_proceeds - p["notional"]
+        # Original trading capital goes back to cash for the next cycle;
+        # only the profit (if any) converts to XRP and joins the permanent
+        # stash. With the hold-below-entry rule on, a sale is never a net
+        # loss; with it off, cash gets back less than it started with — the
+        # permanent stash never goes backwards, but the trading capital can
+        # shrink on a losing round (there is no stop).
+        cash_back = min(net_proceeds, p["notional"])
+        profit_xrp = max(0.0, profit_usdt) / cur
+        await db.xrp_acc_wallet.update_one(
+            {"_id": XRP_ACC_WALLET_ID},
+            {"$inc": {"cash": cash_back, "permanent_xrp": profit_xrp}},
+            upsert=True,
+        )
+        await db.xrp_acc_positions.update_one(
+            {"id": p["id"]},
+            {"$set": {
+                "status": "closed", "close_price": sell_price, "close_reason": hit,
+                "close_last_price": cur,
+                "exit_fill_model": sell_info["fill_model"],
+                "exit_cost_pct": sell_info["cost_pct"],
+                "exit_spread_pct": sell_info.get("spread_pct"),
+                "fee_pct": cfg.sim_fee_pct,
+                "profit_usdt": round(profit_usdt, 4),
+                "profit_xrp": round(profit_xrp, 6),
+                "closed_at": datetime.now(timezone.utc).isoformat(),
+            }},
+        )
+        await close_track(p["id"], cur)
+
+
+class XrpAccTransferRequest(BaseModel):
+    amount: float
+
+
+@api.post("/xrp-accumulation/deposit")
+async def xrp_acc_deposit(req: XrpAccTransferRequest) -> dict[str, Any]:
+    amount = req.amount
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="L'importo deve essere positivo")
+    main_cash = await get_paper_cash()
+    if amount > main_cash:
+        raise HTTPException(
+            status_code=400,
+            detail=f"Fondi insufficienti nel portafoglio principale (disponibili: {round(main_cash, 2)})",
+        )
+    await set_paper_cash(main_cash - amount)
+    updated = await db.xrp_acc_wallet.find_one_and_update(
+        {"_id": XRP_ACC_WALLET_ID},
+        {"$inc": {"cash": amount, "total_transferred_in": amount}},
+        upsert=True,
+        return_document=ReturnDocument.AFTER,
+    )
+    return {"ok": True, "xrp_acc_cash": updated.get("cash", amount), "main_cash": main_cash - amount}
+
+
+@api.post("/xrp-accumulation/withdraw")
+async def xrp_acc_withdraw(req: XrpAccTransferRequest) -> dict[str, Any]:
+    amount = req.amount
+    if amount <= 0:
+        raise HTTPException(status_code=400, detail="L'importo deve essere positivo")
+    w = await get_xrp_acc_wallet()
+    available = w.get("cash", 0.0)
+    if amount > available and (amount - available) <= 0.01:
+        amount = available
+    updated = await db.xrp_acc_wallet.find_one_and_update(
+        {"_id": XRP_ACC_WALLET_ID, "cash": {"$gte": amount}},
+        {"$inc": {"cash": -amount}},
+        return_document=ReturnDocument.AFTER,
+    )
+    if not updated:
+        raise HTTPException(
+            status_code=400,
+            detail="Fondi insufficienti nel capitale di trading — la riserva permanente di XRP non può essere prelevata da qui",
+        )
+    main_cash = await get_paper_cash()
+    await set_paper_cash(main_cash + amount)
+    return {"ok": True, "xrp_acc_cash": updated.get("cash", 0.0), "main_cash": main_cash + amount}
+
+
+@api.get("/xrp-accumulation/portfolio")
+async def xrp_acc_portfolio() -> dict[str, Any]:
+    cfg = await get_config()
+    wallet = await get_xrp_acc_wallet()
+    open_docs = await db.xrp_acc_positions.find({"status": "open"}, {"_id": 0}).to_list(5)
+    closed_docs = await db.xrp_acc_positions.find({"status": "closed"}, {"_id": 0}).sort("closed_at", -1).to_list(500)
+
+    live_price = price_feed.get(XRP_ACC_SYMBOL) or await price_feed.price_or_rest(XRP_ACC_SYMBOL) or 0.0
+    open_out = []
+    open_quantity = 0.0
+    for p in open_docs:
+        cur = price_feed.get(p["symbol"]) or p["entry"]
+        open_quantity += p["quantity"]
+        basis = p.get("fill_price", p["entry"])  # what the bot REALLY paid (real ask)
+        item = {**p, "current_price": cur, "unrealized_pnl": round((cur - basis) * p["quantity"], 4)}
+        if cfg.xrp_acc_hold_below_entry:
+            level = required_exit_price(basis, cfg.xrp_acc_min_net_profit_pct, cfg.sim_fee_pct)
+            item["exit_level"] = level  # the real SELL price needed to close (with RSI at the target)
+            item["pct_to_exit_level"] = round((level / cur - 1.0) * 100.0, 2) if cur else None
+            item["break_even_price"] = required_exit_price(basis, 0.0, cfg.sim_fee_pct)
+            if cfg.xrp_acc_trailing_enabled and p.get("trailing_active"):
+                peak = float(p.get("peak_price") or cur)
+                item["trailing_active"] = True
+                item["peak_price"] = peak
+                item["trailing_stop"] = trailing_stop_price(basis, peak, cfg.xrp_acc_trailing_pct, cfg.sim_fee_pct)
+        open_out.append(item)
+
+    permanent_xrp = wallet.get("permanent_xrp", 0.0)
+    total_xrp = permanent_xrp + open_quantity
+    cash = wallet.get("cash", 0.0)
+    equity_usdt = cash + open_quantity * live_price + permanent_xrp * live_price
+    total_profit_xrp = sum(c.get("profit_xrp", 0.0) for c in closed_docs)
+    return {
+        "cash": round(cash, 4),
+        "permanent_xrp": round(permanent_xrp, 6),
+        "total_xrp": round(total_xrp, 6),
+        "xrp_price": live_price,
+        "equity_usdt": round(equity_usdt, 4),
+        "total_transferred_in": wallet.get("total_transferred_in", 0.0),
+        "total_profit_xrp": round(total_profit_xrp, 6),
+        "open_positions": open_out,
+        "closed_positions": closed_docs[:100],
+        "open_count": len(open_docs),
+        "closed_count": len(closed_docs),
+        "rsi_low_threshold": cfg.xrp_acc_low_threshold,
+        "rsi_target": cfg.xrp_acc_high_threshold,
+        "hold_below_entry": cfg.xrp_acc_hold_below_entry,
+        "min_net_profit_pct": cfg.xrp_acc_min_net_profit_pct,
+        "fee_pct": cfg.sim_fee_pct,
+        "trailing_enabled": cfg.xrp_acc_trailing_enabled and cfg.xrp_acc_hold_below_entry,
+        "trailing_pct": cfg.xrp_acc_trailing_pct,
+    }
+
+
+@api.post("/xrp-accumulation/reset")
+async def xrp_acc_reset() -> dict[str, Any]:
+    await db.xrp_acc_positions.delete_many({})
+    await db.xrp_acc_wallet.update_one(
+        {"_id": XRP_ACC_WALLET_ID},
+        {"$set": {"cash": 0.0, "permanent_xrp": 0.0, "total_transferred_in": 0.0}, "$inc": {"reset_seq": 1}},
+        upsert=True,
+    )
+    return {"ok": True}
+
+
+# ============================================================================
+# ICT (Inner Circle Trader) — versione MECCANICA, solo long, spot.
+# Sweep dei minimi -> rottura della struttura (MSS) -> ritorno nel gap (FVG).
+# Le regole stanno in ict_logic.py (funzioni pure, provate a parte).
+# Paper per impostazione predefinita; reale solo se "ict" e' in live_strategies
+# (si accende dalla pagina Trading reale) e passa tutti i controlli di real_guard.
+# NON e' una strategia dimostrata: e' una prova dal vivo.
+# ============================================================================
+try:
+    import ict_logic as ICT
+except ImportError:  # pragma: no cover
+    from backend import ict_logic as ICT
+
+ICT_WALLET_ID = "ict_wallet_singleton"
+ICT_SETTING_KEYS = ("ict_enabled", "ict_symbols", "ict_timeframe", "ict_rr", "ict_kill_zones",
+                    "ict_alloc_pct", "ict_max_open", "ict_max_hold_h")
+ICT_TIMEFRAMES = ("5m", "15m", "30m", "1h")
+_ict_candle_cache: dict[str, tuple[float, list[list[float]]]] = {}
+_ict_seen: set[str] = set()
+_ict_log_at: dict[str, float] = {}
+_ict_status: dict[str, Any] = {"at": None, "watching": {}}
+
+
+async def get_ict_wallet(cfg: Optional[Config] = None) -> dict[str, Any]:
+    doc = await db.ict_wallet.find_one({"_id": ICT_WALLET_ID}, {"_id": 0})
+    if not doc:
+        cfg = cfg or await get_config()
+        doc = {"cash": float(cfg.ict_capital), "start_capital": float(cfg.ict_capital)}
+        await db.ict_wallet.update_one({"_id": ICT_WALLET_ID}, {"$set": doc}, upsert=True)
+    return doc
+
+
+async def _ict_log(symbol: str, tf: str, reason: str) -> None:
+    key = f"{symbol}|{tf}|{reason}"
+    now = time.time()
+    if now - _ict_log_at.get(key, 0.0) < 300:
+        return
+    _ict_log_at[key] = now
+    await log_reject(symbol, tf, "ict", reason)
+
+
+async def _ict_candles(symbol: str, tf: str) -> list[list[float]]:
+    now = time.time()
+    cached = _ict_candle_cache.get(f"{symbol}|{tf}")
+    if cached and cached[1] and now - cached[0] < 30:
+        return cached[1]
+    candles = await exchange.get_klines(symbol, tf)
+    if candles:
+        _ict_candle_cache[f"{symbol}|{tf}"] = (now, candles)
+        return candles
+    if cached and cached[1] and now - cached[0] < 300:
+        return cached[1]
+    return []
+
+
+async def run_ict_scan() -> None:
+    cfg = await get_config()
+    if not cfg.ict_enabled:
+        return
+    tf = cfg.ict_timeframe
+    watching: dict[str, Any] = {}
+    for symbol in cfg.ict_symbols:
+        candles = await _ict_candles(symbol, tf)
+        if len(candles) < 60:
+            await _ict_log(symbol, tf, "dati insufficienti")
+            continue
+        live = price_feed.get(symbol) or await price_feed.price_or_rest(symbol)
+        if not live or live <= 0:
+            await _ict_log(symbol, tf, "prezzo live non disponibile")
+            continue
+        setups = ICT.find_setups(candles)
+        watching[symbol] = {"setups": len(setups), "price": live,
+                            "fvg_top": setups[-1]["fvg_top"] if setups else None,
+                            "stop": setups[-1]["stop"] if setups else None}
+        if not setups:
+            continue
+        if cfg.ict_kill_zones and not ICT.in_kill_zone(datetime.now(timezone.utc).hour):
+            await _ict_log(symbol, tf, "setup pronto ma fuori dagli orari (kill zone)")
+            continue
+        if await db.ict_positions.find_one({"symbol": symbol, "status": "open"}):
+            continue
+        open_n = await db.ict_positions.count_documents({"status": "open"})
+        if open_n >= cfg.ict_max_open:
+            await _ict_log(symbol, tf, "numero massimo di posizioni aperte raggiunto")
+            continue
+        for st in reversed(setups):
+            sid = f"{symbol}|{tf}|{st['id']}"
+            if sid in _ict_seen or await db.ict_seen.find_one({"_id": sid}, {"_id": 1}):
+                continue
+            plan = ICT.entry_plan(st, live, cfg.ict_rr)
+            if not plan:
+                continue
+            _ict_seen.add(sid)
+            await db.ict_seen.update_one({"_id": sid}, {"$set": {"at": datetime.now(timezone.utc).isoformat()}}, upsert=True)
+            await open_ict_position(symbol, tf, st, plan, cfg)
+            break
+    _ict_status["at"] = datetime.now(timezone.utc).isoformat()
+    _ict_status["watching"] = watching
+
+
+async def open_ict_position(symbol: str, tf: str, st: dict[str, Any], plan: dict[str, Any], cfg: Config) -> None:
+    wallet = await get_ict_wallet(cfg)
+    cash = float(wallet.get("cash", 0.0))
+    open_rows = await db.ict_positions.find({"status": "open"}, {"notional": 1, "_id": 0}).to_list(50)
+    equity = cash + sum(r.get("notional", 0.0) for r in open_rows)
+    notional = min(equity * cfg.ict_alloc_pct / 100.0, cash)
+    if notional < 1.0:
+        await _ict_log(symbol, tf, "capitale ICT esaurito")
+        return
+    mode, why = await real_guard(cfg, "ict")
+    if mode == "blocked":
+        await log_reject(symbol, tf, "ict", f"reale bloccato: {why}")
+        return
+    real_info = None
+    if mode == "real":
+        rb = await real_open_buy(symbol, notional, cfg, "ict", cash_cap=cash)
+        if not rb:
+            await log_reject(symbol, tf, "ict", "ordine reale non eseguito (vedi registro reale)")
+            return
+        real_info = rb
+        notional = rb["value"]
+        fill_price = rb["avg_price"]
+        fill_info = {"fill_model": "reale", "cost_pct": 0.0, "spread_pct": None}
+        quantity = rb["net_qty"]
+    else:
+        fill_price, fill_info = await simulate_fill(symbol, "buy", plan["entry"], cfg, quote_budget=notional)
+        quantity = notional / fill_price
+    stop = plan["stop"]
+    if fill_price <= stop:
+        # il prezzo di riempimento e' gia' sotto lo stop: non apro (in paper); nel reale chiudero' subito allo stop
+        if not real_info:
+            await log_reject(symbol, tf, "ict", "prezzo di riempimento sotto lo stop: non apro")
+            return
+    target = fill_price + cfg.ict_rr * (fill_price - stop)
+    now = datetime.now(timezone.utc)
+    doc = {
+        "id": str(uuid.uuid4()), "symbol": symbol, "timeframe": tf, "side": "long",
+        "entry": plan["entry"], "fill_price": fill_price, "fill_model": fill_info["fill_model"],
+        "entry_cost_pct": fill_info["cost_pct"], "spread_pct": fill_info.get("spread_pct"),
+        "stop": stop, "target": target, "risk_pct": round((fill_price - stop) / fill_price * 100.0, 3), "rr": cfg.ict_rr,
+        "setup_id": st["id"], "sweep_low": st["sweep_low"], "fvg_top": st["fvg_top"], "fvg_bottom": st["fvg_bottom"],
+        "quantity": quantity, "notional": notional, "status": "open",
+        "opened_at": now.isoformat(), "opened_ts": now.timestamp(),
+    }
+    if real_info:
+        doc["real"] = {k: real_info[k] for k in ("order_id", "link_id", "net_qty", "fee_base", "fee_quote", "qty")}
+    await db.ict_positions.insert_one(dict(doc))
+    await db.ict_wallet.update_one({"_id": ICT_WALLET_ID}, {"$inc": {"cash": -notional}}, upsert=True)
+
+
+async def monitor_ict_positions() -> None:
+    cfg = await get_config()
+    open_positions = await db.ict_positions.find({"status": "open"}, {"_id": 0}).to_list(20)
+    for p in open_positions:
+        cur = price_feed.get(p["symbol"]) or await price_feed.price_or_rest(p["symbol"])
+        if not cur or cur <= 0:
+            continue
+        await record_track("ict", db.ict_positions, p, cur)
+        hit = ICT.exit_check(p, cur, time.time(), cfg.ict_max_hold_h)
+        if not hit:
+            continue
+        if p.get("real"):
+            if not real_sell_due(p["id"]):
+                continue
+            sell = await real_close_position(p, cfg, "ictx")
+            if not sell:
+                await rlog(f"Vendita reale ICT di {p['symbol']} non riuscita, riprovo tra 30 s", "errore")
+                continue
+            sell_price = sell["avg_price"]
+            pnl = sell["net_value"] + sell.get("dust_value", 0.0) - p["notional"]
+            await db.ict_wallet.update_one({"_id": ICT_WALLET_ID}, {"$inc": {"cash": p["notional"] + pnl}}, upsert=True)
+            await db.ict_positions.update_one({"id": p["id"]}, {"$set": {
+                "status": "closed", "close_price": sell_price, "close_reason": hit, "close_last_price": cur,
+                "exit_fill_model": "reale", "fee_pct": cfg.sim_fee_pct, "pnl_usdt": round(pnl, 4),
+                "closed_at": datetime.now(timezone.utc).isoformat(),
+                "real_exit": {k: v for k, v in sell.items() if k != "dust"},
+            }})
+            await close_track(p["id"], cur)
+            continue
+        if cfg.sim_realistic_fills and not book_recheck_due(p["id"]):
+            continue
+        sell_price, sell_info = await simulate_fill(p["symbol"], "sell", cur, cfg, base_qty=p["quantity"])
+        gross = (sell_price - p["fill_price"]) * p["quantity"]
+        exit_notional = sell_price * p["quantity"]
+        fees = (p["notional"] + exit_notional) * (cfg.sim_fee_pct / 100.0)
+        pnl = gross - fees
+        await db.ict_wallet.update_one({"_id": ICT_WALLET_ID}, {"$inc": {"cash": p["notional"] + pnl}}, upsert=True)
+        await db.ict_positions.update_one({"id": p["id"]}, {"$set": {
+            "status": "closed", "close_price": sell_price, "close_reason": hit, "close_last_price": cur,
+            "exit_fill_model": sell_info["fill_model"], "exit_cost_pct": sell_info["cost_pct"],
+            "exit_spread_pct": sell_info.get("spread_pct"), "fee_pct": cfg.sim_fee_pct,
+            "pnl_usdt": round(pnl, 4), "closed_at": datetime.now(timezone.utc).isoformat(),
+        }})
+        await close_track(p["id"], cur)
+
+
+async def ict_monitor_loop() -> None:
+    """Uscite ogni 3 s sul prezzo live; ricerca ingressi nello stesso ciclo (un solo chiamante: niente doppie aperture)."""
+    await asyncio.sleep(12)
+    while True:
+        try:
+            await monitor_ict_positions()
+        except Exception as e:  # noqa: BLE001
+            logger.exception("ICT monitor error: %s", e)
+        try:
+            await run_ict_scan()
+        except Exception as e:  # noqa: BLE001
+            logger.exception("ICT scan error: %s", e)
+        await asyncio.sleep(3)
+
+
+async def _ict_close_all_real() -> tuple[int, int]:
+    cfg = await get_config()
+    rows = await db.ict_positions.find({"status": "open", "real": {"$exists": True}}, {"_id": 0}).to_list(50)
+    done, failed = 0, 0
+    for p in rows:
+        sell = await real_close_position(p, cfg, "chiudi")
+        if not sell:
+            failed += 1
+            continue
+        cur = sell["avg_price"]
+        pnl = sell["net_value"] + sell.get("dust_value", 0.0) - p["notional"]
+        await db.ict_wallet.update_one({"_id": ICT_WALLET_ID}, {"$inc": {"cash": p["notional"] + pnl}}, upsert=True)
+        await db.ict_positions.update_one({"id": p["id"]}, {"$set": {
+            "status": "closed", "close_price": cur, "close_reason": "chiusura_manuale_reale", "close_last_price": cur,
+            "exit_fill_model": "reale", "fee_pct": cfg.sim_fee_pct, "pnl_usdt": round(pnl, 4),
+            "closed_at": datetime.now(timezone.utc).isoformat(), "real_exit": {k: v for k, v in sell.items() if k != "dust"},
+        }})
+        await close_track(p["id"], cur)
+        done += 1
+    return done, failed
+
+
+@api.get("/ict/portfolio")
+async def ict_portfolio() -> dict[str, Any]:
+    cfg = await get_config()
+    wallet = await get_ict_wallet(cfg)
+    open_docs = await db.ict_positions.find({"status": "open"}, {"_id": 0}).to_list(50)
+    closed_docs = await db.ict_positions.find({"status": "closed"}, {"_id": 0}).sort("closed_at", -1).to_list(300)
+    open_out, open_value, unreal = [], 0.0, 0.0
+    for p in open_docs:
+        cur = price_feed.get(p["symbol"]) or await price_feed.price_or_rest(p["symbol"]) or p["entry"]
+        val = cur * p["quantity"]
+        fl = val - p["notional"] - (p["notional"] + val) * (cfg.sim_fee_pct / 100.0)
+        open_value += val
+        unreal += fl
+        open_out.append({**p, "current_price": cur, "floating_pnl": round(fl, 4), "is_real": bool(p.get("real"))})
+    closed_out = [{**c, "is_real": bool(c.get("real"))} for c in closed_docs]
+    wins = [c for c in closed_docs if c.get("pnl_usdt", 0.0) > 0]
+    realized = sum(c.get("pnl_usdt", 0.0) for c in closed_docs)
+    return {
+        "enabled": cfg.ict_enabled,
+        "mode": "real" if "ict" in cfg.live_strategies else "paper",
+        "real_switch_on": cfg.real_trading_enabled and "ict" in cfg.live_strategies,
+        "settings": {k: getattr(cfg, k) for k in ICT_SETTING_KEYS},
+        "cash": round(float(wallet.get("cash", 0.0)), 4),
+        "start_capital": float(wallet.get("start_capital", cfg.ict_capital)),
+        "equity": round(float(wallet.get("cash", 0.0)) + open_value, 4),
+        "unrealized": round(unreal, 4),
+        "realized": round(realized, 4),
+        "trades": len(closed_docs),
+        "win_rate": round(100.0 * len(wins) / len(closed_docs), 1) if closed_docs else None,
+        "open_positions": open_out,
+        "closed_positions": closed_out[:100],
+        "watching": _ict_status.get("watching", {}),
+        "last_scan": _ict_status.get("at"),
+        "disclaimer": "Strategia sperimentale, non dimostrata dai test.",
+    }
+
+
+@api.put("/ict/settings")
+async def ict_put_settings(body: dict[str, Any]) -> dict[str, Any]:
+    cfg = await get_config()
+    data = cfg.model_dump()
+    for k, v in body.items():
+        if k not in ICT_SETTING_KEYS:
+            raise HTTPException(status_code=400, detail=f"Impostazione sconosciuta: {k}")
+        data[k] = v
+    try:
+        new_cfg = Config(**data)
+    except Exception as e:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail=f"Valore non valido: {e}")
+    if new_cfg.ict_timeframe not in ICT_TIMEFRAMES:
+        raise HTTPException(status_code=400, detail="Timeframe ammessi: " + ", ".join(ICT_TIMEFRAMES))
+    if not (1.0 <= new_cfg.ict_rr <= 5.0):
+        raise HTTPException(status_code=400, detail="RR tra 1 e 5")
+    if not (5.0 <= new_cfg.ict_alloc_pct <= 100.0):
+        raise HTTPException(status_code=400, detail="Quota per operazione tra 5% e 100%")
+    if not (1 <= new_cfg.ict_max_open <= 4):
+        raise HTTPException(status_code=400, detail="Posizioni aperte massime tra 1 e 4")
+    if not (1.0 <= new_cfg.ict_max_hold_h <= 168.0):
+        raise HTTPException(status_code=400, detail="Durata massima tra 1 e 168 ore")
+    syms = [s.strip().upper() for s in new_cfg.ict_symbols]
+    if not (1 <= len(syms) <= 8) or any((not s.endswith("USDC")) or (not s.isalnum()) or len(s) > 14 for s in syms):
+        raise HTTPException(status_code=400, detail="Da 1 a 8 coppie USDC (es. BTCUSDC)")
+    new_cfg.ict_symbols = syms
+    body = dict(body)
+    if "ict_symbols" in body:
+        body["ict_symbols"] = syms
+    await db.config.update_one({"_id": CONFIG_ID}, {"$set": {k: getattr(new_cfg, k) for k in body}}, upsert=True)
+    return {k: getattr(new_cfg, k) for k in ICT_SETTING_KEYS}
+
+
+@api.post("/ict/reset")
+async def ict_reset() -> dict[str, Any]:
+    if await db.ict_positions.find_one({"status": "open", "real": {"$exists": True}}):
+        raise HTTPException(status_code=400, detail="Ci sono posizioni ICT reali aperte: chiudile prima (pagina Trading reale).")
+    cfg = await get_config()
+    await db.ict_positions.delete_many({})
+    await db.ict_seen.delete_many({})
+    _ict_seen.clear()
+    await db.ict_wallet.update_one(
+        {"_id": ICT_WALLET_ID}, {"$set": {"cash": float(cfg.ict_capital), "start_capital": float(cfg.ict_capital)}}, upsert=True)
+    return {"ok": True}
+
+
+app.include_router(api)

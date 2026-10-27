@@ -609,6 +609,7 @@ class PriceFeed:
             db.s3360_positions,
             db.xrp_acc_positions,
             db.ict_positions,
+            db.manual_setups,
         ):
             rows = await coll.find({"status": "open"}, {"symbol": 1, "_id": 0}).to_list(1000)
             symbols |= {d["symbol"] for d in rows}
@@ -1961,6 +1962,7 @@ async def lifespan(_app: FastAPI):
     xrp_acc_monitor_task = asyncio.create_task(xrp_acc_monitor_loop())
     s3360_entry_task = asyncio.create_task(s3360_entry_loop())
     ict_monitor_task = asyncio.create_task(ict_monitor_loop())
+    manual_task = asyncio.create_task(manual_loop())
     ws_task = asyncio.create_task(price_feed.run())
     premature_task = asyncio.create_task(premature_stop_loop())
     entry_timing_task = asyncio.create_task(entry_timing_loop())
@@ -1969,6 +1971,7 @@ async def lifespan(_app: FastAPI):
     scan_task.cancel()
     monitor_task.cancel()
     ict_monitor_task.cancel()
+    manual_task.cancel()
     s3360_entry_task.cancel()
     ws_task.cancel()
     premature_task.cancel()
@@ -4220,6 +4223,9 @@ async def real_daily_pnl() -> float:
     rows += await db.ict_positions.find(
         {"status": "closed", "real": {"$exists": True}, "closed_at": {"$gte": start}}, {"pnl_usdt": 1, "_id": 0}
     ).to_list(1000)
+    rows += await db.manual_setups.find(
+        {"status": "closed", "real": {"$exists": True}, "closed_at": {"$gte": start}}, {"pnl_usdt": 1, "_id": 0}
+    ).to_list(1000)
     extra = await db.real_roundtrips.find({"at": {"$gte": start}}, {"pnl": 1, "_id": 0}).to_list(1000)
     return float(sum(r.get("pnl_usdt", 0.0) for r in rows) + sum(r.get("pnl", 0.0) for r in extra))
 
@@ -4227,6 +4233,7 @@ async def real_daily_pnl() -> float:
 async def real_open_exposure() -> float:
     rows = await db.s3360_positions.find({"status": "open", "real": {"$exists": True}}, {"notional": 1, "_id": 0}).to_list(500)
     rows += await db.ict_positions.find({"status": "open", "real": {"$exists": True}}, {"notional": 1, "_id": 0}).to_list(500)
+    rows += await db.manual_setups.find({"status": "open", "real": {"$exists": True}}, {"notional": 1, "_id": 0}).to_list(500)
     return float(sum(r.get("notional", 0.0) for r in rows))
 
 
@@ -4396,6 +4403,7 @@ async def real_status() -> dict[str, Any]:
     log = await db.real_log.find({}, {"_id": 0}).sort("at", -1).to_list(30)
     open_rows = await db.s3360_positions.find({"status": "open", "real": {"$exists": True}}, {"_id": 0}).to_list(50)
     open_rows += await db.ict_positions.find({"status": "open", "real": {"$exists": True}}, {"_id": 0}).to_list(50)
+    open_rows += await db.manual_setups.find({"status": "open", "real": {"$exists": True}}, {"_id": 0}).to_list(50)
     return {
         "enabled": cfg.real_trading_enabled,
         "live_strategies": cfg.live_strategies,
@@ -4535,7 +4543,8 @@ async def real_close_all() -> dict[str, Any]:
         await close_track(p["id"], cur)
         done += 1
     d2, f2 = await _ict_close_all_real()
-    return {"chiuse": done + d2, "non_riuscite": failed + f2}
+    d3, f3 = await _manual_close_all_real()
+    return {"chiuse": done + d2 + d3, "non_riuscite": failed + f2 + f3}
 
 
 # ============================================================================
@@ -4924,6 +4933,272 @@ async def xrp_acc_reset() -> dict[str, Any]:
         {"$set": {"cash": 0.0, "permanent_xrp": 0.0, "total_transferred_in": 0.0}, "$inc": {"reset_seq": 1}},
         upsert=True,
     )
+    return {"ok": True}
+
+
+# ============================================================================
+# SETUP MANUALE — incolli un segnale (moneta, ingresso, stop, target, importo), il bot lo legge,
+# mostra rischio/guadagno e SOLO dopo la tua conferma lo esegue (paper o reale, scelto per ogni setup).
+# Ingresso a limite = il bot aspetta che il prezzo scenda al livello e poi compra a mercato.
+# Stop e target sono sorvegliati dal bot ogni 3 secondi (NON sono ordini su Bybit): se il bot e' spento, non scattano.
+# Solo long, spot, coppie USDC. Le regole di calcolo stanno in manual_logic.py.
+# ============================================================================
+try:
+    import manual_logic as ML
+except ImportError:  # pragma: no cover
+    from backend import manual_logic as ML
+
+MANUAL_MAX_ACTIVE = 5
+MANUAL_EXPIRE_H = 48.0
+_manual_lock = asyncio.Lock()
+
+
+async def _manual_price(symbol: str) -> Optional[float]:
+    try:
+        p = price_feed.get(symbol) or await price_feed.price_or_rest(symbol)
+    except Exception:  # noqa: BLE001
+        p = None
+    return float(p) if p and p > 0 else None
+
+
+async def _manual_real_state(cfg: Config) -> tuple[str, Optional[str]]:
+    """Il reale per il setup manuale chiede: interruttore generale acceso, password, chiave Bybit, limite giornaliero."""
+    cfg2 = cfg.model_copy(update={"live_strategies": list(cfg.live_strategies) + ["manual"]})
+    return await real_guard(cfg2, "manual")
+
+
+def _manual_clean(setup: Any) -> dict[str, Any]:
+    if not isinstance(setup, dict):
+        raise HTTPException(status_code=400, detail="Setup mancante.")
+    try:
+        sym = str(setup["symbol"]).strip().upper()
+        entry = setup.get("entry")
+        out = {"symbol": sym, "entry": None if entry in (None, "", 0) else float(entry),
+               "stop": float(setup["stop"]), "target": float(setup["target"]), "amount": float(setup["amount"]),
+               "risk": None if setup.get("risk") in (None, "", 0) else float(setup["risk"])}
+    except (KeyError, TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Setup incompleto o con numeri non validi.")
+    return out
+
+
+async def _manual_cancel(sid: str, reason: str) -> None:
+    await db.manual_setups.update_one({"id": sid, "status": "waiting"}, {"$set": {
+        "status": "cancelled", "close_reason": reason, "closed_at": datetime.now(timezone.utc).isoformat()}})
+
+
+async def _manual_open(s: dict[str, Any], cfg: Config, live: float) -> tuple[bool, str]:
+    """Compra (paper o reale) per un setup 'waiting'. In caso di errore il setup viene annullato con il motivo."""
+    async with _manual_lock:
+        cur_doc = await db.manual_setups.find_one({"id": s["id"], "status": "waiting"}, {"_id": 0})
+        if not cur_doc:
+            return False, "setup non piu' in attesa"
+        sym, amount = s["symbol"], float(s["amount"])
+        real_info = None
+        if s["mode"] == "real":
+            mode, why = await _manual_real_state(cfg)
+            if mode != "real":
+                await _manual_cancel(s["id"], f"reale non disponibile: {why}")
+                return False, f"reale non disponibile: {why}"
+            rb = await real_open_buy(sym, amount, cfg, "man", cash_cap=amount)
+            if not rb:
+                await _manual_cancel(s["id"], "ordine reale non eseguito (vedi registro reale)")
+                return False, "ordine reale non eseguito (vedi registro reale)"
+            real_info = rb
+            fill_price, notional, quantity = rb["avg_price"], rb["value"], rb["net_qty"]
+            fill_info = {"fill_model": "reale", "cost_pct": 0.0}
+        else:
+            fill_price, fill_info = await simulate_fill(sym, "buy", live, cfg, quote_budget=amount)
+            if s.get("entry") is not None and fill_price > s["entry"]:
+                fill_price = float(s["entry"])  # ordine a limite: riempimento al limite o meglio
+            if fill_price <= s["stop"] or fill_price >= s["target"]:
+                await _manual_cancel(s["id"], "prezzo di riempimento fuori dal setup")
+                return False, "prezzo di riempimento fuori dal setup"
+            notional, quantity = amount, amount / fill_price
+        now = datetime.now(timezone.utc)
+        upd = {"status": "open", "entry": fill_price, "fill_price": fill_price, "fill_model": fill_info["fill_model"],
+               "entry_cost_pct": fill_info["cost_pct"], "quantity": quantity, "notional": notional,
+               "opened_at": now.isoformat(), "opened_ts": now.timestamp(), "side": "long", "timeframe": "manuale"}
+        if real_info:
+            upd["real"] = {k: real_info[k] for k in ("order_id", "link_id", "net_qty", "fee_base", "fee_quote", "qty")}
+        await db.manual_setups.update_one({"id": s["id"]}, {"$set": upd})
+        return True, "aperta"
+
+
+async def _manual_close(p: dict[str, Any], cfg: Config, reason: str, cur: float, force: bool = False) -> bool:
+    if p.get("real"):
+        if not force and not real_sell_due(p["id"]):
+            return False
+        sell = await real_close_position(p, cfg, "manx")
+        if not sell:
+            await rlog(f"Vendita reale del setup manuale {p['symbol']} non riuscita, riprovo tra 30 s", "errore")
+            return False
+        sell_price = sell["avg_price"]
+        pnl = sell["net_value"] + sell.get("dust_value", 0.0) - p["notional"]
+        extra = {"exit_fill_model": "reale", "real_exit": {k: v for k, v in sell.items() if k != "dust"}}
+    else:
+        sell_price, sell_info = await simulate_fill(p["symbol"], "sell", cur, cfg, base_qty=p["quantity"])
+        gross = (sell_price - p["fill_price"]) * p["quantity"]
+        fees = (p["notional"] + sell_price * p["quantity"]) * (cfg.sim_fee_pct / 100.0)
+        pnl = gross - fees
+        extra = {"exit_fill_model": sell_info["fill_model"], "exit_cost_pct": sell_info["cost_pct"]}
+    res = await db.manual_setups.update_one({"id": p["id"], "status": "open"}, {"$set": {
+        "status": "closed", "close_price": sell_price, "close_reason": reason, "close_last_price": cur,
+        "fee_pct": cfg.sim_fee_pct, "pnl_usdt": round(pnl, 4), "closed_at": datetime.now(timezone.utc).isoformat(), **extra}})
+    await close_track(p["id"], cur)
+    return bool(res.modified_count)
+
+
+async def manual_loop() -> None:
+    await asyncio.sleep(14)
+    while True:
+        try:
+            cfg = await get_config()
+            now_s = time.time()
+            for s in await db.manual_setups.find({"status": "waiting"}, {"_id": 0}).to_list(20):
+                cur = await _manual_price(s["symbol"])
+                if cur is None:
+                    continue
+                ch = ML.waiting_check(s, cur, now_s) if s.get("entry") else "trigger"
+                if ch == "trigger":
+                    await _manual_open(s, cfg, cur)
+                elif ch == "expired":
+                    await _manual_cancel(s["id"], "scaduto (nessun ingresso entro %d ore)" % int(MANUAL_EXPIRE_H))
+                elif ch == "invalid":
+                    await _manual_cancel(s["id"], "il prezzo ha toccato stop o target prima dell'ingresso")
+            for p in await db.manual_setups.find({"status": "open"}, {"_id": 0}).to_list(20):
+                cur = await _manual_price(p["symbol"])
+                if cur is None:
+                    continue
+                await record_track("manual", db.manual_setups, p, cur)
+                hit = ML.exit_check(p, cur)
+                if hit:
+                    await _manual_close(p, cfg, hit, cur)
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Setup manuale: errore nel ciclo: %s", e)
+        await asyncio.sleep(3)
+
+
+async def _manual_close_all_real() -> tuple[int, int]:
+    cfg = await get_config()
+    rows = await db.manual_setups.find({"status": "open", "real": {"$exists": True}}, {"_id": 0}).to_list(50)
+    done, failed = 0, 0
+    for p in rows:
+        cur = await _manual_price(p["symbol"]) or p["fill_price"]
+        if await _manual_close(p, cfg, "chiusura_manuale_reale", cur, force=True):
+            done += 1
+        else:
+            failed += 1
+    return done, failed
+
+
+@api.post("/manual/parse")
+async def manual_parse(body: dict[str, Any]) -> dict[str, Any]:
+    cfg = await get_config()
+    try:
+        setup = ML.parse_signal(str(body.get("text", "")))
+    except ValueError as e:
+        return {"ok": False, "error": str(e)}
+    if body.get("amount") not in (None, ""):
+        try:
+            setup["amount"] = float(body["amount"])
+        except (TypeError, ValueError):
+            return {"ok": False, "error": "Importo non valido."}
+    price = await _manual_price(setup["symbol"])
+    if price is None:
+        return {"ok": False, "error": f"Non trovo il prezzo di {setup['symbol']} su Bybit: controlla il nome della moneta."}
+    pl = ML.plan(setup, price, cfg.sim_fee_pct, real=False)
+    mode, why = await _manual_real_state(cfg)
+    real_why = None
+    if mode != "real":
+        real_why = why
+    elif setup["amount"] > min(cfg.real_max_order_usdc, REAL_HARD_MAX_ORDER):
+        real_why = "importo sopra il tetto per ordine (%.2f) della pagina Trading reale" % min(cfg.real_max_order_usdc, REAL_HARD_MAX_ORDER)
+    elif setup["amount"] < 5.5:
+        real_why = "importo sotto il minimo reale (5,50)"
+    return {"ok": True, "setup": setup, "price": price, "plan": pl,
+            "real": {"available": real_why is None, "why": real_why}}
+
+
+@api.post("/manual/create")
+async def manual_create(body: dict[str, Any]) -> dict[str, Any]:
+    if body.get("confirm") is not True:
+        raise HTTPException(status_code=400, detail="Serve la conferma.")
+    mode = body.get("mode")
+    if mode not in ("paper", "real"):
+        raise HTTPException(status_code=400, detail="Scegli simulazione o reale.")
+    cfg = await get_config()
+    setup = _manual_clean(body.get("setup"))
+    price = await _manual_price(setup["symbol"])
+    if price is None:
+        raise HTTPException(status_code=400, detail="Prezzo non disponibile per " + setup["symbol"])
+    pl = ML.plan(setup, price, cfg.sim_fee_pct, real=(mode == "real"))
+    if pl["errors"]:
+        raise HTTPException(status_code=400, detail=" ".join(pl["errors"]))
+    if mode == "real":
+        st, why = await _manual_real_state(cfg)
+        if st != "real":
+            raise HTTPException(status_code=400, detail=f"Reale non disponibile: {why}")
+        if setup["amount"] > min(cfg.real_max_order_usdc, REAL_HARD_MAX_ORDER):
+            raise HTTPException(status_code=400, detail="Importo sopra il tetto per ordine della pagina Trading reale.")
+    active = await db.manual_setups.find({"status": {"$in": ["waiting", "open"]}}, {"symbol": 1, "_id": 0}).to_list(50)
+    if len(active) >= MANUAL_MAX_ACTIVE:
+        raise HTTPException(status_code=400, detail=f"Hai gia' {MANUAL_MAX_ACTIVE} setup attivi: chiudine o annullane uno.")
+    if any(a["symbol"] == setup["symbol"] for a in active):
+        raise HTTPException(status_code=400, detail=f"C'e' gia' un setup attivo su {setup['symbol']}.")
+    now = datetime.now(timezone.utc)
+    market = setup["entry"] is None
+    doc = {"id": str(uuid.uuid4()), "symbol": setup["symbol"], "mode": mode, "status": "waiting",
+           "limit_entry": setup["entry"], "entry": setup["entry"] if not market else price,
+           "stop": setup["stop"], "target": setup["target"], "amount": setup["amount"],
+           "plan": {k: pl[k] for k in ("risk_pct", "gain_pct", "loss_net", "gain_net", "rr")},
+           "created_at": now.isoformat(), "expires_ts": now.timestamp() + MANUAL_EXPIRE_H * 3600.0}
+    await db.manual_setups.insert_one(dict(doc))
+    if market or price <= doc["entry"]:
+        ok, msg = await _manual_open(doc, cfg, price)
+        if not ok:
+            raise HTTPException(status_code=400, detail=msg)
+        return {"ok": True, "status": "open", "id": doc["id"]}
+    return {"ok": True, "status": "waiting", "id": doc["id"]}
+
+
+@api.get("/manual/list")
+async def manual_list() -> dict[str, Any]:
+    cfg = await get_config()
+    waiting = await db.manual_setups.find({"status": "waiting"}, {"_id": 0}).sort("created_at", -1).to_list(20)
+    open_docs = await db.manual_setups.find({"status": "open"}, {"_id": 0}).sort("opened_at", -1).to_list(20)
+    closed = await db.manual_setups.find({"status": {"$in": ["closed", "cancelled"]}}, {"_id": 0}).sort("closed_at", -1).to_list(60)
+    w_out = []
+    for w in waiting:
+        w_out.append({**w, "current_price": await _manual_price(w["symbol"])})
+    o_out = []
+    for p in open_docs:
+        cur = await _manual_price(p["symbol"]) or p["fill_price"]
+        val = cur * p["quantity"]
+        fl = val - p["notional"] - (p["notional"] + val) * (cfg.sim_fee_pct / 100.0)
+        o_out.append({**p, "current_price": cur, "floating_pnl": round(fl, 4)})
+    done = [c for c in closed if c["status"] == "closed"]
+    return {"waiting": w_out, "open": o_out, "closed": closed,
+            "trades": len(done), "wins": sum(1 for c in done if c.get("pnl_usdt", 0) > 0),
+            "realized": round(sum(c.get("pnl_usdt", 0.0) for c in done), 4)}
+
+
+@api.post("/manual/cancel/{sid}")
+async def manual_cancel(sid: str) -> dict[str, Any]:
+    if not await db.manual_setups.find_one({"id": sid, "status": "waiting"}, {"_id": 1}):
+        raise HTTPException(status_code=404, detail="Nessun setup in attesa con questo codice.")
+    await _manual_cancel(sid, "annullato da te")
+    return {"ok": True}
+
+
+@api.post("/manual/close/{sid}")
+async def manual_close(sid: str) -> dict[str, Any]:
+    cfg = await get_config()
+    p = await db.manual_setups.find_one({"id": sid, "status": "open"}, {"_id": 0})
+    if not p:
+        raise HTTPException(status_code=404, detail="Nessuna posizione aperta con questo codice.")
+    cur = await _manual_price(p["symbol"]) or p["fill_price"]
+    if not await _manual_close(p, cfg, "chiusura_manuale", cur, force=True):
+        raise HTTPException(status_code=400, detail="Chiusura non riuscita: vedi il registro reale e riprova.")
     return {"ok": True}
 
 

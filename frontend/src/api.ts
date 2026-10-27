@@ -697,6 +697,30 @@ export const signalsApi = {
   s3360: () => req<{ rows: S3360Signal[] }>("/s3360/segnali"),
 };
 
+export type ManualSetup = { symbol: string; entry: number | null; stop: number; target: number; amount: number; risk: number | null };
+export type ManualPlan = {
+  errors: string[]; warnings: string[]; market?: boolean; entry_ref?: number; qty?: number;
+  risk_pct?: number; gain_pct?: number; loss_net?: number; gain_net?: number; rr?: number | null;
+  fees_roundtrip_pct?: number; breakeven?: number;
+};
+export type ManualParse =
+  | { ok: false; error: string }
+  | { ok: true; setup: ManualSetup; price: number; plan: ManualPlan; real: { available: boolean; why: string | null } };
+export type ManualRow = {
+  id: string; symbol: string; mode: "paper" | "real"; status: string; entry?: number | null; fill_price?: number;
+  stop: number; target: number; amount: number; current_price?: number | null; floating_pnl?: number;
+  pnl_usdt?: number; close_price?: number; close_reason?: string; created_at?: string; closed_at?: string;
+};
+export type ManualList = { waiting: ManualRow[]; open: ManualRow[]; closed: ManualRow[]; trades: number; wins: number; realized: number };
+export const manualApi = {
+  parse: (text: string) => req<ManualParse>("/manual/parse", { method: "POST", body: JSON.stringify({ text }) }),
+  create: (setup: ManualSetup, mode: "paper" | "real") =>
+    req<{ ok: boolean; status: string; id: string }>("/manual/create", { method: "POST", body: JSON.stringify({ setup, mode, confirm: true }) }),
+  list: () => req<ManualList>("/manual/list"),
+  cancel: (id: string) => req<{ ok: boolean }>("/manual/cancel/" + id, { method: "POST" }),
+  close: (id: string) => req<{ ok: boolean }>("/manual/close/" + id, { method: "POST" }),
+};
+
 export const realApi = {
   diagnosi: () => req<RealDiagnosi>("/real/diagnosi"),
   status: () => req<RealStatus>("/real/status"),
