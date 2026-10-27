@@ -137,6 +137,7 @@ export default function SettingsScreen() {
     field:
       | "rsi_reversion_timeframes"
       | "s3360_timeframes"
+      | "s3360_post_target_trailing_timeframes"
       | "s3360_rsi_giveback_timeframes"
       | "xrp_acc_timeframes",
     t: string
@@ -665,6 +666,40 @@ export default function SettingsScreen() {
                 step={0.05}
                 testID="input-s3360-trailing-pct"
               />
+              <ToggleRow
+                label="Dopo il target RSI: non vendere subito, segui il massimo"
+                value={cfg.s3360_post_target_trailing_enabled}
+                onChange={(v) => update({ s3360_post_target_trailing_enabled: v })}
+                testID="toggle-s3360-post-target"
+              />
+              <NumRow
+                label="Vendi se il prezzo scende dal massimo di (%)"
+                value={cfg.s3360_post_target_trailing_pct}
+                onChange={(v) => update({ s3360_post_target_trailing_pct: v })}
+                step={0.1}
+                testID="input-s3360-post-target-pct"
+              />
+              <Text style={styles.fieldLabel}>Timeframe su cui vale il trailing dopo il target</Text>
+              <View style={styles.chipsRow}>
+                {TIMEFRAMES_30M.map((t) => {
+                  const active = (cfg.s3360_post_target_trailing_timeframes || []).includes(t);
+                  return (
+                    <Pressable
+                      key={t}
+                      onPress={() => toggleTimeframeFor("s3360_post_target_trailing_timeframes", t)}
+                      style={[styles.chip, active && styles.chipActive]}
+                      testID={`tf-select-s3360-posttarget-${t}`}
+                    >
+                      <Text style={[styles.chipText, active && styles.chipTextActive]}>{t}</Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+              <Text style={styles.scoreHintText}>
+                Quando l&apos;RSI arriva al target (e il prezzo copre il guadagno minimo) il bot non vende: segue il prezzo massimo e
+                vende solo se il prezzo scende dal massimo della percentuale indicata, mai sotto il pareggio. Nelle salite
+                forti guadagni di piu&apos;; nelle salite normali vendi un po&apos; sotto il massimo.
+              </Text>
               <ToggleRow
                 label="Esci se l'RSI risale e poi ritorna giu'"
                 value={cfg.s3360_rsi_giveback_enabled}

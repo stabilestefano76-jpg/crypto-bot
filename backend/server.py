@@ -182,6 +182,9 @@ class Config(BaseModel):
     s3360_rsi_giveback_enabled: bool = False  # extra exit: once the RSI has been above s3360_rsi_arm, selling as soon as it falls back below s3360_rsi_giveback — at ANY price, ignoring the minimum net profit / break-even rules
     s3360_rsi_arm: float = 52.0
     s3360_rsi_giveback: float = 50.0
+    s3360_post_target_trailing_enabled: bool = False  # a RSI target non vende subito: segue il massimo
+    s3360_post_target_trailing_pct: float = 1.0  # vende se il prezzo scende di questa % dal massimo
+    s3360_post_target_trailing_timeframes: list[str] = Field(default_factory=lambda: ["1h", "4h", "1d"])
     s3360_rsi_giveback_timeframes: list[str] = Field(default_factory=lambda: ["1h", "4h", "1d"])  # timeframe su cui vale l'uscita RSI di ritorno
     xrp_acc_enabled: bool = True
     xrp_acc_timeframes: list[str] = Field(default_factory=lambda: ["1h"])
@@ -3875,9 +3878,33 @@ async def monitor_s3360_positions() -> None:
             active, peak = await update_trailing_state(db.s3360_positions, p, cur, margin_price)
             trail_hit = active and cur <= trailing_stop_price(fill, peak, cfg.s3360_trailing_pct, cfg.sim_fee_pct)
 
+        # Trailing DOPO il target: a RSI target (con prezzo che copre il guadagno minimo) non si vende subito;
+        # si segue il massimo e si vende solo se il prezzo ricade di s3360_post_target_trailing_pct dal massimo.
+        pt_on = bool(cfg.s3360_post_target_trailing_enabled and tf in cfg.s3360_post_target_trailing_timeframes)
+        pt_armed = False
+        pt_hit = False
+        if pt_on:
+            if not p.get("pt_armed") and rsi_hit and (not cfg.s3360_hold_below_entry or cur >= margin_price):
+                p["pt_armed"] = True
+                p["pt_peak"] = cur
+                await db.s3360_positions.update_one({"id": p["id"]}, {"$set": {
+                    "pt_armed": True, "pt_peak": cur, "pt_armed_at": datetime.now(timezone.utc).isoformat()}})
+            if p.get("pt_armed"):
+                pt_armed = True
+                old_peak = float(p.get("pt_peak") or 0.0)
+                peak_now = max(old_peak, cur)
+                if peak_now > old_peak:
+                    p["pt_peak"] = peak_now
+                    await db.s3360_positions.update_one({"id": p["id"]}, {"$set": {"pt_peak": peak_now}})
+                pt_hit = cur <= peak_now * (1.0 - cfg.s3360_post_target_trailing_pct / 100.0)
+
         # The RSI target stays the main exit; the trailing protects the profit
         # when the price turns back before the target is reached.
-        if rsi_hit and (not cfg.s3360_hold_below_entry or cur >= margin_price):
+        if pt_armed and not (pt_hit or trail_hit or giveback_hit):
+            continue  # target raggiunto: si lascia correre, il trailing dopo il target protegge
+        if pt_hit:
+            hit, floor_price = "trailing_dopo_target", break_even
+        elif rsi_hit and not pt_on and (not cfg.s3360_hold_below_entry or cur >= margin_price):
             hit, floor_price = "target_rsi_raggiunto", margin_price
         elif trail_hit:
             hit, floor_price = "trailing_stop", break_even
@@ -3894,13 +3921,21 @@ async def monitor_s3360_positions() -> None:
         else:
             continue
         if cfg.s3360_hold_below_entry and cur < floor_price:
-            await _s3360_hold_log(p, "RSI tornato sotto la soglia ma il prezzo non copre i costi: attendo" if hit == "rsi_ritorno" else "Trailing: il prezzo non copre i costi, attendo" if hit == "trailing_stop" else "RSI al target ma prezzo sotto l'entrata: attendo il recupero")
+            await _s3360_hold_log(p, "RSI tornato sotto la soglia ma il prezzo non copre i costi: attendo" if hit == "rsi_ritorno" else "Trailing: il prezzo non copre i costi, attendo" if hit in ("trailing_stop", "trailing_dopo_target") else "RSI al target ma prezzo sotto l'entrata: attendo il recupero")
             continue
 
         # The last price clears the floor; now ask what a market sell would
         # REALLY get (best bid / depth). With the simulation off this is `cur`
         # and costs no request. The book is read at most every 10s per position.
         if p.get("real"):
+            if cfg.s3360_hold_below_entry and floor_price > 0 and cfg.sim_realistic_fills:
+                # prima di mandare un ordine vero guardo il libro ordini: se il prezzo realistico e' sotto il minimo, attendo
+                if not book_recheck_due(p["id"]):
+                    continue
+                est_price, _est = await simulate_fill(p["symbol"], "sell", cur, cfg, base_qty=p["quantity"])
+                if est_price < floor_price:
+                    await _s3360_hold_log(p, "Vendita reale: il prezzo realistico dal libro ordini e' sotto il minimo: attendo")
+                    continue
             if not real_sell_due(p["id"]):
                 continue
             sell = await real_close_position(p, cfg, "s3360x")
