@@ -112,6 +112,11 @@ export type Config = {
   s3360_timeframes: string[];
   s3360_rsi_period: number;
   s3360_low_threshold: number;
+  s3360_entry_mode: string;
+  s3360_confirm_level: number;
+  s3360_confirm_lookback: number;
+  s3360_confirm_ma_period: number;
+  s3360_confirm_closed_only: boolean;
   s3360_high_threshold: number;
   s3360_max_open_positions: number;
   s3360_max_daily_rise_pct: number;
@@ -142,6 +147,11 @@ export type Config = {
   xrp_acc_timeframes: string[];
   xrp_acc_rsi_period: number;
   xrp_acc_low_threshold: number;
+  xrp_acc_entry_mode: string;
+  xrp_acc_confirm_level: number;
+  xrp_acc_confirm_lookback: number;
+  xrp_acc_confirm_ma_period: number;
+  xrp_acc_confirm_closed_only: boolean;
   xrp_acc_high_threshold: number;
   xrp_acc_hold_below_entry: boolean;
   xrp_acc_min_net_profit_pct: number;

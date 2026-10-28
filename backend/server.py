@@ -182,10 +182,20 @@ class Config(BaseModel):
     s3360_rsi_giveback_enabled: bool = False  # extra exit: once the RSI has been above s3360_rsi_arm, selling as soon as it falls back below s3360_rsi_giveback — at ANY price, ignoring the minimum net profit / break-even rules
     s3360_rsi_arm: float = 52.0
     s3360_rsi_giveback: float = 50.0
+    s3360_entry_mode: str = "tocco"  # tocco | risale | incrocio | entrambi (ingresso a conferma)
+    s3360_confirm_level: float = 30.0  # livello che l'RSI deve riconquistare (modalita risale / entrambi)
+    s3360_confirm_lookback: int = 5  # l'RSI deve essere stato sotto la soglia bassa in queste ultime candele
+    s3360_confirm_ma_period: int = 14  # periodo della media dell'RSI (modalita incrocio / entrambi)
+    s3360_confirm_closed_only: bool = True  # True: decide solo a candela chiusa (il segnale non sparisce)
     s3360_post_target_trailing_enabled: bool = False  # a RSI target non vende subito: segue il massimo
     s3360_post_target_trailing_pct: float = 1.0  # vende se il prezzo scende di questa % dal massimo
     s3360_post_target_trailing_timeframes: list[str] = Field(default_factory=lambda: ["1h", "4h", "1d"])
     s3360_rsi_giveback_timeframes: list[str] = Field(default_factory=lambda: ["1h", "4h", "1d"])  # timeframe su cui vale l'uscita RSI di ritorno
+    xrp_acc_entry_mode: str = "tocco"  # tocco | risale | incrocio | entrambi (ingresso a conferma)
+    xrp_acc_confirm_level: float = 30.0  # livello che l'RSI deve riconquistare (modalita risale / entrambi)
+    xrp_acc_confirm_lookback: int = 5  # l'RSI deve essere stato sotto la soglia bassa in queste ultime candele
+    xrp_acc_confirm_ma_period: int = 14  # periodo della media dell'RSI (modalita incrocio / entrambi)
+    xrp_acc_confirm_closed_only: bool = True  # True: decide solo a candela chiusa (il segnale non sparisce)
     xrp_acc_enabled: bool = True
     xrp_acc_timeframes: list[str] = Field(default_factory=lambda: ["1h"])
     xrp_acc_rsi_period: int = 14
@@ -3458,6 +3468,12 @@ async def simulate_fill(
     return price, {"fill_model": "fallback", "cost_pct": round(cfg.sim_fallback_slippage_pct, 4)}
 
 
+try:
+    import entry_confirm as EC
+except ImportError:  # pragma: no cover
+    from backend import entry_confirm as EC
+
+
 # ============================================================================
 # Strategy "33/60" — buy when RSI crosses down through 35 (a fresh dip into
 # oversold-adjacent territory), exit once RSI recovers up to 60. Backtested
@@ -3682,7 +3698,16 @@ async def run_s3360_scan() -> None:
             closes = [c[2] for c in candles]
             live_rsis = rsi_wilder(closes + [live_price], cfg.s3360_rsi_period)
             live_rsi = live_rsis[-1]
-            if live_rsi > cfg.s3360_low_threshold:
+            if cfg.s3360_entry_mode in EC.CONFIRM_MODES:
+                _ev = EC.evaluate(closes, live_price, rsi_wilder, mode=cfg.s3360_entry_mode, period=cfg.s3360_rsi_period,
+                                  low=cfg.s3360_low_threshold, level=cfg.s3360_confirm_level, lookback=cfg.s3360_confirm_lookback,
+                                  ma_period=cfg.s3360_confirm_ma_period, closed_only=cfg.s3360_confirm_closed_only)
+                if not _ev["ok"]:
+                    await _s3360_log(symbol, tf, "nessun nuovo ingresso (" + _ev["reason"] + ")")
+                    continue
+                if _ev["rsi"] is not None:
+                    live_rsi = _ev["rsi"]
+            elif live_rsi > cfg.s3360_low_threshold:
                 await _s3360_log(symbol, tf, "nessun nuovo ingresso sotto soglia bassa")
                 continue
             # Dedup against the CURRENT still-forming candle's start time —
@@ -4706,7 +4731,16 @@ async def run_xrp_acc_scan() -> None:
         live_rsis = rsi_wilder(closes + [live_price], cfg.xrp_acc_rsi_period)
         live_rsi = live_rsis[-1]
         await rsi_watch("xrp_acc", XRP_ACC_SYMBOL, tf, live_rsi)
-        if live_rsi > cfg.xrp_acc_low_threshold:
+        if cfg.xrp_acc_entry_mode in EC.CONFIRM_MODES:
+            _ev = EC.evaluate(closes, live_price, rsi_wilder, mode=cfg.xrp_acc_entry_mode, period=cfg.xrp_acc_rsi_period,
+                              low=cfg.xrp_acc_low_threshold, level=cfg.xrp_acc_confirm_level, lookback=cfg.xrp_acc_confirm_lookback,
+                              ma_period=cfg.xrp_acc_confirm_ma_period, closed_only=cfg.xrp_acc_confirm_closed_only)
+            if not _ev["ok"]:
+                await _xrp_acc_log(tf, "nessun nuovo ingresso (" + _ev["reason"] + ")")
+                continue
+            if _ev["rsi"] is not None:
+                live_rsi = _ev["rsi"]
+        elif live_rsi > cfg.xrp_acc_low_threshold:
             await _xrp_acc_log(tf, "nessun nuovo ingresso sotto soglia bassa")
             continue
         tf_sec = TF_SECONDS.get(tf, 3600)

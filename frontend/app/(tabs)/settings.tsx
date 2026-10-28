@@ -517,6 +517,59 @@ export default function SettingsScreen() {
                 step={1}
                 testID="input-s3360-low"
               />
+              <Text style={styles.fieldLabel}>Come entrare</Text>
+              <View style={styles.chipsRow}>
+                {([["tocco", "Tocco soglia"], ["risale", "RSI risale"], ["incrocio", "Incrocio media"], ["entrambi", "Entrambi"]] as const).map(([m, lab]) => {
+                  const active = (cfg.s3360_entry_mode || "tocco") === m;
+                  return (
+                    <Pressable
+                      key={m}
+                      onPress={() => update({ s3360_entry_mode: m })}
+                      style={[styles.chip, active && styles.chipActive]}
+                      testID={`entry-mode-s3360-${m}`}
+                    >
+                      <Text style={[styles.chipText, active && styles.chipTextActive]}>{lab}</Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+              {(cfg.s3360_entry_mode || "tocco") !== "tocco" && (
+                <View>
+                  <NumRow
+                    label="Livello che l'RSI deve riconquistare"
+                    value={cfg.s3360_confirm_level}
+                    onChange={(v) => update({ s3360_confirm_level: v })}
+                    step={1}
+                    testID="input-s3360-confirm-level"
+                  />
+                  <NumRow
+                    label="Sotto la soglia bassa nelle ultime (candele)"
+                    value={cfg.s3360_confirm_lookback}
+                    onChange={(v) => update({ s3360_confirm_lookback: v })}
+                    step={1}
+                    testID="input-s3360-confirm-lookback"
+                  />
+                  <NumRow
+                    label="Periodo della media dell'RSI"
+                    value={cfg.s3360_confirm_ma_period}
+                    onChange={(v) => update({ s3360_confirm_ma_period: v })}
+                    step={1}
+                    testID="input-s3360-confirm-ma"
+                  />
+                  <ToggleRow
+                    label="Decidi solo a candela chiusa"
+                    value={cfg.s3360_confirm_closed_only}
+                    onChange={(v) => update({ s3360_confirm_closed_only: v })}
+                    testID="toggle-s3360-confirm-closed"
+                  />
+                  <Text style={styles.scoreHintText}>
+                    Ingresso a conferma: il bot compra solo dopo che l&apos;RSI, sceso sotto la soglia bassa, gira verso l&apos;alto.
+                    "RSI risale": passa sopra il livello scelto. "Incrocio media": incrocia al rialzo la sua media. "Entrambi": una delle due
+                    appena avvenuta e l&apos;altra gia&apos; vera. Con la decisione a candela chiusa il segnale non puo&apos; sparire,
+                    ma si entra un po&apos; piu&apos; tardi.
+                  </Text>
+                </View>
+              )}
               <NumRow
                 label="Soglia alta (uscita)"
                 value={cfg.s3360_high_threshold}
@@ -815,6 +868,59 @@ export default function SettingsScreen() {
                 step={1}
                 testID="input-xrp-acc-low"
               />
+              <Text style={styles.fieldLabel}>Come entrare</Text>
+              <View style={styles.chipsRow}>
+                {([["tocco", "Tocco soglia"], ["risale", "RSI risale"], ["incrocio", "Incrocio media"], ["entrambi", "Entrambi"]] as const).map(([m, lab]) => {
+                  const active = (cfg.xrp_acc_entry_mode || "tocco") === m;
+                  return (
+                    <Pressable
+                      key={m}
+                      onPress={() => update({ xrp_acc_entry_mode: m })}
+                      style={[styles.chip, active && styles.chipActive]}
+                      testID={`entry-mode-xrp-acc-${m}`}
+                    >
+                      <Text style={[styles.chipText, active && styles.chipTextActive]}>{lab}</Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+              {(cfg.xrp_acc_entry_mode || "tocco") !== "tocco" && (
+                <View>
+                  <NumRow
+                    label="Livello che l'RSI deve riconquistare"
+                    value={cfg.xrp_acc_confirm_level}
+                    onChange={(v) => update({ xrp_acc_confirm_level: v })}
+                    step={1}
+                    testID="input-xrp-acc-confirm-level"
+                  />
+                  <NumRow
+                    label="Sotto la soglia bassa nelle ultime (candele)"
+                    value={cfg.xrp_acc_confirm_lookback}
+                    onChange={(v) => update({ xrp_acc_confirm_lookback: v })}
+                    step={1}
+                    testID="input-xrp-acc-confirm-lookback"
+                  />
+                  <NumRow
+                    label="Periodo della media dell'RSI"
+                    value={cfg.xrp_acc_confirm_ma_period}
+                    onChange={(v) => update({ xrp_acc_confirm_ma_period: v })}
+                    step={1}
+                    testID="input-xrp-acc-confirm-ma"
+                  />
+                  <ToggleRow
+                    label="Decidi solo a candela chiusa"
+                    value={cfg.xrp_acc_confirm_closed_only}
+                    onChange={(v) => update({ xrp_acc_confirm_closed_only: v })}
+                    testID="toggle-xrp-acc-confirm-closed"
+                  />
+                  <Text style={styles.scoreHintText}>
+                    Ingresso a conferma: il bot compra solo dopo che l&apos;RSI, sceso sotto la soglia bassa, gira verso l&apos;alto.
+                    "RSI risale": passa sopra il livello scelto. "Incrocio media": incrocia al rialzo la sua media. "Entrambi": una delle due
+                    appena avvenuta e l&apos;altra gia&apos; vera. Con la decisione a candela chiusa il segnale non puo&apos; sparire,
+                    ma si entra un po&apos; piu&apos; tardi.
+                  </Text>
+                </View>
+              )}
               <NumRow
                 label="Soglia alta (uscita)"
                 value={cfg.xrp_acc_high_threshold}
