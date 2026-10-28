@@ -623,6 +623,7 @@ class PriceFeed:
             db.xrp_acc_positions,
             db.ict_positions,
             db.manual_setups,
+            db.ma_positions,
         ):
             rows = await coll.find({"status": "open"}, {"symbol": 1, "_id": 0}).to_list(1000)
             symbols |= {d["symbol"] for d in rows}
@@ -1975,6 +1976,7 @@ async def lifespan(_app: FastAPI):
     xrp_acc_monitor_task = asyncio.create_task(xrp_acc_monitor_loop())
     s3360_entry_task = asyncio.create_task(s3360_entry_loop())
     ict_monitor_task = asyncio.create_task(ict_monitor_loop())
+    ma_task = asyncio.create_task(ma_loop())
     manual_task = asyncio.create_task(manual_loop())
     ws_task = asyncio.create_task(price_feed.run())
     premature_task = asyncio.create_task(premature_stop_loop())
@@ -1984,6 +1986,7 @@ async def lifespan(_app: FastAPI):
     scan_task.cancel()
     monitor_task.cancel()
     ict_monitor_task.cancel()
+    ma_task.cancel()
     manual_task.cancel()
     s3360_entry_task.cancel()
     ws_task.cancel()
@@ -5268,6 +5271,215 @@ async def manual_close(sid: str) -> dict[str, Any]:
     cur = await _manual_price(p["symbol"]) or p["fill_price"]
     if not await _manual_close(p, cfg, "chiusura_manuale", cur, force=True):
         raise HTTPException(status_code=400, detail="Chiusura non riuscita: vedi il registro reale e riprova.")
+    return {"ok": True}
+
+
+# ============================================================================
+# MEDIE MOBILI — strategia a incrocio di medie (SIMULAZIONE, nessun soldo vero).
+# Compra quando la media veloce incrocia al rialzo quella lenta (sull'ultima candela CHIUSA),
+# vende quando la veloce scende sotto la lenta. Solo acquisti (spot), coppie USDC.
+# Le impostazioni si cambiano dalla pagina "Medie mobili" dell'app (non da Impostazioni).
+# Le regole di calcolo stanno in ma_logic.py.
+# ============================================================================
+try:
+    import ma_logic as MA
+except ImportError:  # pragma: no cover
+    from backend import ma_logic as MA
+
+_ma_lock = asyncio.Lock()
+_ma_candle_cache: dict[str, tuple[float, list[list[float]]]] = {}
+_ma_prefix = "ma_"
+
+
+async def _ma_price(symbol: str) -> Optional[float]:
+    try:
+        p = price_feed.get(symbol) or await price_feed.price_or_rest(symbol)
+    except Exception:  # noqa: BLE001
+        p = None
+    return float(p) if p and p > 0 else None
+
+
+async def _ma_get_cfg() -> dict[str, Any]:
+    doc = await db.ma_config.find_one({"_id": "ma_config"}, {"_id": 0}) or {}
+    out = dict(MA.DEFAULTS)
+    out.update({k: v for k, v in doc.items() if k in MA.DEFAULTS})
+    return out
+
+
+async def _ma_event(symbol: str, text: str) -> None:
+    try:
+        await db.ma_events.insert_one({"at": datetime.now(timezone.utc).isoformat(), "symbol": symbol, "text": text})
+        n = await db.ma_events.count_documents({})
+        if n > 150:
+            old = await db.ma_events.find({}, {"_id": 1}).sort("at", 1).to_list(n - 100)
+            await db.ma_events.delete_many({"_id": {"$in": [o["_id"] for o in old]}})
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _ma_candles(symbol: str, tf: str) -> list[list[float]]:
+    """Candele CHIUSE (la ancora in formazione e' gia' esclusa). Copia riusata per un po': cambiano solo a candela chiusa."""
+    key = f"{symbol}|{tf}"
+    now = time.time()
+    ttl = 60 if tf == "1h" else 180
+    c = _ma_candle_cache.get(key)
+    if c and c[1] and now - c[0] < ttl:
+        return c[1]
+    candles = await exchange.get_klines(symbol, tf, limit=500)
+    if candles:
+        _ma_candle_cache[key] = (now, candles)
+        return candles
+    if c and c[1] and now - c[0] < 1800:
+        return c[1]
+    return []
+
+
+async def _ma_analyze(symbol: str, tf: str, kind: str, fast: int, slow: int) -> tuple[dict[str, Any], float]:
+    candles = await _ma_candles(symbol, tf)
+    if not candles:
+        return {"ok": False, "reason": "candele non disponibili"}, 0.0
+    an = MA.analyze([c[2] for c in candles], kind, fast, slow)
+    return an, float(candles[-1][0])
+
+
+async def _ma_open(symbol: str, cfg: Config, mc: dict[str, Any], an: dict[str, Any], live: float) -> bool:
+    async with _ma_lock:
+        if await db.ma_positions.find_one({"symbol": symbol, "status": "open"}, {"_id": 1}):
+            return False
+        amount = float(mc["amount"])
+        fill_price, fill_info = await simulate_fill(symbol, "buy", live, cfg, quote_budget=amount)
+        now = datetime.now(timezone.utc)
+        doc = {"id": str(uuid.uuid4()), "symbol": symbol, "status": "open", "side": "long", "timeframe": mc["tf"],
+               "kind": mc["kind"], "fast": mc["fast"], "slow": mc["slow"], "stop_pct": mc["stop_pct"],
+               "entry": fill_price, "fill_price": fill_price, "fill_model": fill_info["fill_model"],
+               "entry_cost_pct": fill_info["cost_pct"], "notional": amount, "quantity": amount / fill_price,
+               "opened_at": now.isoformat(), "opened_ts": now.timestamp(),
+               "entry_fast": an.get("fast"), "entry_slow": an.get("slow")}
+        await db.ma_positions.insert_one(doc)
+        await _ma_event(symbol, "COMPRATO a %.6g (%s %d/%d su %s, importo %.2f)" % (fill_price, mc["kind"], mc["fast"], mc["slow"], mc["tf"], amount))
+        return True
+
+
+async def _ma_close(p: dict[str, Any], cfg: Config, reason: str, cur: float) -> bool:
+    async with _ma_lock:
+        fresh = await db.ma_positions.find_one({"id": p["id"], "status": "open"}, {"_id": 0})
+        if not fresh:
+            return False
+        sell_price, sell_info = await simulate_fill(p["symbol"], "sell", cur, cfg, base_qty=p["quantity"])
+        gross = (sell_price - p["fill_price"]) * p["quantity"]
+        fees = (p["notional"] + sell_price * p["quantity"]) * (cfg.sim_fee_pct / 100.0)
+        pnl = gross - fees
+        res = await db.ma_positions.update_one({"id": p["id"], "status": "open"}, {"$set": {
+            "status": "closed", "close_price": sell_price, "close_reason": reason, "close_last_price": cur,
+            "fee_pct": cfg.sim_fee_pct, "pnl_usdt": round(pnl, 4), "closed_at": datetime.now(timezone.utc).isoformat(),
+            "exit_fill_model": sell_info["fill_model"], "exit_cost_pct": sell_info["cost_pct"]}})
+        if res.modified_count:
+            await _ma_event(p["symbol"], "VENDUTO a %.6g (%s) risultato %+.2f" % (sell_price, reason.replace("_", " "), pnl))
+        return bool(res.modified_count)
+
+
+async def ma_pass() -> None:
+    cfg = await get_config()
+    mc = await _ma_get_cfg()
+    # 1) uscite: sempre sorvegliate, anche con la strategia spenta (con i parametri usati all'ingresso)
+    for p in await db.ma_positions.find({"status": "open"}, {"_id": 0}).to_list(50):
+        cur = await _ma_price(p["symbol"])
+        if cur is None:
+            continue
+        an, _ts = await _ma_analyze(p["symbol"], p["timeframe"], p["kind"], p["fast"], p["slow"])
+        hit = MA.exit_decision(an, cur, p["fill_price"], float(p.get("stop_pct") or 0.0))
+        if hit:
+            await _ma_close(p, cfg, hit, cur)
+    # 2) ingressi: solo con la strategia accesa
+    if not mc["enabled"]:
+        return
+    open_rows = await db.ma_positions.find({"status": "open"}, {"symbol": 1, "_id": 0}).to_list(50)
+    open_syms = {r["symbol"] for r in open_rows}
+    for sym in mc["symbols"]:
+        an, cand_ts = await _ma_analyze(sym, mc["tf"], mc["kind"], mc["fast"], mc["slow"])
+        if not an.get("ok") or an["cross"] != "up":
+            continue
+        st = await db.ma_state.find_one({"_id": sym + "|" + mc["tf"] + "|" + mc["kind"] + str(mc["fast"]) + "/" + str(mc["slow"])}) or {}
+        last_done = float(st.get("ts", 0.0))
+        act, why = MA.entry_decision(an, cand_ts, last_done, len(open_syms), int(mc["max_positions"]), sym in open_syms)
+        if act == "skip" and why == "incrocio gia' valutato":
+            continue
+        await db.ma_state.update_one({"_id": sym + "|" + mc["tf"] + "|" + mc["kind"] + str(mc["fast"]) + "/" + str(mc["slow"])},
+                                     {"$set": {"ts": cand_ts}}, upsert=True)
+        if act != "buy":
+            await _ma_event(sym, "Incrocio al rialzo ma non compro: " + why)
+            continue
+        live = await _ma_price(sym)
+        if live is None:
+            await _ma_event(sym, "Incrocio al rialzo ma prezzo non disponibile: salto")
+            continue
+        if await _ma_open(sym, cfg, mc, an, live):
+            open_syms.add(sym)
+
+
+async def ma_loop() -> None:
+    await asyncio.sleep(16)
+    while True:
+        try:
+            await ma_pass()
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Medie mobili: errore nel ciclo: %s", e)
+        await asyncio.sleep(5)
+
+
+@api.get("/ma/status")
+async def ma_status() -> dict[str, Any]:
+    cfg = await get_config()
+    mc = await _ma_get_cfg()
+    open_docs = await db.ma_positions.find({"status": "open"}, {"_id": 0}).sort("opened_at", -1).to_list(50)
+    open_syms = {p["symbol"] for p in open_docs}
+    coins = []
+    for sym in mc["symbols"]:
+        row: dict[str, Any] = {"symbol": sym, "in_position": sym in open_syms, "price": await _ma_price(sym)}
+        an, _ = await _ma_analyze(sym, mc["tf"], mc["kind"], mc["fast"], mc["slow"])
+        if an.get("ok"):
+            row.update({"fast": an["fast"], "slow": an["slow"], "above": an["above"], "dist_pct": round(an["dist_pct"], 2), "cross": an["cross"]})
+        else:
+            row["note"] = an.get("reason", "")
+        coins.append(row)
+    o_out = []
+    for p in open_docs:
+        cur = await _ma_price(p["symbol"]) or p["fill_price"]
+        val = cur * p["quantity"]
+        fl = val - p["notional"] - (p["notional"] + val) * (cfg.sim_fee_pct / 100.0)
+        o_out.append({**p, "current_price": cur, "floating_pnl": round(fl, 4)})
+    closed = await db.ma_positions.find({"status": "closed"}, {"_id": 0}).sort("closed_at", -1).to_list(60)
+    all_closed = await db.ma_positions.find({"status": "closed"}, {"pnl_usdt": 1, "_id": 0}).to_list(5000)
+    events = await db.ma_events.find({}, {"_id": 0}).sort("at", -1).to_list(25)
+    return {"config": mc, "coins": coins, "open": o_out, "closed": closed, "events": events,
+            "trades": len(all_closed), "wins": sum(1 for c in all_closed if c.get("pnl_usdt", 0) > 0),
+            "realized": round(sum(c.get("pnl_usdt", 0.0) for c in all_closed), 4)}
+
+
+@api.post("/ma/config")
+async def ma_set_config(body: dict[str, Any]) -> dict[str, Any]:
+    cur = await _ma_get_cfg()
+    try:
+        new = MA.clean_config(body, cur)
+    except ValueError as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    if new["symbols"] != cur["symbols"]:
+        for s in new["symbols"]:
+            if await _ma_price(s) is None:
+                raise HTTPException(status_code=400, detail="Non trovo il prezzo di %s su Bybit: controlla il nome (esempio BTCUSDC)." % s)
+    await db.ma_config.update_one({"_id": "ma_config"}, {"$set": new}, upsert=True)
+    return {"ok": True, "config": new}
+
+
+@api.post("/ma/close/{pid}")
+async def ma_close_now(pid: str) -> dict[str, Any]:
+    cfg = await get_config()
+    p = await db.ma_positions.find_one({"id": pid, "status": "open"}, {"_id": 0})
+    if not p:
+        raise HTTPException(status_code=404, detail="Nessuna posizione aperta con questo codice.")
+    cur = await _ma_price(p["symbol"]) or p["fill_price"]
+    if not await _ma_close(p, cfg, "chiusura_manuale", cur):
+        raise HTTPException(status_code=400, detail="Chiusura non riuscita, riprova.")
     return {"ok": True}
 
 

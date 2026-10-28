@@ -734,6 +734,28 @@ export const manualApi = {
   close: (id: string) => req<{ ok: boolean }>("/manual/close/" + id, { method: "POST" }),
 };
 
+export type MaConfig = {
+  enabled: boolean; kind: "SMA" | "EMA"; tf: "1h" | "4h" | "1d"; fast: number; slow: number;
+  amount: number; max_positions: number; stop_pct: number; symbols: string[];
+};
+export type MaCoin = {
+  symbol: string; in_position: boolean; price: number | null; fast?: number; slow?: number;
+  above?: boolean; dist_pct?: number; cross?: "up" | "down" | null; note?: string;
+};
+export type MaRow = {
+  id: string; symbol: string; status: string; timeframe: string; kind: string; fast: number; slow: number;
+  fill_price: number; notional: number; current_price?: number; floating_pnl?: number;
+  pnl_usdt?: number; close_price?: number; close_reason?: string; opened_at?: string; closed_at?: string;
+};
+export type MaStatus = {
+  config: MaConfig; coins: MaCoin[]; open: MaRow[]; closed: MaRow[];
+  events: { at: string; symbol: string; text: string }[]; trades: number; wins: number; realized: number;
+};
+export const maApi = {
+  status: () => req<MaStatus>("/ma/status"),
+  setConfig: (c: Partial<MaConfig>) => req<{ ok: boolean; config: MaConfig }>("/ma/config", { method: "POST", body: JSON.stringify(c) }),
+  close: (id: string) => req<{ ok: boolean }>("/ma/close/" + id, { method: "POST" }),
+};
 export const realApi = {
   diagnosi: () => req<RealDiagnosi>("/real/diagnosi"),
   status: () => req<RealStatus>("/real/status"),

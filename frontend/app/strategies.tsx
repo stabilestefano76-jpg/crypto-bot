@@ -49,6 +49,13 @@ const STRATEGIES: StrategyEntry[] = [
     route: "/manual",
   },
   {
+    key: "ma",
+    title: "Medie mobili",
+    subtitle: "Compra all'incrocio delle medie, vende quando si incrociano al ribasso (simulazione)",
+    icon: "analytics",
+    route: "/ma",
+  },
+  {
     key: "real",
     title: "Trading reale",
     subtitle: "Soldi veri su Bybit: interruttore, limiti e STOP",
