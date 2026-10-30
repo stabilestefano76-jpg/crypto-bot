@@ -182,6 +182,7 @@ class Config(BaseModel):
     s3360_rsi_giveback_enabled: bool = False  # extra exit: once the RSI has been above s3360_rsi_arm, selling as soon as it falls back below s3360_rsi_giveback — at ANY price, ignoring the minimum net profit / break-even rules
     s3360_rsi_arm: float = 52.0
     s3360_rsi_giveback: float = 50.0
+    s3360_rsi_arm_closed_only: bool = True  # l'uscita 'RSI di ritorno' si arma solo con l'RSI di una candela CHIUSA (non con un picco di pochi secondi)
     s3360_entry_mode: str = "tocco"  # tocco | risale | incrocio | entrambi (ingresso a conferma)
     s3360_confirm_level: float = 30.0  # livello che l'RSI deve riconquistare (modalita risale / entrambi)
     s3360_confirm_lookback: int = 5  # l'RSI deve essere stato sotto la soglia bassa in queste ultime candele
@@ -3849,6 +3850,20 @@ async def open_s3360_position(symbol: str, tf: str, signal: dict[str, Any], cfg:
     )
 
 
+async def _s3360_exit_diag(p: dict[str, Any], tf: str, hit: str, cur: float, diag: dict[str, Any]) -> None:
+    """Dopo la chiusura: salva l'RSI al momento dell'uscita e, per l'uscita 'RSI di ritorno', scrive nel Registro segnali
+    quando e con quale RSI si era armata. Non deve mai disturbare la chiusura."""
+    try:
+        await db.s3360_positions.update_one({"id": p["id"]}, {"$set": diag})
+        if hit == "rsi_ritorno":
+            how = p.get("rsi_armed_how") or "?"
+            v = p.get("rsi_armed_value")
+            await _s3360_event(p["symbol"], tf, diag.get("exit_rsi_live") or 0.0, cur, time.time(),
+                               "USCITA RSI di ritorno: RSI ora %s, armata %s con RSI %s" % (diag.get("exit_rsi_live"), how, v))
+    except Exception:  # noqa: BLE001
+        pass
+
+
 _s3360_hold_log_at: dict[str, float] = {}
 
 
@@ -3889,11 +3904,29 @@ async def monitor_s3360_positions() -> None:
         # Uscita extra "RSI di ritorno": dopo che l'RSI ha superato s3360_rsi_arm la posizione e' 'armata';
         # se poi l'RSI scende sotto s3360_rsi_giveback si esce (stesso pavimento delle altre uscite).
         giveback_hit = False
+        _gb_diag: dict[str, Any] = {"exit_rsi_live": round(float(rsis[-1]), 2) if rsis and rsis[-1] is not None else None}
         if cfg.s3360_rsi_giveback_enabled and rsis and tf in cfg.s3360_rsi_giveback_timeframes:
-            if not p.get("rsi_armed") and rsis[-1] > cfg.s3360_rsi_arm:
-                p["rsi_armed"] = True
-                await db.s3360_positions.update_one({"id": p["id"]}, {"$set": {"rsi_armed": True}})
-            giveback_hit = bool(p.get("rsi_armed")) and rsis[-1] < cfg.s3360_rsi_giveback
+            if not p.get("rsi_armed"):
+                _arm_rsi, _arm_how = None, ""
+                if cfg.s3360_rsi_arm_closed_only:
+                    # Si arma solo con l'RSI di una candela CHIUSA dopo l'apertura: un picco di pochi secondi dentro la candela non basta.
+                    try:
+                        _opened_ts = datetime.fromisoformat(p["opened_at"]).timestamp()
+                    except Exception:  # noqa: BLE001
+                        _opened_ts = 0.0
+                    if (len(rsis) >= 2 and rsis[-2] is not None and candles
+                            and candles[-1][0] + TF_SECONDS.get(tf, 3600) > _opened_ts and rsis[-2] > cfg.s3360_rsi_arm):
+                        _arm_rsi, _arm_how = float(rsis[-2]), "a candela chiusa"
+                elif rsis[-1] is not None and rsis[-1] > cfg.s3360_rsi_arm:
+                    _arm_rsi, _arm_how = float(rsis[-1]), "live"
+                if _arm_rsi is not None:
+                    _arm_doc = {"rsi_armed": True, "rsi_armed_at": datetime.now(timezone.utc).isoformat(),
+                                "rsi_armed_value": round(_arm_rsi, 2), "rsi_armed_how": _arm_how, "rsi_armed_price": cur}
+                    p.update(_arm_doc)
+                    await db.s3360_positions.update_one({"id": p["id"]}, {"$set": _arm_doc})
+                    await _s3360_event(p["symbol"], tf, _arm_rsi, cur, candles[-1][0] if candles else 0.0,
+                                       "RSI di ritorno ARMATO (%s, soglia %g)" % (_arm_how, cfg.s3360_rsi_arm))
+            giveback_hit = bool(p.get("rsi_armed")) and rsis[-1] is not None and rsis[-1] < cfg.s3360_rsi_giveback
 
         fill = p.get("fill_price", p["entry"])
         margin_price = required_exit_price(fill, cfg.s3360_min_net_profit_pct, cfg.sim_fee_pct)
@@ -3980,6 +4013,7 @@ async def monitor_s3360_positions() -> None:
                 "real_exit": {k: v for k, v in sell.items() if k != "dust"},
             }})
             await close_track(p["id"], cur)
+            await _s3360_exit_diag(p, tf, hit, cur, _gb_diag)
             continue
         if cfg.sim_realistic_fills and not book_recheck_due(p["id"]):
             continue
@@ -4012,6 +4046,7 @@ async def monitor_s3360_positions() -> None:
             }},
         )
         await close_track(p["id"], cur)
+        await _s3360_exit_diag(p, tf, hit, cur, _gb_diag)
 
 
 class S3360TransferRequest(BaseModel):

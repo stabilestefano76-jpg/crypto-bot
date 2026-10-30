@@ -760,6 +760,11 @@ export default function SettingsScreen() {
                 testID="toggle-s3360-rsi-giveback"
               />
               <Text style={styles.fieldLabel}>Timeframe su cui vale questa uscita</Text>
+              {cfg.s3360_rsi_giveback_enabled && (cfg.s3360_rsi_giveback_timeframes || []).length === 0 && (
+                <Text style={[styles.scoreHintText, { color: "#f0b429" }]}>
+                  Attenzione: nessun timeframe selezionato, quindi questa uscita non vale su niente.
+                </Text>
+              )}
               <View style={styles.chipsRow}>
                 {TIMEFRAMES_30M.map((t) => {
                   const active = (cfg.s3360_rsi_giveback_timeframes || []).includes(t);
@@ -782,6 +787,16 @@ export default function SettingsScreen() {
                 step={1}
                 testID="input-s3360-rsi-arm"
               />
+              <ToggleRow
+                label="Arma l'uscita solo a candela chiusa (consigliato)"
+                value={cfg.s3360_rsi_arm_closed_only !== false}
+                onChange={(v) => update({ s3360_rsi_arm_closed_only: v })}
+                testID="toggle-s3360-rsi-arm-closed"
+              />
+              <Text style={styles.scoreHintText}>
+                Acceso: l&apos;uscita si arma solo se l&apos;RSI a fine candela supera la soglia. Un picco di pochi secondi dentro
+                la candela non basta piu&apos;. Spento: si arma anche con un picco momentaneo.
+              </Text>
               <NumRow
                 label="Chiudi se l'RSI scende sotto"
                 value={cfg.s3360_rsi_giveback}

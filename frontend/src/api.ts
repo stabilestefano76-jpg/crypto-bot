@@ -139,6 +139,7 @@ export type Config = {
   s3360_rsi_giveback_enabled: boolean;
   s3360_rsi_arm: number;
   s3360_rsi_giveback: number;
+  s3360_rsi_arm_closed_only: boolean;
   s3360_post_target_trailing_enabled: boolean;
   s3360_post_target_trailing_pct: number;
   s3360_post_target_trailing_timeframes: string[];
