@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { ActivityIndicator, Alert, Pressable, ScrollView, StyleSheet, Switch, Text, View } from "react-native";
+import { ActivityIndicator, Alert, Pressable, ScrollView, StyleSheet, Switch, Text, TextInput, View } from "react-native";
 import { useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
@@ -23,10 +23,13 @@ export default function RealScreen() {
   const [busy, setBusy] = useState(false);
   const [dg, setDg] = useState<RealDiagnosi | null>(null);
   const [sg, setSg] = useState<S3360Signal[]>([]);
+  const [lim, setLim] = useState<{ o: string; t: string; d: string } | null>(null);
 
   const load = useCallback(async () => {
     try {
-      setSt(await realApi.status());
+      const s0 = await realApi.status();
+      setSt(s0);
+      setLim((cur) => cur ?? { o: String(s0.max_order), t: String(s0.max_total), d: String(s0.daily_loss_limit) });
       try {
         setDg(await realApi.diagnosi());
       } catch {}
@@ -54,6 +57,23 @@ export default function RealScreen() {
       setBusy(false);
       load();
     }
+  };
+
+  const saveLimits = () => {
+    if (!lim) return;
+    const num = (x: string) => Number(String(x).replace(",", "."));
+    const patch = { real_max_order_usdc: num(lim.o), real_max_total_usdc: num(lim.t), real_daily_loss_usdc: num(lim.d) };
+    if (Object.values(patch).some((x) => !isFinite(x) || x <= 0)) {
+      setMsg("ERRORE: scrivi numeri maggiori di zero.");
+      return;
+    }
+    const raising =
+      patch.real_max_order_usdc > (st?.max_order ?? 0) ||
+      patch.real_max_total_usdc > (st?.max_total ?? 0) ||
+      patch.real_daily_loss_usdc > (st?.daily_loss_limit ?? 0);
+    const go = () => run(() => realApi.save(patch), () => "Limiti salvati.");
+    if (raising) ask("Alzare i limiti?", "Il bot potra' usare piu' soldi veri e rischiare una perdita piu' alta in un giorno.", "Salva", go);
+    else go();
   };
 
   if (!st)
@@ -92,9 +112,16 @@ export default function RealScreen() {
 
         <View style={styles.card}>
           <Text style={styles.big}>Limiti</Text>
-          <Text style={styles.line}>Per ogni operazione: massimo {money(st.max_order)}</Text>
-          <Text style={styles.line}>Totale in gioco: massimo {money(st.max_total)} (ora {money(st.exposure)})</Text>
-          <Text style={styles.line}>Perdita massima al giorno: {money(st.daily_loss_limit)} (oggi {st.daily_pnl.toFixed(2)})</Text>
+          <Text style={styles.note}>Per ogni operazione: massimo (USDC)</Text>
+          <TextInput style={styles.limInput} value={lim?.o ?? ""} onChangeText={(v) => setLim((c) => (c ? { ...c, o: v } : c))} keyboardType="decimal-pad" testID="lim-order" />
+          <Text style={styles.note}>Totale in gioco: massimo (USDC) · ora {money(st.exposure)}</Text>
+          <TextInput style={styles.limInput} value={lim?.t ?? ""} onChangeText={(v) => setLim((c) => (c ? { ...c, t: v } : c))} keyboardType="decimal-pad" testID="lim-total" />
+          <Text style={styles.note}>Perdita massima al giorno (USDC) · oggi {st.daily_pnl.toFixed(2)}</Text>
+          <TextInput style={styles.limInput} value={lim?.d ?? ""} onChangeText={(v) => setLim((c) => (c ? { ...c, d: v } : c))} keyboardType="decimal-pad" testID="lim-daily" />
+          <Pressable style={[styles.btn, { marginTop: spacing.md, marginBottom: 0, opacity: busy ? 0.4 : 1 }]} disabled={busy} onPress={saveLimits}>
+            <Text style={styles.btnText}>Salva limiti</Text>
+          </Pressable>
+          <Text style={styles.note}>Massimi consentiti: 100 per operazione, 200 in totale, 50 di perdita al giorno.</Text>
         </View>
 
         <View style={styles.card}>
@@ -145,7 +172,7 @@ export default function RealScreen() {
               }
             />
           </View>
-          <Text style={styles.note}>Il reale lavora solo se TUTTI e due sono accesi. Ricorda di mettere i soldi nel portafoglio di 33/60 (Deposita): e' il budget che il bot puo' usare.</Text>
+          <Text style={styles.note}>Il reale lavora solo se TUTTI e due sono accesi. Ricorda di mettere i soldi nel portafoglio della strategia (Deposita): e' il budget che il bot puo' usare.</Text>
         </View>
 
         <Pressable
@@ -244,4 +271,5 @@ const styles = StyleSheet.create({
   btnText: { color: colors.onBrand, fontWeight: "700", fontSize: font.base },
   msg: { color: colors.warning, fontSize: font.base, marginTop: spacing.sm },
   log: { color: colors.onSurfaceSecondary, fontSize: font.sm, marginTop: spacing.xs },
+  limInput: { backgroundColor: colors.surfaceTertiary, color: colors.onSurface, borderRadius: radius.md, padding: spacing.md, marginTop: spacing.xs, fontSize: font.base },
 });
