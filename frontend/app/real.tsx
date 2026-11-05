@@ -65,6 +65,7 @@ export default function RealScreen() {
 
   const live = st.live_strategies.includes("s3360");
   const liveIct = st.live_strategies.includes("ict");
+  const liveXrp = st.live_strategies.includes("xrp_acc");
   const toggleLive = (key: string, on: boolean) => {
     const rest = st.live_strategies.filter((x) => x !== key);
     return on ? [...rest, key] : rest;
@@ -81,9 +82,9 @@ export default function RealScreen() {
         <View style={{ width: 26 }} />
       </View>
       <ScrollView contentContainerStyle={{ padding: spacing.lg, paddingBottom: 60 }}>
-        <View style={[styles.card, { borderColor: st.enabled && (live || liveIct) ? colors.error : colors.border }]}>
-          <Text style={styles.big}>{st.enabled && (live || liveIct)
-              ? "REALE ACCESO su " + [live ? "33/60" : "", liveIct ? "ICT" : ""].filter(Boolean).join(" + ")
+        <View style={[styles.card, { borderColor: st.enabled && (live || liveIct || liveXrp) ? colors.error : colors.border }]}>
+          <Text style={styles.big}>{st.enabled && (live || liveIct || liveXrp)
+              ? "REALE ACCESO su " + [live ? "33/60" : "", liveIct ? "ICT" : "", liveXrp ? "XRP Accumulation" : ""].filter(Boolean).join(" + ")
               : "Reale spento (solo simulazione)"}</Text>
           <Text style={styles.line}>{st.password_active ? "✓ Password di accesso attiva" : "✗ Password di accesso NON attiva (serve BOT_ACCESS_KEY su Railway)"}</Text>
           <Text style={styles.line}>{st.key_connected ? "✓ Chiave Bybit collegata" : "✗ Chiave Bybit non collegata"}</Text>
@@ -128,6 +129,19 @@ export default function RealScreen() {
                   ? ask("ICT con soldi veri?", "ICT e' sperimentale e NON e' stata dimostrata dai test. Usa soldi veri entro i limiti indicati.", "Accendi", () =>
                       run(() => realApi.save({ live_strategies: toggleLive("ict", true) })))
                   : run(() => realApi.save({ live_strategies: toggleLive("ict", false) }))
+              }
+            />
+          </View>
+          <View style={styles.row}>
+            <Text style={styles.big}>XRP Accumulation con soldi veri</Text>
+            <Switch
+              value={liveXrp}
+              disabled={busy}
+              onValueChange={(v) =>
+                v
+                  ? ask("XRP Accumulation con soldi veri?", "Compra XRP quando l'RSI e' basso e al target vende SOLO la parte che riporta il capitale: il guadagno resta in XRP. Senza stop: se l'RSI non risale, l'XRP resta in conto. Usa soldi veri entro i limiti indicati.", "Accendi", () =>
+                      run(() => realApi.save({ live_strategies: toggleLive("xrp_acc", true) })))
+                  : run(() => realApi.save({ live_strategies: toggleLive("xrp_acc", false) }))
               }
             />
           </View>

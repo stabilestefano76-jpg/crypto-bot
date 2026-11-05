@@ -4239,7 +4239,7 @@ except ImportError:  # pragma: no cover
 REAL_HARD_MAX_ORDER = 100.0    # nessuna impostazione puo' superare questi tetti
 REAL_HARD_MAX_TOTAL = 200.0
 REAL_HARD_MAX_DAILY_LOSS = 50.0
-REAL_ALLOWED_STRATEGIES = ("s3360", "ict")
+REAL_ALLOWED_STRATEGIES = ("s3360", "ict", "xrp_acc")
 REAL_SETTING_KEYS = ("real_trading_enabled", "real_max_order_usdc", "real_max_total_usdc",
                      "real_daily_loss_usdc", "live_strategies")
 
@@ -4324,6 +4324,9 @@ async def real_daily_pnl() -> float:
     rows += await db.manual_setups.find(
         {"status": "closed", "real": {"$exists": True}, "closed_at": {"$gte": start}}, {"pnl_usdt": 1, "_id": 0}
     ).to_list(1000)
+    rows += await db.xrp_acc_positions.find(
+        {"status": "closed", "real": {"$exists": True}, "closed_at": {"$gte": start}}, {"pnl_usdt": 1, "_id": 0}
+    ).to_list(1000)
     extra = await db.real_roundtrips.find({"at": {"$gte": start}}, {"pnl": 1, "_id": 0}).to_list(1000)
     return float(sum(r.get("pnl_usdt", 0.0) for r in rows) + sum(r.get("pnl", 0.0) for r in extra))
 
@@ -4332,6 +4335,7 @@ async def real_open_exposure() -> float:
     rows = await db.s3360_positions.find({"status": "open", "real": {"$exists": True}}, {"notional": 1, "_id": 0}).to_list(500)
     rows += await db.ict_positions.find({"status": "open", "real": {"$exists": True}}, {"notional": 1, "_id": 0}).to_list(500)
     rows += await db.manual_setups.find({"status": "open", "real": {"$exists": True}}, {"notional": 1, "_id": 0}).to_list(500)
+    rows += await db.xrp_acc_positions.find({"status": "open", "real": {"$exists": True}}, {"notional": 1, "_id": 0}).to_list(50)
     return float(sum(r.get("notional", 0.0) for r in rows))
 
 
@@ -4502,6 +4506,7 @@ async def real_status() -> dict[str, Any]:
     open_rows = await db.s3360_positions.find({"status": "open", "real": {"$exists": True}}, {"_id": 0}).to_list(50)
     open_rows += await db.ict_positions.find({"status": "open", "real": {"$exists": True}}, {"_id": 0}).to_list(50)
     open_rows += await db.manual_setups.find({"status": "open", "real": {"$exists": True}}, {"_id": 0}).to_list(50)
+    open_rows += await db.xrp_acc_positions.find({"status": "open", "real": {"$exists": True}}, {"_id": 0}).to_list(50)
     return {
         "enabled": cfg.real_trading_enabled,
         "live_strategies": cfg.live_strategies,
@@ -4641,6 +4646,9 @@ async def real_close_all() -> dict[str, Any]:
         await close_track(p["id"], cur)
         done += 1
     d2, f2 = await _ict_close_all_real()
+    dx, fx = await _xrp_close_all_real()
+    done += dx
+    failed += fx
     d3, f3 = await _manual_close_all_real()
     return {"chiuse": done + d2 + d3, "non_riuscite": failed + f2 + f3}
 
@@ -4796,10 +4804,27 @@ async def run_xrp_acc_scan() -> None:
                 continue
         _xrp_acc_last_candle[tf] = forming_candle_t
 
-        # Paper fill at the real ask (walking the book if needed) instead of
-        # the last traded price.
-        fill_price, fill_info = await simulate_fill(XRP_ACC_SYMBOL, "buy", live_price, cfg, quote_budget=cash)
-        quantity = cash / fill_price
+        # Reale (solo se "xrp_acc" e' tra le strategie con soldi veri) oppure simulazione.
+        mode, why_real = await real_guard(cfg, "xrp_acc")
+        if mode == "blocked":
+            await log_reject(XRP_ACC_SYMBOL, tf, "xrp_acc", f"reale bloccato: {why_real}")
+            return
+        real_info = None
+        notional = cash
+        if mode == "real":
+            rb = await real_open_buy(XRP_ACC_SYMBOL, cash, cfg, "xrp", cash_cap=cash)
+            if not rb:
+                await log_reject(XRP_ACC_SYMBOL, tf, "xrp_acc", "ordine reale non eseguito (vedi registro reale)")
+                return
+            real_info = rb
+            notional = rb["value"]
+            fill_price = rb["avg_price"]
+            fill_info = {"fill_model": "reale", "cost_pct": 0.0, "spread_pct": None}
+            quantity = rb["net_qty"]
+        else:
+            # Paper fill at the real ask (walking the book if needed) instead of the last traded price.
+            fill_price, fill_info = await simulate_fill(XRP_ACC_SYMBOL, "buy", live_price, cfg, quote_budget=cash)
+            quantity = cash / fill_price
         doc = {
             "id": str(uuid.uuid4()),
             "symbol": XRP_ACC_SYMBOL,
@@ -4812,15 +4837,52 @@ async def run_xrp_acc_scan() -> None:
             "spread_pct": fill_info.get("spread_pct"),
             "rsi_at_entry": live_rsi,
             "quantity": quantity,
-            "notional": cash,
+            "notional": notional,
             "status": "open",
             "opened_at": datetime.now(timezone.utc).isoformat(),
         }
+        if real_info:
+            doc["real"] = {k: real_info[k] for k in ("order_id", "link_id", "net_qty", "fee_base", "fee_quote", "qty")}
         await db.xrp_acc_positions.insert_one(dict(doc))
         await db.xrp_acc_wallet.update_one(
-            {"_id": XRP_ACC_WALLET_ID}, {"$inc": {"cash": -cash}}, upsert=True
+            {"_id": XRP_ACC_WALLET_ID}, {"$inc": {"cash": -notional}}, upsert=True
         )
         break
+
+
+async def _xrp_acc_finish_real(p: dict[str, Any], sell: dict[str, Any], total_qty: float, reason: str, cur: float, cfg: Config) -> None:
+    """Contabilita' di una vendita vera: il capitale torna in cassa, l'XRP NON venduto (il guadagno) entra nel gruzzolo permanente."""
+    if sell.get("dust"):
+        sold_qty, net_value, avg = 0.0, 0.0, float(sell.get("avg_price") or cur)
+    else:
+        sold_qty, net_value, avg = float(sell.get("qty") or 0.0), float(sell["net_value"]), float(sell["avg_price"])
+    remaining = max(0.0, total_qty - sold_qty)
+    cash_back = min(net_value, p["notional"])
+    profit_usdt = net_value + remaining * avg - p["notional"]
+    await db.xrp_acc_wallet.update_one({"_id": XRP_ACC_WALLET_ID}, {"$inc": {"cash": cash_back, "permanent_xrp": remaining}}, upsert=True)
+    await db.xrp_acc_positions.update_one({"id": p["id"]}, {"$set": {
+        "status": "closed", "close_price": avg, "close_reason": reason, "close_last_price": cur,
+        "exit_fill_model": "reale", "fee_pct": cfg.sim_fee_pct,
+        "profit_usdt": round(profit_usdt, 4), "pnl_usdt": round(profit_usdt, 4), "profit_xrp": round(remaining, 6),
+        "closed_at": datetime.now(timezone.utc).isoformat(),
+        "real_exit": {k: v for k, v in sell.items() if k != "dust"},
+    }})
+    await close_track(p["id"], cur)
+
+
+async def _xrp_close_all_real() -> tuple[int, int]:
+    """STOP / chiudi tutto: vende subito tutta la posizione reale di XRP Accumulation."""
+    cfg = await get_config()
+    done, failed = 0, 0
+    for p in await db.xrp_acc_positions.find({"status": "open", "real": {"$exists": True}}, {"_id": 0}).to_list(5):
+        sell = await real_close_position(p, cfg, "chiudi")
+        if not sell:
+            failed += 1
+            continue
+        total = float((p.get("real") or {}).get("net_qty") or p["quantity"])
+        await _xrp_acc_finish_real(p, sell, total, "chiusura_manuale_reale", sell.get("avg_price") or p["fill_price"], cfg)
+        done += 1
+    return done, failed
 
 
 _xrp_acc_hold_log_at: dict[str, float] = {}
@@ -4887,6 +4949,31 @@ async def monitor_xrp_acc_positions() -> None:
         # The last price clears the floor; now ask what a market sell would
         # REALLY get (best bid / depth). With the simulation off this is `cur`
         # and costs no request. The book is read at most every 10s.
+        if p.get("real"):
+            # Vendita VERA. Prima il libro ordini (come la 33/60): se il prezzo realistico e' sotto il minimo, attendo.
+            if cfg.xrp_acc_hold_below_entry and floor_price > 0 and cfg.sim_realistic_fills:
+                if not book_recheck_due(p["id"]):
+                    continue
+                est_price, _est = await simulate_fill(p["symbol"], "sell", cur, cfg, base_qty=p["quantity"])
+                if est_price < floor_price:
+                    await _xrp_acc_hold_log(p, "Vendita reale: il prezzo realistico dal libro ordini e' sotto il minimo: attendo")
+                    continue
+            if not real_sell_due(p["id"]):
+                continue
+            total_qty = float((p.get("real") or {}).get("net_qty") or p["quantity"])
+            fee_k = 1.0 - cfg.sim_fee_pct / 100.0
+            sell_p = dict(p)
+            if cur * total_qty * fee_k > p["notional"] * 1.003:
+                # c'e' guadagno: vendo SOLO la parte che riporta il capitale (+0,4% di margine); il resto resta in XRP
+                part = min(total_qty, p["notional"] * 1.004 / (cur * fee_k))
+                sell_p["real"] = {**(p.get("real") or {}), "net_qty": part}
+                sell_p["quantity"] = part
+            sell = await real_close_position(sell_p, cfg, "xrpx")
+            if not sell:
+                await rlog(f"Vendita reale XRP Accumulation non riuscita, riprovo tra 30 s", "errore")
+                continue
+            await _xrp_acc_finish_real(p, sell, total_qty, hit, cur, cfg)
+            continue
         if cfg.sim_realistic_fills and not book_recheck_due(p["id"]):
             continue
         sell_price, sell_info = await simulate_fill(p["symbol"], "sell", cur, cfg, base_qty=p["quantity"])
