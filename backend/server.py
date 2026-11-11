@@ -3795,6 +3795,10 @@ async def open_s3360_position(symbol: str, tf: str, signal: dict[str, Any], cfg:
     notional = min((equity / slots) * await get_regime_size_multiplier(cfg), cash)
     if notional < 1.0:
         return
+    _pc_mode = "real" if (await real_guard(cfg, "s3360"))[0] == "real" else "paper"
+    _pc_ok, _pc_why, notional = await precheck_entry(symbol, tf, notional, cfg, _pc_mode, "s3360")
+    if not _pc_ok or notional < 1.0:
+        return
     # Paper fill at the real ask (walking the book if the order is bigger than
     # the first level) instead of the last traded price.
     mode, why = await real_guard(cfg, "s3360")
@@ -4498,6 +4502,71 @@ def _clamp_real_settings(new_cfg: Config) -> None:
             raise HTTPException(status_code=400, detail=f"La strategia '{s}' non e' ancora collegabile al reale")
 
 
+# ============================================================================
+# CONTROLLO PRIMA DI ENTRARE: costi coperti, rischio/rendimento, libro ordini, perdita massima.
+# Se non passa, il bot NON compra e scrive il motivo in "Diagnosi: perche' non apre?".
+# Le regole di calcolo stanno in pre_entry_check.py.
+# ============================================================================
+try:
+    import pre_entry_check as PEC
+except ImportError:  # pragma: no cover
+    from backend import pre_entry_check as PEC
+
+
+async def precheck_settings() -> dict[str, Any]:
+    doc = await db.precheck_config.find_one({"_id": "main"}, {"_id": 0})
+    return PEC.clean_settings(doc)
+
+
+async def precheck_entry(symbol: str, tf: Optional[str], notional: float, cfg: Config, mode: str, strategy: str,
+                         *, stop: Optional[float] = None, target: Optional[float] = None,
+                         use_max_loss: bool = True) -> tuple[bool, Optional[str], float]:
+    """(ok, motivo, importo). Con un errore interno NON blocca (e scrive il problema nel diagnostico)."""
+    try:
+        s = await precheck_settings()
+        if not s["enabled"] or (mode != "real" and not s["also_paper"]):
+            return True, None, notional
+        price = price_feed.get(symbol) or await price_feed.price_or_rest(symbol)
+        if not price:
+            return True, None, notional
+        if (stop is None or target is None) and tf:
+            candles = await exchange.get_klines(symbol, tf)
+            highs = [c[3] for c in candles]
+            lows = [c[4] for c in candles]
+            closes = [c[2] for c in candles]
+            atr = atr_wilder(highs, lows, closes, 14)
+            stop, target = PEC.reference_levels(price, highs, lows, atr, s)
+        _, info = await simulate_fill(symbol, "buy", price, cfg, quote_budget=notional)
+        r = PEC.evaluate(price=price, notional=notional, fee_pct=cfg.sim_fee_pct, stop=stop, target=target,
+                         book_cost_pct=float(info.get("cost_pct") or 0.0), spread_pct=info.get("spread_pct"),
+                         book_model=str(info.get("fill_model")), s=s, use_max_loss=use_max_loss)
+        if not r["ok"]:
+            why = "controllo ingresso: " + "; ".join(r["reasons"])
+            await log_reject(symbol, tf or "-", strategy, why)
+            return False, why, notional
+        return True, None, r["notional"]
+    except Exception as e:  # noqa: BLE001
+        await log_reject(symbol, tf or "-", strategy, f"controllo ingresso non riuscito ({e}): procedo senza")
+        return True, None, notional
+
+
+@api.get("/precheck/config")
+async def precheck_get() -> dict[str, Any]:
+    return {"settings": await precheck_settings(), "defaults": PEC.DEFAULTS}
+
+
+@api.put("/precheck/config")
+async def precheck_put(body: dict[str, Any]) -> dict[str, Any]:
+    for k in body:
+        if k not in PEC.DEFAULTS:
+            raise HTTPException(status_code=400, detail=f"Impostazione sconosciuta: {k}")
+    cur = await precheck_settings()
+    cur.update(body)
+    new = PEC.clean_settings(cur)
+    await db.precheck_config.update_one({"_id": "main"}, {"$set": new}, upsert=True)
+    return {"settings": new}
+
+
 @api.get("/real/status")
 async def real_status() -> dict[str, Any]:
     cfg = await get_config()
@@ -4804,6 +4873,10 @@ async def run_xrp_acc_scan() -> None:
                 continue
         _xrp_acc_last_candle[tf] = forming_candle_t
 
+        _pc_mode = "real" if (await real_guard(cfg, "xrp_acc"))[0] == "real" else "paper"
+        _pc_ok, _pc_why, cash = await precheck_entry(XRP_ACC_SYMBOL, tf, cash, cfg, _pc_mode, "xrp_acc")
+        if not _pc_ok:
+            return
         # Reale (solo se "xrp_acc" e' tra le strategie con soldi veri) oppure simulazione.
         mode, why_real = await real_guard(cfg, "xrp_acc")
         if mode == "blocked":
@@ -5188,6 +5261,12 @@ async def _manual_open(s: dict[str, Any], cfg: Config, live: float) -> tuple[boo
             return False, "setup non piu' in attesa"
         sym, amount = s["symbol"], float(s["amount"])
         real_info = None
+        _pc_ok, _pc_why, _ = await precheck_entry(
+            sym, None, amount, cfg, s["mode"], "manuale",
+            stop=float(s["stop"]), target=float(s["target"]), use_max_loss=False)
+        if not _pc_ok:
+            await _manual_cancel(s["id"], _pc_why or "controllo ingresso")
+            return False, _pc_why or "controllo ingresso"
         if s["mode"] == "real":
             mode, why = await _manual_real_state(cfg)
             if mode != "real":

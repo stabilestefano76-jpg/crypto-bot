@@ -757,6 +757,15 @@ export const maApi = {
   setConfig: (c: Partial<MaConfig>) => req<{ ok: boolean; config: MaConfig }>("/ma/config", { method: "POST", body: JSON.stringify(c) }),
   close: (id: string) => req<{ ok: boolean }>("/ma/close/" + id, { method: "POST" }),
 };
+export type PrecheckSettings = {
+  enabled: boolean; also_paper: boolean; cost_multiple: number; min_rr: number;
+  max_book_cost_pct: number; max_spread_pct: number; max_loss_usdc: number;
+};
+export const precheckApi = {
+  get: () => req<{ settings: PrecheckSettings }>("/precheck/config"),
+  save: (patch: Record<string, unknown>) =>
+    req<{ settings: PrecheckSettings }>("/precheck/config", { method: "PUT", body: JSON.stringify(patch) }),
+};
 export const realApi = {
   diagnosi: () => req<RealDiagnosi>("/real/diagnosi"),
   status: () => req<RealStatus>("/real/status"),

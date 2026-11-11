@@ -3,7 +3,7 @@ import { ActivityIndicator, Alert, Pressable, ScrollView, StyleSheet, Switch, Te
 import { useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
-import { realApi, RealDiagnosi, RealStatus, signalsApi, S3360Signal } from "@/src/api";
+import { precheckApi, PrecheckSettings, realApi, RealDiagnosi, RealStatus, signalsApi, S3360Signal } from "@/src/api";
 import { colors, font, radius, spacing } from "@/src/theme";
 
 const money = (n?: number | null) => (n === undefined || n === null || isNaN(n) ? "-" : `${n.toFixed(2)} USDC`);
@@ -24,6 +24,8 @@ export default function RealScreen() {
   const [dg, setDg] = useState<RealDiagnosi | null>(null);
   const [sg, setSg] = useState<S3360Signal[]>([]);
   const [lim, setLim] = useState<{ o: string; t: string; d: string } | null>(null);
+  const [pc, setPc] = useState<PrecheckSettings | null>(null);
+  const [pcf, setPcf] = useState<Record<string, string> | null>(null);
 
   const load = useCallback(async () => {
     try {
@@ -57,6 +59,27 @@ export default function RealScreen() {
       setBusy(false);
       load();
     }
+  };
+
+  const fillPc = (x: PrecheckSettings) => {
+    setPc(x);
+    setPcf({ cost_multiple: String(x.cost_multiple), min_rr: String(x.min_rr), max_book_cost_pct: String(x.max_book_cost_pct),
+             max_spread_pct: String(x.max_spread_pct), max_loss_usdc: String(x.max_loss_usdc) });
+  };
+  useEffect(() => {
+    precheckApi.get().then((r) => fillPc(r.settings)).catch(() => {});
+  }, []);
+  const savePc = (patch: Record<string, unknown>) =>
+    run(() => precheckApi.save(patch).then((r) => { fillPc(r.settings); return r; }), () => "Controlli salvati.");
+  const savePcNums = () => {
+    if (!pcf) return;
+    const patch: Record<string, number> = {};
+    for (const k of Object.keys(pcf)) {
+      const n = Number(String(pcf[k]).replace(",", "."));
+      if (!isFinite(n) || n <= 0) { setMsg("ERRORE: scrivi numeri maggiori di zero."); return; }
+      patch[k] = n;
+    }
+    savePc(patch);
   };
 
   const saveLimits = () => {
@@ -173,6 +196,32 @@ export default function RealScreen() {
             />
           </View>
           <Text style={styles.note}>Il reale lavora solo se TUTTI e due sono accesi. Ricorda di mettere i soldi nel portafoglio della strategia (Deposita): e' il budget che il bot puo' usare.</Text>
+        </View>
+
+        <View style={styles.card}>
+          <View style={styles.row}>
+            <Text style={styles.big}>Controlli prima di entrare</Text>
+            <Switch value={!!pc?.enabled} disabled={busy || !pc} onValueChange={(v) => savePc({ enabled: v })} testID="pc-enabled" />
+          </View>
+          <Text style={styles.note}>Prima di comprare il bot controlla costi, rischio/rendimento, libro ordini e perdita massima. Se qualcosa non va NON compra e scrive il motivo in "Diagnosi".</Text>
+          <View style={styles.row}>
+            <Text style={styles.line}>Controlla anche in simulazione</Text>
+            <Switch value={!!pc?.also_paper} disabled={busy || !pc} onValueChange={(v) => savePc({ also_paper: v })} testID="pc-paper" />
+          </View>
+          <Text style={styles.note}>Guadagno atteso almeno N volte i costi (commissioni + libro)</Text>
+          <TextInput style={styles.limInput} value={pcf?.cost_multiple ?? ""} onChangeText={(v) => setPcf((c) => (c ? { ...c, cost_multiple: v } : c))} keyboardType="decimal-pad" testID="pc-costmult" />
+          <Text style={styles.note}>Guadagno atteso almeno N volte la perdita possibile (rischio/rendimento)</Text>
+          <TextInput style={styles.limInput} value={pcf?.min_rr ?? ""} onChangeText={(v) => setPcf((c) => (c ? { ...c, min_rr: v } : c))} keyboardType="decimal-pad" testID="pc-rr" />
+          <Text style={styles.note}>Libro sottile: costo massimo di ingresso (%)</Text>
+          <TextInput style={styles.limInput} value={pcf?.max_book_cost_pct ?? ""} onChangeText={(v) => setPcf((c) => (c ? { ...c, max_book_cost_pct: v } : c))} keyboardType="decimal-pad" testID="pc-book" />
+          <Text style={styles.note}>Spread massimo (%)</Text>
+          <TextInput style={styles.limInput} value={pcf?.max_spread_pct ?? ""} onChangeText={(v) => setPcf((c) => (c ? { ...c, max_spread_pct: v } : c))} keyboardType="decimal-pad" testID="pc-spread" />
+          <Text style={styles.note}>Perdita massima possibile per operazione (USDC)</Text>
+          <TextInput style={styles.limInput} value={pcf?.max_loss_usdc ?? ""} onChangeText={(v) => setPcf((c) => (c ? { ...c, max_loss_usdc: v } : c))} keyboardType="decimal-pad" testID="pc-maxloss" />
+          <Pressable style={[styles.btn, { marginTop: spacing.md, marginBottom: 0, opacity: busy || !pcf ? 0.4 : 1 }]} disabled={busy || !pcf} onPress={savePcNums}>
+            <Text style={styles.btnText}>Salva controlli</Text>
+          </Pressable>
+          <Text style={styles.note}>Stop e obiettivo delle strategie automatiche sono di riferimento: stop = minimo delle ultime 20 candele, obiettivo = prezzo + 3 x ATR. Per i setup manuali valgono i tuoi.</Text>
         </View>
 
         <Pressable
