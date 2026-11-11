@@ -766,6 +766,42 @@ export const precheckApi = {
   save: (patch: Record<string, unknown>) =>
     req<{ settings: PrecheckSettings }>("/precheck/config", { method: "PUT", body: JSON.stringify(patch) }),
 };
+export type DeskPlan = {
+  side: "long" | "short"; entry: number; stop: number; target: number; risk_pct_price: number; gain_pct_price: number;
+  rr: number | null; leverage: number; safe_leverage: number; notional: number; margin: number;
+  liquidation: number | null; liq_dist_pct: number | null; max_loss: number; expected_gain: number; cost_pct: number;
+  warnings: string[]; checks: { ok: boolean; reasons: string[] };
+};
+export type DeskAnalysis = {
+  symbol: string; price: number;
+  analysis: { bias: "long" | "short" | "attendi"; score: number; notes: string[]; volatile: boolean };
+  plans: { long: DeskPlan; short: DeskPlan };
+};
+export type DeskRow = {
+  id: string; symbol: string; side: "long" | "short"; leverage: number; fill_price: number; notional: number; margin: number;
+  stop: number; target: number; liquidation: number | null; current_price?: number; floating_pnl?: number;
+  pnl_usdt?: number; close_price?: number; close_reason?: string; opened_at?: string; closed_at?: string; forced?: boolean;
+  auto?: boolean; lots_total?: number; lots_left?: number; tp1?: number | null; tp1_done?: boolean; realized_partial?: number;
+};
+export type DeskConfig = {
+  symbols: string[]; capital: number; risk_pct: number; max_leverage: number; funding_day_pct: number; max_open: number;
+  auto_enabled: boolean; auto_leverage: number; auto_risk_pct: number; max_total_risk_pct: number; daily_loss_pct: number;
+  max_trades_day: number; cooldown_min: number; lots: number; tp1_r: number; be_after_tp1: boolean; streak_pause: number; streak_pause_h: number;
+};
+export type DeskRisk = { open_risk: number; open_risk_limit: number; today_pnl: number; daily_limit: number; auto_today: number; pause: string | null };
+export type DeskStatus = {
+  config: DeskConfig; risk: DeskRisk; cash: number; equity: number; open: DeskRow[]; closed: DeskRow[];
+  events: { at: string; symbol: string; text: string }[]; trades: number; wins: number; realized: number;
+};
+export const deskApi = {
+  status: () => req<DeskStatus>("/desk/status"),
+  analisi: (symbol: string, leverage: number, risk_pct: number) =>
+    req<DeskAnalysis>(`/desk/analisi?symbol=${encodeURIComponent(symbol)}&leverage=${leverage}&risk_pct=${risk_pct}`),
+  open: (b: { symbol: string; side: string; leverage: number; risk_pct: number; force?: boolean }) =>
+    req<{ ok: boolean }>("/desk/open", { method: "POST", body: JSON.stringify(b) }),
+  close: (id: string) => req<{ ok: boolean }>("/desk/close/" + id, { method: "POST" }),
+  setConfig: (c: Record<string, unknown>) => req<{ ok: boolean; config: DeskConfig }>("/desk/config", { method: "POST", body: JSON.stringify(c) }),
+};
 export const realApi = {
   diagnosi: () => req<RealDiagnosi>("/real/diagnosi"),
   status: () => req<RealStatus>("/real/status"),

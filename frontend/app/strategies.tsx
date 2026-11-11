@@ -56,6 +56,13 @@ const STRATEGIES: StrategyEntry[] = [
     route: "/ma",
   },
   {
+    key: "desk",
+    title: "Analisi e rischio",
+    subtitle: "Analizza il mercato e apre da solo se tutto e' d'accordo. Long, short, leva e lotti (simulazione)",
+    icon: "shield-checkmark",
+    route: "/desk",
+  },
+  {
     key: "real",
     title: "Trading reale",
     subtitle: "Soldi veri su Bybit: interruttore, limiti e STOP",

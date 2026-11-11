@@ -1977,6 +1977,7 @@ async def lifespan(_app: FastAPI):
     xrp_acc_monitor_task = asyncio.create_task(xrp_acc_monitor_loop())
     s3360_entry_task = asyncio.create_task(s3360_entry_loop())
     ict_monitor_task = asyncio.create_task(ict_monitor_loop())
+    desk_task = asyncio.create_task(desk_loop())
     ma_task = asyncio.create_task(ma_loop())
     manual_task = asyncio.create_task(manual_loop())
     ws_task = asyncio.create_task(price_feed.run())
@@ -1987,6 +1988,7 @@ async def lifespan(_app: FastAPI):
     scan_task.cancel()
     monitor_task.cancel()
     ict_monitor_task.cancel()
+    desk_task.cancel()
     ma_task.cancel()
     manual_task.cancel()
     s3360_entry_task.cancel()
@@ -5682,6 +5684,407 @@ async def ma_close_now(pid: str) -> dict[str, Any]:
     if not await _ma_close(p, cfg, "chiusura_manuale", cur):
         raise HTTPException(status_code=400, detail="Chiusura non riuscita, riprova.")
     return {"ok": True}
+
+
+# ============================================================================
+# ANALISI E RISCHIO — prima analizza il mercato (1d/4h/1h), poi applica i controlli prima di entrare
+# e ti suggerisce stop, obiettivo, importo, leva e prezzo di liquidazione. Long, SHORT e LEVA.
+# SOLO SIMULAZIONE: nessun ordine va a Bybit. Puoi aprire tu col bottone oppure accendere l'APERTURA AUTOMATICA:
+# il bot apre da solo solo se mercato e controlli sono d'accordo, divide la posizione in lotti, chiude il primo lotto
+# a 1R, porta lo stop a pareggio e rispetta i limiti di rischio totale (giornaliero, per serie di perdite, ecc.).
+# Le regole di calcolo stanno in desk_logic.py.
+# ============================================================================
+try:
+    import desk_logic as DK
+except ImportError:  # pragma: no cover
+    from backend import desk_logic as DK
+
+_desk_lock = asyncio.Lock()
+_desk_candle_cache: dict[str, tuple[float, list[list[float]]]] = {}
+
+
+async def _desk_price(symbol: str) -> Optional[float]:
+    try:
+        p = price_feed.get(symbol) or await price_feed.price_or_rest(symbol)
+    except Exception:  # noqa: BLE001
+        p = None
+    return float(p) if p and p > 0 else None
+
+
+async def _desk_cfg() -> dict[str, Any]:
+    doc = await db.desk_config.find_one({"_id": "desk"}, {"_id": 0}) or {}
+    out = dict(DK.DEFAULTS)
+    out.update({k: v for k, v in doc.items() if k in DK.DEFAULTS})
+    return out
+
+
+async def _desk_event(symbol: str, text: str) -> None:
+    try:
+        await db.desk_events.insert_one({"at": datetime.now(timezone.utc).isoformat(), "symbol": symbol, "text": text})
+        n = await db.desk_events.count_documents({})
+        if n > 150:
+            old = await db.desk_events.find({}, {"_id": 1}).sort("at", 1).to_list(n - 100)
+            await db.desk_events.delete_many({"_id": {"$in": [o["_id"] for o in old]}})
+    except Exception:  # noqa: BLE001
+        pass
+
+
+async def _desk_candles(symbol: str, tf: str) -> list[list[float]]:
+    key = f"{symbol}|{tf}"
+    now = time.time()
+    c = _desk_candle_cache.get(key)
+    if c and c[1] and now - c[0] < (60 if tf == "1h" else 180):
+        return c[1]
+    candles = await exchange.get_klines(symbol, tf, limit=300)
+    if candles:
+        _desk_candle_cache[key] = (now, candles)
+        return candles
+    return c[1] if c and c[1] and now - c[0] < 1800 else []
+
+
+async def _desk_wallet() -> dict[str, Any]:
+    w = await db.desk_wallet.find_one({"_id": "w"}, {"_id": 0})
+    if w is None:
+        dc = await _desk_cfg()
+        w = {"cash": float(dc["capital"])}
+        await db.desk_wallet.update_one({"_id": "w"}, {"$set": w}, upsert=True)
+    return w
+
+
+async def _desk_build(symbol: str, leverage: float, risk_pct: float, dc: dict[str, Any], cfg: Config) -> dict[str, Any]:
+    price = await _desk_price(symbol)
+    frames = {tf: await _desk_candles(symbol, tf) for tf in ("1d", "4h", "1h")}
+    if price is None or not frames["1h"]:
+        raise HTTPException(status_code=400, detail="Dati di mercato non disponibili per " + symbol)
+    an = DK.analyze_market(frames)
+    if not an.get("ok"):
+        raise HTTPException(status_code=400, detail="Dati insufficienti per analizzare " + symbol)
+    a1 = DK.atr(frames["1h"]) or 0.0
+    if a1 <= 0:
+        raise HTTPException(status_code=400, detail="Volatilita' non calcolabile per " + symbol)
+    s = await precheck_settings()
+    plans = {}
+    for side in ("long", "short"):
+        pl = DK.risk_plan(side, price, frames["1h"], a1, capital=float(dc["capital"]), risk_pct=risk_pct, leverage=leverage,
+                          fee_pct=cfg.sim_fee_pct, funding_day_pct=float(dc["funding_day_pct"]), max_leverage=float(dc["max_leverage"]),
+                          max_loss_usdc=s["max_loss_usdc"] if s["check_max_loss"] else None)
+        _, info = await simulate_fill(symbol, "buy" if side == "long" else "sell", price, cfg,
+                                      quote_budget=pl["notional"] if side == "long" else None,
+                                      base_qty=None if side == "long" else pl["notional"] / price)
+        st_m, tg_m = DK.mirror_for_check(pl)
+        ev = PEC.evaluate(price=price, notional=pl["notional"], fee_pct=cfg.sim_fee_pct, stop=st_m, target=tg_m,
+                          book_cost_pct=abs(float(info.get("cost_pct") or 0.0)), spread_pct=info.get("spread_pct"),
+                          book_model=str(info.get("fill_model")), s=s, use_max_loss=False)
+        pl["checks"] = {"ok": ev["ok"], "reasons": ev["reasons"]}
+        plans[side] = pl
+    return {"symbol": symbol, "price": price, "analysis": an, "plans": plans, "atr_1h": a1}
+
+
+@api.get("/desk/analisi")
+async def desk_analisi(symbol: str, leverage: float = 1.0, risk_pct: float = 1.0) -> dict[str, Any]:
+    cfg = await get_config()
+    dc = await _desk_cfg()
+    if symbol not in dc["symbols"]:
+        raise HTTPException(status_code=400, detail="Moneta non in elenco.")
+    return await _desk_build(symbol, max(1.0, min(leverage, float(DK.MAX_LEVERAGE))), max(0.1, min(risk_pct, 3.0)), dc, cfg)
+
+
+async def _desk_close(p: dict[str, Any], cfg: Config, reason: str, cur: float) -> bool:
+    async with _desk_lock:
+        fresh = await db.desk_positions.find_one({"id": p["id"], "status": "open"}, {"_id": 0})
+        if not fresh:
+            return False
+        p = fresh
+        days = max(0.0, (time.time() - p["opened_ts"]) / 86400.0)
+        carry = p["notional"] * (p["funding_day_pct"] / 100.0) * days if (p["leverage"] > 1.0 or p["side"] == "short") else 0.0
+        if reason == "liquidazione":
+            exit_price = p["liquidation"]
+        else:
+            if p["side"] == "long":
+                exit_price, _ = await simulate_fill(p["symbol"], "sell", cur, cfg, base_qty=p["quantity"])
+            else:
+                exit_price, _ = await simulate_fill(p["symbol"], "buy", cur, cfg, quote_budget=cur * p["quantity"])
+        res_pnl = DK.pnl(p["side"], p["fill_price"], exit_price, p["quantity"], cfg.sim_fee_pct, carry, p["margin"])
+        done = float(p.get("realized_partial") or 0.0)
+        r = await db.desk_positions.update_one({"id": p["id"], "status": "open"}, {"$set": {
+            "status": "closed", "close_price": exit_price, "close_reason": reason, "pnl_usdt": round(res_pnl + done, 4),
+            "pnl_last_lot": round(res_pnl, 4),
+            "carry_usdt": round(carry, 4), "closed_at": datetime.now(timezone.utc).isoformat()}})
+        if r.modified_count:
+            await db.desk_wallet.update_one({"_id": "w"}, {"$inc": {"cash": p["margin"] + res_pnl}}, upsert=True)
+            await _desk_event(p["symbol"], "CHIUSA %s a %.6g (%s) risultato totale %+.2f" % (p["side"], exit_price, reason, res_pnl + done))
+        return bool(r.modified_count)
+
+
+async def _desk_take_lot(p: dict[str, Any], cfg: Config, cur: float) -> None:
+    """Chiude il PRIMO lotto al primo obiettivo e porta lo stop a pareggio sul resto."""
+    async with _desk_lock:
+        p = await db.desk_positions.find_one({"id": p["id"], "status": "open"}, {"_id": 0})
+        if not p or p.get("tp1_done") or int(p.get("lots_left", 1)) < 2:
+            return
+        qty0 = float(p["qty0"]); part_qty = qty0 / int(p["lots_total"])
+        frac = min(1.0, part_qty / p["quantity"])
+        part_margin, part_notional = p["margin"] * frac, p["notional"] * frac
+        if p["side"] == "long":
+            ex, _ = await simulate_fill(p["symbol"], "sell", cur, cfg, base_qty=part_qty)
+        else:
+            ex, _ = await simulate_fill(p["symbol"], "buy", cur, cfg, quote_budget=cur * part_qty)
+        days = max(0.0, (time.time() - p["opened_ts"]) / 86400.0)
+        carry = part_notional * (p["funding_day_pct"] / 100.0) * days if (p["leverage"] > 1.0 or p["side"] == "short") else 0.0
+        pp = DK.pnl(p["side"], p["fill_price"], ex, part_qty, cfg.sim_fee_pct, carry, part_margin)
+        dc = await _desk_cfg()
+        new_stop = p["fill_price"] if dc["be_after_tp1"] else p["stop"]
+        if p["side"] == "long":
+            new_stop = max(new_stop, p["stop"]) if dc["be_after_tp1"] else p["stop"]
+        else:
+            new_stop = min(new_stop, p["stop"]) if dc["be_after_tp1"] else p["stop"]
+        r = await db.desk_positions.update_one({"id": p["id"], "status": "open", "tp1_done": {"$ne": True}}, {"$set": {
+            "tp1_done": True, "stop": new_stop, "quantity": p["quantity"] - part_qty, "margin": p["margin"] - part_margin,
+            "notional": p["notional"] - part_notional, "lots_left": int(p["lots_left"]) - 1,
+            "realized_partial": round(float(p.get("realized_partial") or 0.0) + pp, 4)}})
+        if r.modified_count:
+            await db.desk_wallet.update_one({"_id": "w"}, {"$inc": {"cash": part_margin + pp}}, upsert=True)
+            await _desk_event(p["symbol"], "PRIMO LOTTO chiuso a %.6g (%+.2f)%s" % (ex, pp, ", stop a pareggio" if dc["be_after_tp1"] else ""))
+
+
+async def desk_pass() -> None:
+    cfg = await get_config()
+    for p in await db.desk_positions.find({"status": "open"}, {"_id": 0}).to_list(50):
+        cur = await _desk_price(p["symbol"])
+        if cur is None:
+            continue
+        hit = DK.exit_hit(p["side"], cur, p["stop"], p["target"], p.get("liquidation"))
+        if hit:
+            await _desk_close(p, cfg, hit, cur)
+            continue
+        if p.get("tp1") and not p.get("tp1_done") and int(p.get("lots_left", 1)) >= 2 and DK.tp1_hit(p["side"], cur, p["tp1"]):
+            await _desk_take_lot(p, cfg, cur)
+
+
+async def _desk_day_stats(dc: dict[str, Any]) -> dict[str, Any]:
+    """Numeri per i limiti di rischio: perdita di oggi, aperture di oggi, serie di perdite, rischio aperto."""
+    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
+    closed = await db.desk_positions.find({"status": "closed"}, {"_id": 0}).sort("closed_at", -1).to_list(200)
+    today_pnl = sum(c.get("pnl_usdt", 0.0) for c in closed if str(c.get("closed_at", "")).startswith(today))
+    opened_today = await db.desk_positions.count_documents({"opened_at": {"$regex": "^" + today}, "auto": True})
+    opens = await db.desk_positions.find({"status": "open"}, {"_id": 0}).to_list(50)
+    open_risks = [0.0 if o.get("tp1_done") and dc["be_after_tp1"] else float(o.get("max_loss") or 0.0) for o in opens]
+    since = None
+    if closed:
+        try:
+            since = (datetime.now(timezone.utc) - datetime.fromisoformat(closed[0]["closed_at"])).total_seconds() / 3600.0
+        except Exception:  # noqa: BLE001
+            since = None
+    return {"today_pnl": today_pnl, "opened_today": opened_today, "open_risks": open_risks, "closed": closed, "since_last_close_h": since}
+
+
+async def _desk_open_core(symbol: str, side: str, lev: float, rp: float, force: bool, dc: dict[str, Any], cfg: Config, auto: bool = False) -> dict[str, Any]:
+    async with _desk_lock:
+        b = await _desk_build(symbol, lev, rp, dc, cfg)
+        if auto and lev > b["plans"][side]["safe_leverage"]:      # il bot abbassa da solo la leva se serve
+            lev = b["plans"][side]["safe_leverage"]
+            b = await _desk_build(symbol, lev, rp, dc, cfg)
+        pl, an = b["plans"][side], b["analysis"]
+        why: list[str] = []
+        if an["bias"] != side and not force:
+            why.append("il mercato dice '%s', non '%s' (puoi forzare, ma e' contro la tendenza)" % (an["bias"], side))
+        why += pl["checks"]["reasons"]
+        if lev > float(dc["max_leverage"]) and not force and not auto:
+            why.append("leva sopra il massimo scelto (%gx)" % dc["max_leverage"])
+        if pl["liq_dist_pct"] is not None and pl["liq_dist_pct"] < 1.5 * pl["risk_pct_price"]:
+            why.append("la liquidazione e' troppo vicina allo stop: usa leva %gx o meno" % pl["safe_leverage"])
+        if pl["notional"] < 5.5:
+            why.append("importo %.2f USDC sotto il minimo di 5,5" % pl["notional"])
+        opens = await db.desk_positions.find({"status": "open"}, {"symbol": 1, "_id": 0}).to_list(50)
+        if len(opens) >= int(dc["max_open"]):
+            why.append("hai gia' %d posizioni aperte" % len(opens))
+        if any(o["symbol"] == symbol for o in opens):
+            why.append("c'e' gia' una posizione su " + symbol)
+        w = await _desk_wallet()
+        if pl["margin"] > w["cash"]:
+            why.append("margine %.2f USDC piu' del contante libero %.2f" % (pl["margin"], w["cash"]))
+        # rischio TOTALE (vale anche per le aperture manuali)
+        stt = await _desk_day_stats(dc)
+        why += DK.risk_gate(capital=float(dc["capital"]), open_risks=stt["open_risks"], new_risk=pl["max_loss"],
+                            max_total_risk_pct=float(dc["max_total_risk_pct"]), today_pnl=stt["today_pnl"], daily_loss_pct=float(dc["daily_loss_pct"]))
+        if auto:
+            if stt["opened_today"] >= int(dc["max_trades_day"]):
+                why.append("gia' %d aperture automatiche oggi" % stt["opened_today"])
+            sb = DK.streak_block([c.get("pnl_usdt", 0.0) for c in stt["closed"]], stt["since_last_close_h"], int(dc["streak_pause"]), float(dc["streak_pause_h"]))
+            if sb:
+                why.append(sb)
+            last = next((c for c in stt["closed"] if c["symbol"] == symbol), None)
+            if last and dc["cooldown_min"]:
+                try:
+                    mins = (datetime.now(timezone.utc) - datetime.fromisoformat(last["closed_at"])).total_seconds() / 60.0
+                    if mins < float(dc["cooldown_min"]):
+                        why.append("attesa dopo l'ultima chiusura su %s (ancora %d minuti)" % (symbol, float(dc["cooldown_min"]) - mins))
+                except Exception:  # noqa: BLE001
+                    pass
+        if why:
+            raise HTTPException(status_code=400, detail="NON apro: " + "; ".join(why))
+        price = b["price"]
+        if side == "long":
+            fill, info = await simulate_fill(symbol, "buy", price, cfg, quote_budget=pl["notional"])
+        else:
+            fill, info = await simulate_fill(symbol, "sell", price, cfg, base_qty=pl["notional"] / price)
+        qty = pl["notional"] / fill
+        liq = DK.liquidation_price(side, fill, pl["leverage"])
+        lots = DK.lots_for(pl["notional"], int(dc["lots"]))
+        now = datetime.now(timezone.utc)
+        doc = {"id": str(uuid.uuid4()), "symbol": symbol, "status": "open", "side": side, "leverage": pl["leverage"],
+               "entry": price, "fill_price": fill, "fill_model": info.get("fill_model"), "quantity": qty, "qty0": qty,
+               "notional": pl["notional"], "margin": pl["margin"], "stop": pl["stop"], "target": pl["target"],
+               "tp1": DK.tp1_price(side, fill, pl["stop"], float(dc["tp1_r"])) if lots > 1 else None,
+               "lots_total": lots, "lots_left": lots, "tp1_done": False, "realized_partial": 0.0,
+               "liquidation": liq, "max_loss": pl["max_loss"], "rr": pl["rr"], "bias_at_entry": an["bias"],
+               "forced": bool(force), "auto": bool(auto), "funding_day_pct": float(dc["funding_day_pct"]),
+               "opened_at": now.isoformat(), "opened_ts": now.timestamp()}
+        await db.desk_positions.insert_one(dict(doc))
+        await db.desk_wallet.update_one({"_id": "w"}, {"$inc": {"cash": -pl["margin"]}}, upsert=True)
+        await _desk_event(symbol, "%s %s %gx a %.6g (importo %.2f in %d lotti, margine %.2f, stop %.6g, obiettivo %.6g, perdita max %.2f)" % (
+            "APERTA DAL BOT" if auto else "APERTA", side, pl["leverage"], fill, pl["notional"], lots, pl["margin"], pl["stop"], pl["target"], pl["max_loss"]))
+    doc.pop("_id", None)
+    return doc
+
+
+async def desk_auto_pass() -> None:
+    """Apertura automatica: per ogni moneta, se il mercato indica long/short e TUTTI i controlli passano, apre."""
+    dc = await _desk_cfg()
+    if not dc["auto_enabled"]:
+        return
+    cfg = await get_config()
+    for sym in dc["symbols"]:
+        if await db.desk_positions.find_one({"symbol": sym, "status": "open"}, {"_id": 1}):
+            continue
+        try:
+            b = await _desk_build(sym, float(dc["auto_leverage"]), float(dc["auto_risk_pct"]), dc, cfg)
+        except HTTPException:
+            continue
+        bias = b["analysis"]["bias"]
+        if bias not in ("long", "short"):
+            continue
+        try:
+            await _desk_open_core(sym, bias, float(dc["auto_leverage"]), float(dc["auto_risk_pct"]), False, dc, cfg, auto=True)
+        except HTTPException as e:
+            # un solo messaggio per motivo: niente spam ogni minuto
+            key = "auto|" + sym
+            st = await db.desk_state.find_one({"_id": key}) or {}
+            sig = __import__("re").sub(r"\d+(\.\d+)?", "#", str(e.detail))  # i numeri che cambiano non contano
+            if st.get("why") != sig or time.time() - float(st.get("ts", 0)) > 3600:
+                await db.desk_state.update_one({"_id": key}, {"$set": {"why": sig, "ts": time.time()}}, upsert=True)
+                await log_reject(sym, "-", "desk", "controllo ingresso (auto, " + bias + "): " + str(e.detail))
+                await _desk_event(sym, "Auto: %s indicato ma non apro - %s" % (bias, e.detail))
+
+
+_desk_auto_last = 0.0
+
+
+async def desk_loop() -> None:
+    global _desk_auto_last
+    await asyncio.sleep(18)
+    while True:
+        try:
+            await desk_pass()
+            if time.time() - _desk_auto_last > 45:
+                _desk_auto_last = time.time()
+                await desk_auto_pass()
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Analisi e rischio: errore nel ciclo: %s", e)
+        await asyncio.sleep(4)
+
+
+@api.post("/desk/open")
+async def desk_open(body: dict[str, Any]) -> dict[str, Any]:
+    cfg = await get_config()
+    dc = await _desk_cfg()
+    symbol, side = body.get("symbol"), body.get("side")
+    if symbol not in dc["symbols"] or side not in ("long", "short"):
+        raise HTTPException(status_code=400, detail="Scegli moneta e direzione.")
+    try:
+        lev = float(body.get("leverage", 1.0)); rp = float(body.get("risk_pct", dc["risk_pct"]))
+    except (TypeError, ValueError):
+        raise HTTPException(status_code=400, detail="Numeri non validi.")
+    if not (1.0 <= lev <= DK.MAX_LEVERAGE) or not (0.1 <= rp <= 3.0):
+        raise HTTPException(status_code=400, detail="Leva tra 1 e %d, rischio tra 0,1%% e 3%%." % DK.MAX_LEVERAGE)
+    try:
+        doc = await _desk_open_core(symbol, side, lev, rp, bool(body.get("force")), dc, cfg)
+    except HTTPException as e:
+        await log_reject(symbol, "-", "desk", "controllo ingresso: " + str(e.detail))
+        raise
+    return {"ok": True, "position": doc}
+
+
+@api.get("/desk/status")
+async def desk_status() -> dict[str, Any]:
+    cfg = await get_config()
+    dc = await _desk_cfg()
+    w = await _desk_wallet()
+    open_docs = await db.desk_positions.find({"status": "open"}, {"_id": 0}).sort("opened_at", -1).to_list(50)
+    o_out, margins, floating = [], 0.0, 0.0
+    for p in open_docs:
+        cur = await _desk_price(p["symbol"]) or p["fill_price"]
+        days = max(0.0, (time.time() - p["opened_ts"]) / 86400.0)
+        carry = p["notional"] * (p["funding_day_pct"] / 100.0) * days if (p["leverage"] > 1.0 or p["side"] == "short") else 0.0
+        fl = DK.pnl(p["side"], p["fill_price"], cur, p["quantity"], cfg.sim_fee_pct, carry, p["margin"])
+        margins += p["margin"]; floating += fl
+        o_out.append({**p, "current_price": cur, "floating_pnl": round(fl + float(p.get("realized_partial") or 0.0), 4)})
+    closed = await db.desk_positions.find({"status": "closed"}, {"_id": 0}).sort("closed_at", -1).to_list(40)
+    allc = await db.desk_positions.find({"status": "closed"}, {"pnl_usdt": 1, "_id": 0}).to_list(5000)
+    events = await db.desk_events.find({}, {"_id": 0}).sort("at", -1).to_list(20)
+    stt = await _desk_day_stats(dc)
+    risk = {"open_risk": round(sum(stt["open_risks"]), 4), "open_risk_limit": round(float(dc["capital"]) * float(dc["max_total_risk_pct"]) / 100.0, 4),
+            "today_pnl": round(stt["today_pnl"], 4), "daily_limit": round(-float(dc["capital"]) * float(dc["daily_loss_pct"]) / 100.0, 4),
+            "auto_today": stt["opened_today"],
+            "pause": DK.streak_block([c.get("pnl_usdt", 0.0) for c in stt["closed"]], stt["since_last_close_h"], int(dc["streak_pause"]), float(dc["streak_pause_h"]))}
+    return {"config": dc, "risk": risk, "cash": round(w["cash"], 4), "equity": round(w["cash"] + margins + floating, 4),
+            "open": o_out, "closed": closed, "events": events, "trades": len(allc),
+            "wins": sum(1 for c in allc if c.get("pnl_usdt", 0) > 0), "realized": round(sum(c.get("pnl_usdt", 0.0) for c in allc), 4)}
+
+
+@api.post("/desk/close/{pid}")
+async def desk_close_now(pid: str) -> dict[str, Any]:
+    cfg = await get_config()
+    p = await db.desk_positions.find_one({"id": pid, "status": "open"}, {"_id": 0})
+    if not p:
+        raise HTTPException(status_code=404, detail="Posizione non trovata.")
+    cur = await _desk_price(p["symbol"])
+    if cur is None:
+        raise HTTPException(status_code=400, detail="Prezzo non disponibile.")
+    return {"ok": await _desk_close(p, cfg, "chiusura_manuale", cur)}
+
+
+@api.post("/desk/config")
+async def desk_set_config(body: dict[str, Any]) -> dict[str, Any]:
+    cur = await _desk_cfg()
+    new = dict(cur)
+    try:
+        if "symbols" in body:
+            syms = [str(x).strip().upper() for x in body["symbols"] if str(x).strip()]
+            if not syms or len(syms) > 12 or any(not s.endswith("USDC") for s in syms):
+                raise ValueError("Monete: da 1 a 12, tutte in USDC (esempio BTCUSDC).")
+            new["symbols"] = syms
+        for k, (lo, hi) in DK.CFG_LIMITS.items():
+            if k in body:
+                v = float(body[k])
+                if not (lo <= v <= hi):
+                    raise ValueError("%s deve stare tra %g e %g." % (k, lo, hi))
+                new[k] = int(v) if k in DK.INT_KEYS else v
+        for k in ("auto_enabled", "be_after_tp1"):
+            if k in body:
+                new[k] = bool(body[k])
+        if "capital" in body:
+            c = float(body["capital"])
+            if not (10 <= c <= 100000):
+                raise ValueError("Capitale tra 10 e 100000.")
+            if await db.desk_positions.find_one({"status": "open"}, {"_id": 1}):
+                raise ValueError("Chiudi prima le posizioni aperte per cambiare il capitale.")
+            new["capital"] = c
+            await db.desk_wallet.update_one({"_id": "w"}, {"$set": {"cash": c}}, upsert=True)
+    except (TypeError, ValueError) as e:
+        raise HTTPException(status_code=400, detail=str(e))
+    await db.desk_config.update_one({"_id": "desk"}, {"$set": new}, upsert=True)
+    return {"ok": True, "config": new}
 
 
 # ============================================================================
