@@ -5742,6 +5742,60 @@ async def _desk_candles(symbol: str, tf: str) -> list[list[float]]:
     return c[1] if c and c[1] and now - c[0] < 1800 else []
 
 
+async def _desk_symbols(dc: dict[str, Any]) -> list[str]:
+    """Monete analizzate: se la pre-analisi e' accesa e ha gia' un elenco, quello; altrimenti l'elenco fisso."""
+    if dc.get("scan_enabled"):
+        u = await db.desk_state.find_one({"_id": "universe"}, {"_id": 0}) or {}
+        syms = [r["symbol"] for r in u.get("rows", [])]
+        if syms:
+            return syms
+    return list(dc["symbols"])
+
+
+_desk_scan_running = False
+
+
+async def desk_scan() -> None:
+    """PRE-ANALISI: scandaglia tutto il panorama USDC di Bybit e tiene le migliori coppie."""
+    global _desk_scan_running
+    if _desk_scan_running:
+        return
+    _desk_scan_running = True
+    try:
+        dc = await _desk_cfg()
+        cfg = await get_config()
+        tickers = await exchange.get_tickers()
+        cands = DK.scan_candidates(tickers, float(dc["scan_min_volume"]), int(dc["scan_pool"]))
+        if not cands:   # rete o Bybit non risponde: tengo l'elenco di prima
+            await _desk_event("-", "PRE-ANALISI: nessuna coppia letta da Bybit, tengo l'elenco precedente")
+            return
+        sem = asyncio.Semaphore(4)
+
+        async def one(c: dict[str, Any]) -> Optional[dict[str, Any]]:
+            async with sem:
+                try:
+                    b = await _desk_build(c["symbol"], 1.0, float(dc["auto_risk_pct"]), dc, cfg)
+                except Exception:  # noqa: BLE001
+                    return None
+            bias = b["analysis"]["bias"]
+            pl = b["plans"].get(bias) if bias in ("long", "short") else None
+            return {**c, "bias": bias, "score": b["analysis"]["score"], "checks_ok": bool(pl and pl["checks"]["ok"]),
+                    "why": (pl["checks"]["reasons"][0] if pl and pl["checks"]["reasons"] else None),
+                    "rr": pl["rr"] if pl else None}
+
+        res = [r for r in await asyncio.gather(*[one(c) for c in cands]) if r]
+        chosen = DK.rank_scan(res, int(dc["scan_top"]))
+        await db.desk_state.update_one({"_id": "universe"}, {"$set": {
+            "rows": chosen, "at": datetime.now(timezone.utc).isoformat(), "scanned": len(cands), "analyzed": len(res),
+            "total_pairs": len([t for t in tickers if str(t.get("symbol") or "").endswith("USDC")])}}, upsert=True)
+        await _desk_event("-", "PRE-ANALISI: scandagliate %d coppie USDC, scelte %d: %s" % (
+            len(res), len(chosen), ", ".join("%s %s" % (r["symbol"][:-4], r["bias"]) for r in chosen) or "nessuna con tendenza chiara"))
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Pre-analisi: errore: %s", e)
+    finally:
+        _desk_scan_running = False
+
+
 async def _desk_wallet() -> dict[str, Any]:
     w = await db.desk_wallet.find_one({"_id": "w"}, {"_id": 0})
     if w is None:
@@ -5784,7 +5838,7 @@ async def _desk_build(symbol: str, leverage: float, risk_pct: float, dc: dict[st
 async def desk_analisi(symbol: str, leverage: float = 1.0, risk_pct: float = 1.0) -> dict[str, Any]:
     cfg = await get_config()
     dc = await _desk_cfg()
-    if symbol not in dc["symbols"]:
+    if symbol not in await _desk_symbols(dc):
         raise HTTPException(status_code=400, detail="Moneta non in elenco.")
     return await _desk_build(symbol, max(1.0, min(leverage, float(DK.MAX_LEVERAGE))), max(0.1, min(risk_pct, 3.0)), dc, cfg)
 
@@ -5954,7 +6008,7 @@ async def desk_auto_pass() -> None:
     if not dc["auto_enabled"]:
         return
     cfg = await get_config()
-    for sym in dc["symbols"]:
+    for sym in await _desk_symbols(dc):
         if await db.desk_positions.find_one({"symbol": sym, "status": "open"}, {"_id": 1}):
             continue
         try:
@@ -5978,14 +6032,19 @@ async def desk_auto_pass() -> None:
 
 
 _desk_auto_last = 0.0
+_desk_scan_last = 0.0
 
 
 async def desk_loop() -> None:
-    global _desk_auto_last
+    global _desk_auto_last, _desk_scan_last
     await asyncio.sleep(18)
     while True:
         try:
             await desk_pass()
+            _dcl = await _desk_cfg()
+            if _dcl["scan_enabled"] and time.time() - _desk_scan_last > float(_dcl["scan_every_min"]) * 60:
+                _desk_scan_last = time.time()
+                asyncio.create_task(desk_scan())
             if time.time() - _desk_auto_last > 45:
                 _desk_auto_last = time.time()
                 await desk_auto_pass()
@@ -5999,7 +6058,7 @@ async def desk_open(body: dict[str, Any]) -> dict[str, Any]:
     cfg = await get_config()
     dc = await _desk_cfg()
     symbol, side = body.get("symbol"), body.get("side")
-    if symbol not in dc["symbols"] or side not in ("long", "short"):
+    if symbol not in await _desk_symbols(dc) or side not in ("long", "short"):
         raise HTTPException(status_code=400, detail="Scegli moneta e direzione.")
     try:
         lev = float(body.get("leverage", 1.0)); rp = float(body.get("risk_pct", dc["risk_pct"]))
@@ -6037,9 +6096,20 @@ async def desk_status() -> dict[str, Any]:
             "today_pnl": round(stt["today_pnl"], 4), "daily_limit": round(-float(dc["capital"]) * float(dc["daily_loss_pct"]) / 100.0, 4),
             "auto_today": stt["opened_today"],
             "pause": DK.streak_block([c.get("pnl_usdt", 0.0) for c in stt["closed"]], stt["since_last_close_h"], int(dc["streak_pause"]), float(dc["streak_pause_h"]))}
-    return {"config": dc, "risk": risk, "cash": round(w["cash"], 4), "equity": round(w["cash"] + margins + floating, 4),
+    uni = await db.desk_state.find_one({"_id": "universe"}, {"_id": 0}) or {}
+    scan = {"running": _desk_scan_running, "at": uni.get("at"), "scanned": uni.get("scanned"), "analyzed": uni.get("analyzed"),
+            "total_pairs": uni.get("total_pairs"), "rows": uni.get("rows", [])}
+    return {"config": dc, "risk": risk, "scan": scan, "symbols_active": await _desk_symbols(dc), "cash": round(w["cash"], 4), "equity": round(w["cash"] + margins + floating, 4),
             "open": o_out, "closed": closed, "events": events, "trades": len(allc),
             "wins": sum(1 for c in allc if c.get("pnl_usdt", 0) > 0), "realized": round(sum(c.get("pnl_usdt", 0.0) for c in allc), 4)}
+
+
+@api.post("/desk/scan")
+async def desk_scan_now() -> dict[str, Any]:
+    if _desk_scan_running:
+        return {"ok": True, "running": True}
+    asyncio.create_task(desk_scan())
+    return {"ok": True, "running": True}
 
 
 @api.post("/desk/close/{pid}")
@@ -6070,7 +6140,7 @@ async def desk_set_config(body: dict[str, Any]) -> dict[str, Any]:
                 if not (lo <= v <= hi):
                     raise ValueError("%s deve stare tra %g e %g." % (k, lo, hi))
                 new[k] = int(v) if k in DK.INT_KEYS else v
-        for k in ("auto_enabled", "be_after_tp1"):
+        for k in ("auto_enabled", "be_after_tp1", "scan_enabled"):
             if k in body:
                 new[k] = bool(body[k])
         if "capital" in body:

@@ -24,12 +24,19 @@ DEFAULTS: dict[str, Any] = {
     "be_after_tp1": True,        # dopo il primo lotto lo stop va a pareggio
     "streak_pause": 3,           # dopo N perdite di fila il bot si ferma per qualche ora
     "streak_pause_h": 6,
+    # --- pre-analisi: il bot scandaglia tutte le coppie USDC di Bybit e sceglie le migliori ---
+    "scan_enabled": False,
+    "scan_top": 10,              # quante coppie tenere (1-12)
+    "scan_pool": 40,             # quante coppie (le piu' scambiate) vengono analizzate a fondo (10-80)
+    "scan_min_volume": 100000.0, # volume minimo nelle ultime 24 ore (USDC) per essere considerata
+    "scan_every_min": 60,        # ogni quanto rifa' la scansione (minuti)
 }
 CFG_LIMITS = {"risk_pct": (0.1, 3.0), "max_leverage": (1.0, float(MAX_LEVERAGE)), "funding_day_pct": (0.0, 1.0), "max_open": (1, 6),
               "auto_leverage": (1.0, float(MAX_LEVERAGE)), "auto_risk_pct": (0.1, 3.0), "max_total_risk_pct": (0.5, 10.0),
               "daily_loss_pct": (0.5, 10.0), "max_trades_day": (1, 20), "cooldown_min": (0, 1440), "lots": (1, 3),
-              "tp1_r": (0.3, 3.0), "streak_pause": (1, 10), "streak_pause_h": (1, 48)}
-INT_KEYS = ("max_open", "max_trades_day", "cooldown_min", "lots", "streak_pause", "streak_pause_h")
+              "tp1_r": (0.3, 3.0), "streak_pause": (1, 10), "streak_pause_h": (1, 48),
+              "scan_top": (1, 12), "scan_pool": (10, 80), "scan_min_volume": (1000.0, 1e9), "scan_every_min": (15, 1440)}
+INT_KEYS = ("max_open", "max_trades_day", "cooldown_min", "lots", "streak_pause", "streak_pause_h", "scan_top", "scan_pool", "scan_every_min")
 TF_WEIGHT = {"1d": 2.0, "4h": 1.5, "1h": 1.0}
 
 
@@ -238,3 +245,46 @@ def streak_block(recent_pnls_newest_first: list[float], since_last_close_h: Opti
     if all(x < 0 for x in recent_pnls_newest_first[:n]) and since_last_close_h < hours:
         return "%d perdite di fila: pausa di %g ore (ne restano %.1f)" % (n, hours, hours - since_last_close_h)
     return None
+
+
+STABLE_BASES = {"USDT", "USDC", "DAI", "TUSD", "FDUSD", "USDE", "PYUSD", "USDD", "USDP", "EUR", "EURI", "EURS", "AEUR", "BUSD", "USD1", "RLUSD"}
+LEVERAGED_SUFFIX = ("3L", "3S", "2L", "2S", "5L", "5S", "UP", "DOWN")
+
+
+def scan_candidates(tickers: list[dict], min_volume: float, pool: int) -> list[dict]:
+    """Prima scrematura sull'intero elenco Bybit: solo coppie USDC vere, non stabili, non a leva, con volume sufficiente."""
+    out = []
+    for t in tickers:
+        sym = str(t.get("symbol") or "")
+        if not sym.endswith("USDC") or len(sym) <= 4:
+            continue
+        base = sym[:-4]
+        if base in STABLE_BASES or any(base.endswith(x) and len(base) > len(x) + 1 for x in LEVERAGED_SUFFIX):
+            continue
+        try:
+            vol = float(t.get("volValue") or 0.0)
+            last = float(t.get("last") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if vol < min_volume or last <= 0:
+            continue
+        try:
+            ch = float(t.get("changeRate") or 0.0) * 100.0
+        except (TypeError, ValueError):
+            ch = 0.0
+        out.append({"symbol": sym, "volume": vol, "price": last, "change24h": ch})
+    out.sort(key=lambda r: r["volume"], reverse=True)
+    return out[: max(1, int(pool))]
+
+
+def rank_scan(rows: list[dict], top: int) -> list[dict]:
+    """rows: candidati analizzati (bias, score, checks_ok, volume). Tendenza chiara + controlli passati + liquidita'."""
+    n = max(1, len(rows))
+    by_vol = sorted(rows, key=lambda r: r["volume"], reverse=True)
+    for i, r in enumerate(by_vol):
+        r["liq_bonus"] = 0.5 * (1.0 - i / n)
+    for r in rows:
+        r["quality"] = round(abs(r["score"]) * 2.0 + (1.0 if r["checks_ok"] else 0.0) + r["liq_bonus"], 3)
+    good = [r for r in rows if r["bias"] in ("long", "short")]
+    good.sort(key=lambda r: r["quality"], reverse=True)
+    return good[: max(1, int(top))]

@@ -32,13 +32,14 @@ export default function DeskScreen() {
     try {
       const s = await deskApi.status();
       setSt(s);
-      setSym((c) => c || s.config.symbols[0]);
+      setSym((c) => (c && s.symbols_active.includes(c) ? c : s.symbols_active[0] ?? c));
       setCapital((c) => c || String(s.config.capital));
       setAf((c) => c ?? {
         auto_leverage: String(s.config.auto_leverage), auto_risk_pct: String(s.config.auto_risk_pct),
         max_total_risk_pct: String(s.config.max_total_risk_pct), daily_loss_pct: String(s.config.daily_loss_pct),
         max_trades_day: String(s.config.max_trades_day), lots: String(s.config.lots), tp1_r: String(s.config.tp1_r),
-        cooldown_min: String(s.config.cooldown_min),
+        cooldown_min: String(s.config.cooldown_min), scan_top: String(s.config.scan_top), scan_pool: String(s.config.scan_pool),
+        scan_min_volume: String(s.config.scan_min_volume), scan_every_min: String(s.config.scan_every_min),
       });
     } catch (e: any) {
       setMsg(String(e?.message ?? "Errore"));
@@ -193,9 +194,36 @@ export default function DeskScreen() {
           <Text style={styles.note}>Dopo {st.config.streak_pause} perdite di fila il bot si ferma per {st.config.streak_pause_h} ore. Il rischio totale e il limite giornaliero valgono anche se apri tu.</Text>
         </View>
 
+        <View style={[styles.card, { borderColor: st.config.scan_enabled ? colors.success : colors.border }]}>
+          <View style={styles.row}>
+            <Text style={styles.big}>Pre-analisi di tutto il mercato</Text>
+            <Switch value={st.config.scan_enabled} disabled={busy} onValueChange={(v) => setAuto({ scan_enabled: v })} testID="desk-scan-switch" />
+          </View>
+          <Text style={styles.note}>Il bot scandaglia tutte le coppie USDC di Bybit, tiene le piu' scambiate, le analizza a fondo (1d/4h/1h + controlli) e sceglie le {st.config.scan_top} migliori. Poi analizza e opera solo su quelle. Rifa' la scelta ogni {st.config.scan_every_min} minuti. Le posizioni gia' aperte restano gestite.</Text>
+          {autoField("Quante coppie scegliere (1-12)", "scan_top")}
+          {autoField("Quante coppie analizzare a fondo (le piu' scambiate, 10-80)", "scan_pool")}
+          {autoField("Volume minimo nelle 24 ore (USDC)", "scan_min_volume")}
+          {autoField("Rifai la scelta ogni (minuti)", "scan_every_min")}
+          <Pressable style={[styles.btn, { opacity: busy || !af ? 0.4 : 1 }]} disabled={busy || !af} onPress={saveAutoNums}>
+            <Text style={styles.btnText}>Salva impostazioni</Text>
+          </Pressable>
+          <Pressable style={[styles.btn, styles.btnGhost, { opacity: busy || st.scan.running ? 0.4 : 1 }]} disabled={busy || st.scan.running} onPress={async () => { setBusy(true); try { await deskApi.scan(); setMsg("Scansione avviata: ci vuole un minuto circa."); } catch (e: any) { setMsg("ERRORE: " + String(e?.message ?? e)); } setBusy(false); load(); }}>
+            <Text style={[styles.btnText, { color: colors.onSurface }]}>{st.scan.running ? "Scansione in corso..." : "Scandaglia ora"}</Text>
+          </Pressable>
+          {st.scan.at ? (
+            <Text style={styles.note}>Ultima scansione {st.scan.at.slice(5, 16).replace("T", " ")} UTC: {st.scan.total_pairs} coppie USDC su Bybit, {st.scan.analyzed} analizzate a fondo.</Text>
+          ) : <Text style={styles.note}>Nessuna scansione ancora: accendi l'interruttore o tocca "Scandaglia ora".</Text>}
+          {st.scan.rows.map((r) => (
+            <View key={r.symbol} style={styles.row}>
+              <Text style={styles.line}>{r.symbol} · {r.bias === "long" ? "LONG" : "SHORT"}{r.checks_ok ? " ✓" : ""}</Text>
+              <Text style={styles.note}>forza {r.score} · 24h {r.change24h >= 0 ? "+" : ""}{r.change24h.toFixed(1)}%</Text>
+            </View>
+          ))}
+        </View>
+
         <View style={styles.card}>
           <Text style={styles.big}>1. Scegli la moneta</Text>
-          <View style={styles.chips}>{st.config.symbols.map((s) => chip(s, s === sym, () => { setSym(s); setAn(null); }))}</View>
+          <View style={styles.chips}>{st.symbols_active.map((s) => chip(s, s === sym, () => { setSym(s); setAn(null); }))}</View>
           <Text style={styles.note}>Leva (1 = senza leva, massimo 10)</Text>
           <TextInput style={styles.inp} value={lev} onChangeText={setLev} keyboardType="decimal-pad" testID="desk-lev" />
           <Text style={styles.note}>Quanto vuoi rischiare in questa operazione (% del capitale)</Text>

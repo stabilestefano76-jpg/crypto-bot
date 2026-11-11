@@ -787,10 +787,13 @@ export type DeskConfig = {
   symbols: string[]; capital: number; risk_pct: number; max_leverage: number; funding_day_pct: number; max_open: number;
   auto_enabled: boolean; auto_leverage: number; auto_risk_pct: number; max_total_risk_pct: number; daily_loss_pct: number;
   max_trades_day: number; cooldown_min: number; lots: number; tp1_r: number; be_after_tp1: boolean; streak_pause: number; streak_pause_h: number;
+  scan_enabled: boolean; scan_top: number; scan_pool: number; scan_min_volume: number; scan_every_min: number;
 };
+export type DeskScanRow = { symbol: string; bias: string; score: number; volume: number; price: number; change24h: number; checks_ok: boolean; why?: string | null; rr?: number | null; quality: number };
+export type DeskScan = { running: boolean; at?: string | null; scanned?: number | null; analyzed?: number | null; total_pairs?: number | null; rows: DeskScanRow[] };
 export type DeskRisk = { open_risk: number; open_risk_limit: number; today_pnl: number; daily_limit: number; auto_today: number; pause: string | null };
 export type DeskStatus = {
-  config: DeskConfig; risk: DeskRisk; cash: number; equity: number; open: DeskRow[]; closed: DeskRow[];
+  config: DeskConfig; risk: DeskRisk; scan: DeskScan; symbols_active: string[]; cash: number; equity: number; open: DeskRow[]; closed: DeskRow[];
   events: { at: string; symbol: string; text: string }[]; trades: number; wins: number; realized: number;
 };
 export const deskApi = {
@@ -800,6 +803,7 @@ export const deskApi = {
   open: (b: { symbol: string; side: string; leverage: number; risk_pct: number; force?: boolean }) =>
     req<{ ok: boolean }>("/desk/open", { method: "POST", body: JSON.stringify(b) }),
   close: (id: string) => req<{ ok: boolean }>("/desk/close/" + id, { method: "POST" }),
+  scan: () => req<{ ok: boolean; running: boolean }>("/desk/scan", { method: "POST" }),
   setConfig: (c: Record<string, unknown>) => req<{ ok: boolean; config: DeskConfig }>("/desk/config", { method: "POST", body: JSON.stringify(c) }),
 };
 export const realApi = {
