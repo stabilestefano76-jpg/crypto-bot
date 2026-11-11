@@ -5851,7 +5851,8 @@ async def _term_analyze(symbol: str, tc: dict[str, Any], cfg: Config, risk_pct: 
     sigs = LAB.live_signals(frames, qualified, price)
     best, why = LAB.choose(sigs, float(cfg.sim_fee_pct))
     if not best:
-        base["reasons"] = ["%d strategie qualificate, ma nessuna ha un segnale valido adesso su %s." % (len(qualified), symbol)] + why
+        names = ", ".join("%s (%s, %s)" % (q["name"], q["tf"], q["side"]) for q in sorted(qualified, key=lambda x: -x["t"])[:3])
+        base["reasons"] = ["%d strategie qualificate, ma nessuna ha un segnale valido adesso su %s. Qualificate: %s." % (len(qualified), symbol, names)] + why
         return base
     q, side = best["q"], ("long" if best["side"] == 1 else "short")
     a = best["atr"]

@@ -20,7 +20,7 @@ RIGOR = {   # soglie per essere scelta: n operazioni, t minimo
     "severo": {"min_n": 100, "min_t": 3.0},
     "normale": {"min_n": 60, "min_t": 2.0},
 }
-DEFAULTS = {"enabled": True, "rigor": "normale", "auto_enabled": False, "auto_risk_pct": 1.0,
+DEFAULTS = {"enabled": True, "rigor": "severo", "auto_enabled": False, "auto_risk_pct": 1.0,
             "symbols": ["BTCUSDC", "ETHUSDC", "SOLUSDC", "XRPUSDC", "DOGEUSDC", "ADAUSDC", "LINKUSDC", "LTCUSDC"],
             "lab_years": 3.0, "auto_every_min": 15, "max_universe": 12}
 CFG_LIMITS = {"auto_risk_pct": (0.1, 3.0), "auto_every_min": (5, 240), "lab_years": (1.0, 4.0), "max_universe": (4, 20)}
@@ -87,7 +87,7 @@ def vol_ratio(rows: list[tuple], n: int = 20) -> list[Optional[float]]:
 def indicators(rows: list[tuple]) -> dict[str, Any]:
     c = [r[4] for r in rows]
     return {"atr": atr_series(rows), "rsi": rsi_series(rows), "rsi2": rsi_series(rows, 2), "vr": vol_ratio(rows),
-            "sma50": sma_series(c, 50), "sma100": sma_series(c, 100), "sma200": sma_series(c, 200)}
+            "sma20": sma_series(c, 20), "sma50": sma_series(c, 50), "sma100": sma_series(c, 100), "sma200": sma_series(c, 200)}
 
 
 # ---------------------------------------------------------------- generatori
@@ -227,6 +227,58 @@ def gen_reaction(et: str, filt: bool) -> Callable:
     return g
 
 
+
+# ---------------------------------------------------- figure di candele giapponesi
+def _body(r):
+    return abs(r[4] - r[1])
+
+
+def gen_candle(kind: str, ctx: bool) -> Callable:
+    """kind: morning, evening, bull_engulf, bear_engulf, hammer, star. ctx=True: solo dopo un calo (rialziste: sotto la media a 20)
+    o dopo un rialzo (ribassiste: sopra la media a 20). Il segnale e' deciso alla chiusura dell'ultima candela del disegno."""
+    def g(rows, ind, tf):
+        A, M = ind["atr"], ind["sma20"]
+        out = []
+        for t in range(25, len(rows)):
+            a = A[t]
+            if a is None or M[t - 2] is None:
+                continue
+            r0, r1, r2 = rows[t - 2], rows[t - 1], rows[t]
+            side, lo_hi = 0, None
+            if kind == "morning":
+                if (r0[4] < r0[1] and _body(r0) >= 0.6 * a and _body(r1) <= 0.35 * _body(r0)
+                        and r2[4] > r2[1] and _body(r2) >= 0.5 * a and r2[4] > (r0[1] + r0[4]) / 2):
+                    side, lo_hi = 1, min(r0[3], r1[3], r2[3])
+            elif kind == "evening":
+                if (r0[4] > r0[1] and _body(r0) >= 0.6 * a and _body(r1) <= 0.35 * _body(r0)
+                        and r2[4] < r2[1] and _body(r2) >= 0.5 * a and r2[4] < (r0[1] + r0[4]) / 2):
+                    side, lo_hi = -1, max(r0[2], r1[2], r2[2])
+            elif kind == "bull_engulf":
+                if r1[4] < r1[1] and _body(r1) >= 0.3 * a and r2[4] > r2[1] and r2[1] <= r1[4] and r2[4] >= r1[1] and _body(r2) > _body(r1):
+                    side, lo_hi = 1, min(r1[3], r2[3])
+            elif kind == "bear_engulf":
+                if r1[4] > r1[1] and _body(r1) >= 0.3 * a and r2[4] < r2[1] and r2[1] >= r1[4] and r2[4] <= r1[1] and _body(r2) > _body(r1):
+                    side, lo_hi = -1, max(r1[2], r2[2])
+            elif kind == "hammer":
+                rng, body = r2[2] - r2[3], _body(r2)
+                lw, uw = min(r2[1], r2[4]) - r2[3], r2[2] - max(r2[1], r2[4])
+                if rng >= 0.8 * a and lw >= 2 * max(body, 1e-12) and uw <= 0.3 * rng:
+                    side, lo_hi = 1, r2[3]
+            elif kind == "star":
+                rng, body = r2[2] - r2[3], _body(r2)
+                lw, uw = min(r2[1], r2[4]) - r2[3], r2[2] - max(r2[1], r2[4])
+                if rng >= 0.8 * a and uw >= 2 * max(body, 1e-12) and lw <= 0.3 * rng:
+                    side, lo_hi = -1, r2[2]
+            if not side:
+                continue
+            c0 = rows[t - 2][4]
+            if ctx and not ((side == 1 and c0 < M[t - 2]) or (side == -1 and c0 > M[t - 2])):
+                continue
+            stop = lo_hi - STOP_BUF * a if side == 1 else lo_hi + STOP_BUF * a
+            out.append(_ev(t, side, stop, a))
+        return out
+    return g
+
 # Archivio: id, nome semplice, famiglia, spiegazione, generatore. Per aggiungere una strategia basta una riga.
 CATALOG: list[dict[str, Any]] = []
 
@@ -251,6 +303,17 @@ for _et, _nm, _sd in (("bounce_sup", "Rimbalzo sul supporto", (1,)), ("break_sup
     _add("re_" + _et, _nm, "Reazione ai livelli", "Reazione del prezzo a un supporto/resistenza importante (toccato almeno 2 volte).", gen_reaction(_et, False), _sd)
     _add("re_" + _et + "_vr", _nm + " con volume e RSI", "Reazione ai livelli",
          "Come sopra, ma solo con volume almeno 1,5 volte la media e RSI coerente.", gen_reaction(_et, True), _sd)
+
+
+_CANDLES = (("morning", "Morning star (stella del mattino)", (1,), "Rossa grande, piccola, verde grande che chiude oltre meta' della prima: possibile inversione al rialzo."),
+            ("evening", "Evening star (stella della sera)", (-1,), "Verde grande, piccola, rossa grande che chiude sotto meta' della prima: possibile inversione al ribasso."),
+            ("bull_engulf", "Ingoiante rialzista", (1,), "Una candela verde che ingoia per intero il corpo della rossa precedente."),
+            ("bear_engulf", "Ingoiante ribassista", (-1,), "Una candela rossa che ingoia per intero il corpo della verde precedente."),
+            ("hammer", "Martello", (1,), "Candela con lunga ombra sotto e corpo piccolo in alto: rifiuto dei prezzi bassi."),
+            ("star", "Stella cadente", (-1,), "Candela con lunga ombra sopra e corpo piccolo in basso: rifiuto dei prezzi alti."))
+for _k, _nm, _sd, _tx in _CANDLES:
+    _add("cd_" + _k, _nm, "Candele giapponesi", _tx, gen_candle(_k, False), _sd)
+    _add("cd_" + _k + "_ctx", _nm + " dopo calo/rialzo", "Candele giapponesi", _tx + " Solo dopo un movimento contrario (prezzo sotto/sopra la media a 20 candele).", gen_candle(_k, True), _sd)
 
 
 # ------------------------------------------------------------- prova sui prezzi

@@ -1978,6 +1978,7 @@ async def lifespan(_app: FastAPI):
     s3360_entry_task = asyncio.create_task(s3360_entry_loop())
     ict_monitor_task = asyncio.create_task(ict_monitor_loop())
     desk_task = asyncio.create_task(desk_loop())
+    term_task = asyncio.create_task(term_loop())
     ma_task = asyncio.create_task(ma_loop())
     manual_task = asyncio.create_task(manual_loop())
     ws_task = asyncio.create_task(price_feed.run())
@@ -1989,6 +1990,7 @@ async def lifespan(_app: FastAPI):
     monitor_task.cancel()
     ict_monitor_task.cancel()
     desk_task.cancel()
+    term_task.cancel()
     ma_task.cancel()
     manual_task.cancel()
     s3360_entry_task.cancel()
@@ -5684,6 +5686,421 @@ async def ma_close_now(pid: str) -> dict[str, Any]:
     if not await _ma_close(p, cfg, "chiusura_manuale", cur):
         raise HTTPException(status_code=400, detail="Chiusura non riuscita, riprova.")
     return {"ok": True}
+
+
+# ============================================================================
+# TERMINALE — schermata a coppie (grafico, volume, RSI, libro ordini) con il tasto ANALIZZA.
+# Un ARCHIVIO di strategie note viene provato sui prezzi passati CON i tuoi costi (1 volta al giorno).
+# Solo le strategie con un vantaggio statistico sufficiente (e positive anche nell'ultimo terzo del periodo) possono dare un setup.
+# Analizza dice: LONG da..a con stop e obiettivo, SHORT (solo simulazione), oppure PASSA. Poi un secondo tocco apre in SIMULAZIONE.
+# Modo automatico: analizza e apre da solo, con gli stessi limiti di rischio di "Analisi e rischio". NESSUN ordine reale.
+# Le regole stanno in lab_logic.py.
+# ============================================================================
+try:
+    import lab_logic as LAB
+except ImportError:  # pragma: no cover
+    from backend import lab_logic as LAB
+
+_TERM_STABLES = {"USDT", "USDC", "USDE", "DAI", "FDUSD", "TUSD", "PYUSD", "EUR", "EURC", "USD1", "USDD", "BUSD"}
+_lab: dict[str, Any] = {"running": False, "res": None, "err": None}
+
+
+async def _term_cfg() -> dict[str, Any]:
+    doc = await db.term_config.find_one({"_id": "term"}, {"_id": 0}) or {}
+    out = dict(LAB.DEFAULTS)
+    out.update({k: v for k, v in doc.items() if k in LAB.DEFAULTS})
+    return out
+
+
+async def _term_pairs_raw(min_volume: float = 20000.0) -> list[dict[str, Any]]:
+    rows = []
+    for t in await exchange.get_tickers():
+        s = str(t.get("symbol") or "")
+        base = s[:-4]
+        if not s.endswith("USDC") or base in _TERM_STABLES or any(base.endswith(x) for x in ("UP", "DOWN", "3L", "3S")):
+            continue
+        try:
+            rows.append({"symbol": s, "last": float(t.get("last") or 0), "change": float(t.get("changeRate") or 0) * 100.0,
+                         "turnover": float(t.get("volValue") or 0)})
+        except (TypeError, ValueError):
+            continue
+    rows = [r for r in rows if r["turnover"] >= min_volume and r["last"] > 0]
+    rows.sort(key=lambda r: -r["turnover"])
+    return rows
+
+
+async def _term_syms(tc: dict[str, Any]) -> list[str]:
+    syms = list(tc["symbols"])
+    for r in await _term_pairs_raw():
+        if len(syms) >= int(tc["max_universe"]):
+            break
+        if r["symbol"] not in syms:
+            syms.append(r["symbol"])
+    return syms
+
+
+async def _lab_history(symbol: str, tf: str, years: float) -> list[list[float]]:
+    """Storia a pagine da Bybit (1000 candele per chiamata, dalla piu' recente indietro). Formato del bot."""
+    need = int(years * 365 * 86400 / LAB.SECS[tf])
+    out: dict[int, list[float]] = {}
+    end = None
+    for _ in range(40):
+        params: dict[str, Any] = {"category": exchange.category, "symbol": symbol, "interval": TF_MAP[tf], "limit": 1000}
+        if end:
+            params["end"] = end
+        data = await exchange._get("/v5/market/kline", params=params)
+        if not data or data.get("retCode") != 0:
+            break
+        lst = data.get("result", {}).get("list", [])
+        if not lst:
+            break
+        for row in lst:
+            try:
+                out[int(row[0]) // 1000] = [float(row[0]) / 1000.0, float(row[1]), float(row[4]), float(row[2]), float(row[3]), float(row[5])]
+            except (ValueError, IndexError):
+                continue
+        if len(lst) < 1000 or len(out) >= need:
+            break
+        end = int(lst[-1][0]) - 1
+        await asyncio.sleep(0.1)
+    cs = [out[k] for k in sorted(out)]
+    return cs[:-1] if len(cs) > 1 else cs         # via la candela ancora aperta
+
+
+async def lab_run() -> None:
+    if _lab["running"]:
+        return
+    _lab["running"], _lab["err"] = True, None
+    try:
+        tc, cfg = await _term_cfg(), await get_config()
+        data: dict[tuple[str, str], list[tuple]] = {}
+        for s in await _term_syms(tc):
+            for tf in LAB.TFS:
+                cs = await _lab_history(s, tf, float(tc["lab_years"]))
+                if len(cs) >= 300:
+                    data[(s, tf)] = LAB.to_rows(cs)
+        if not data:
+            raise RuntimeError("nessun dato storico disponibile da Bybit")
+        fee = float(cfg.sim_fee_pct)
+        res = await asyncio.to_thread(LAB.run_lab, data, fee)
+        res["fee_side"] = fee
+        res["at"] = datetime.now(timezone.utc).isoformat()
+        _lab["res"] = res
+        await db.lab_results.update_one({"_id": "lab"}, {"$set": res}, upsert=True)
+        await _desk_event("-", "Terminale: archivio strategie aggiornato (%d prove, %d monete)" % (len(res["rows"]), len(res["symbols"])))
+    except Exception as e:  # noqa: BLE001
+        logger.exception("Terminale: errore nel calcolo dell'archivio: %s", e)
+        _lab["err"] = str(e)
+    finally:
+        _lab["running"] = False
+
+
+async def _lab_get() -> Optional[dict[str, Any]]:
+    if _lab["res"] is None:
+        doc = await db.lab_results.find_one({"_id": "lab"}, {"_id": 0})
+        if doc:
+            _lab["res"] = doc
+    return _lab["res"]
+
+
+def _lab_qualified(res: dict[str, Any], rigor: str) -> list[dict[str, Any]]:
+    return [r for r in res["rows"] if LAB.qualifies(r, rigor)]
+
+
+async def _term_plan(symbol: str, side: str, price: float, stop: float, target: float, dc: dict[str, Any], cfg: Config, risk_pct: float) -> dict[str, Any]:
+    s = await precheck_settings()
+    pl = LAB.plan_custom(side, price, stop, target, capital=float(dc["capital"]), risk_pct=risk_pct, fee_pct=cfg.sim_fee_pct,
+                         funding_day_pct=float(dc["funding_day_pct"]), max_loss_usdc=s["max_loss_usdc"] if s["check_max_loss"] else None)
+    _, info = await simulate_fill(symbol, "buy" if side == "long" else "sell", price, cfg,
+                                  quote_budget=pl["notional"] if side == "long" else None,
+                                  base_qty=None if side == "long" else pl["notional"] / price)
+    st_m, tg_m = DK.mirror_for_check(pl)
+    ev = PEC.evaluate(price=price, notional=pl["notional"], fee_pct=cfg.sim_fee_pct, stop=st_m, target=tg_m,
+                      book_cost_pct=abs(float(info.get("cost_pct") or 0.0)), spread_pct=info.get("spread_pct"),
+                      book_model=str(info.get("fill_model")), s=s, use_max_loss=False)
+    pl["checks"] = {"ok": ev["ok"], "reasons": ev["reasons"]}
+    return pl
+
+
+def _term_explain(q: dict[str, Any]) -> str:
+    t = "%s su grafico %s. %s" % (q["name"], q["tf"], q["text"])
+    t += " Nel passato, su %d operazioni in %d monete, ha reso in media %+.2fR a operazione DOPO i costi (t=%.1f, vinte %.0f%%)." % (
+        q["n"], q["coins"], q["net"], q["t"], q["win"])
+    t += " E' positiva in entrambe le meta' del periodo (%+.2fR e %+.2fR) e anche nell'ultimo terzo (%+.2fR)." % (q["h1"], q["h2"], q.get("oos") or 0.0)
+    return t
+
+
+async def _term_analyze(symbol: str, tc: dict[str, Any], cfg: Config, risk_pct: Optional[float] = None) -> dict[str, Any]:
+    dc = await _desk_cfg()
+    price = await _desk_price(symbol)
+    if price is None:
+        raise HTTPException(status_code=400, detail="Prezzo non disponibile per " + symbol)
+    now = datetime.now(timezone.utc)
+    base: dict[str, Any] = {"symbol": symbol, "price": price, "at": now.isoformat(), "rigor": tc["rigor"], "verdict": "PASSA", "reasons": []}
+    res = await _lab_get()
+    if not res:
+        base["reasons"] = ["L'archivio delle strategie non e' ancora pronto: il primo calcolo richiede qualche minuto."]
+        base["lab"] = {"tested": 0, "qualified": 0}
+        return base
+    qualified = _lab_qualified(res, tc["rigor"])
+    base["lab"] = {"tested": len([r for r in res["rows"] if r.get("n", 0) >= 10]), "qualified": len(qualified), "at": res.get("at")}
+    if not qualified:
+        base["reasons"] = ["Nessuna strategia dell'archivio ha un vantaggio statistico sufficiente con i tuoi costi (%d provate). Meglio non entrare." % base["lab"]["tested"]]
+        return base
+    frames = {tf: await _desk_candles(symbol, tf) for tf in LAB.TFS}
+    sigs = LAB.live_signals(frames, qualified, price)
+    best, why = LAB.choose(sigs, float(cfg.sim_fee_pct))
+    if not best:
+        base["reasons"] = ["%d strategie qualificate, ma nessuna ha un segnale valido adesso su %s." % (len(qualified), symbol)] + why
+        return base
+    q, side = best["q"], ("long" if best["side"] == 1 else "short")
+    a = best["atr"]
+    rp = float(risk_pct if risk_pct is not None else dc["risk_pct"])
+    pl = await _term_plan(symbol, side, price, best["stop"], best["target"], dc, cfg, rp)
+    setup = {"id": str(uuid.uuid4()), "symbol": symbol, "side": side, "entry": price, "stop": best["stop"], "target": best["target"],
+             "atr": a, "strategy": q["id"], "strategy_name": q["name"], "tf": q["tf"], "created_ts": now.timestamp()}
+    await db.term_setups.insert_one(dict(setup))
+    await db.term_setups.delete_many({"created_ts": {"$lt": now.timestamp() - 3600}})
+    base.update({"verdict": side.upper(), "setup_id": setup["id"], "zone_from": price - 0.1 * a, "zone_to": price + 0.1 * a,
+                 "stop": best["stop"], "target": best["target"], "plan": pl, "simulation_only": side == "short",
+                 "strategy": {k: q.get(k) for k in ("id", "name", "family", "tf", "side", "rr", "n", "coins", "net", "gross", "t", "win", "h1", "h2", "oos")},
+                 "explain": _term_explain(q), "reasons": why})
+    return base
+
+
+async def _term_open_core(setup: dict[str, Any], dc: dict[str, Any], cfg: Config, auto: bool, risk_pct: float) -> dict[str, Any]:
+    async with _desk_lock:
+        symbol, side = setup["symbol"], setup["side"]
+        price = await _desk_price(symbol)
+        if price is None:
+            raise HTTPException(status_code=400, detail="Prezzo non disponibile")
+        why: list[str] = []
+        if abs(price - setup["entry"]) > 0.5 * setup["atr"]:
+            why.append("il prezzo si e' mosso troppo da quando hai analizzato: rianalizza")
+        stop, target = float(setup["stop"]), float(setup["target"])
+        if (side == "long" and not (stop < price < target)) or (side == "short" and not (target < price < stop)):
+            why.append("il prezzo e' gia' fuori da stop/obiettivo del setup")
+        if why:
+            raise HTTPException(status_code=400, detail="NON apro: " + "; ".join(why))
+        pl = await _term_plan(symbol, side, price, stop, target, dc, cfg, risk_pct)
+        why += pl["checks"]["reasons"]
+        if pl["notional"] < 5.5:
+            why.append("importo %.2f USDC sotto il minimo di 5,5" % pl["notional"])
+        opens = await db.desk_positions.find({"status": "open"}, {"symbol": 1, "_id": 0}).to_list(50)
+        if len(opens) >= int(dc["max_open"]):
+            why.append("hai gia' %d posizioni aperte" % len(opens))
+        if any(o["symbol"] == symbol for o in opens):
+            why.append("c'e' gia' una posizione su " + symbol)
+        w = await _desk_wallet()
+        if pl["margin"] > w["cash"]:
+            why.append("margine %.2f USDC piu' del contante libero %.2f" % (pl["margin"], w["cash"]))
+        stt = await _desk_day_stats(dc)
+        why += DK.risk_gate(capital=float(dc["capital"]), open_risks=stt["open_risks"], new_risk=pl["max_loss"],
+                            max_total_risk_pct=float(dc["max_total_risk_pct"]), today_pnl=stt["today_pnl"], daily_loss_pct=float(dc["daily_loss_pct"]))
+        if auto:
+            if stt["opened_today"] >= int(dc["max_trades_day"]):
+                why.append("gia' %d aperture automatiche oggi" % stt["opened_today"])
+            sb = DK.streak_block([c.get("pnl_usdt", 0.0) for c in stt["closed"]], stt["since_last_close_h"], int(dc["streak_pause"]), float(dc["streak_pause_h"]))
+            if sb:
+                why.append(sb)
+            last = next((c for c in stt["closed"] if c["symbol"] == symbol), None)
+            if last and dc["cooldown_min"]:
+                try:
+                    mins = (datetime.now(timezone.utc) - datetime.fromisoformat(last["closed_at"])).total_seconds() / 60.0
+                    if mins < float(dc["cooldown_min"]):
+                        why.append("attesa dopo l'ultima chiusura su %s (ancora %d minuti)" % (symbol, float(dc["cooldown_min"]) - mins))
+                except Exception:  # noqa: BLE001
+                    pass
+        if why:
+            raise HTTPException(status_code=400, detail="NON apro: " + "; ".join(why))
+        if side == "long":
+            fill, info = await simulate_fill(symbol, "buy", price, cfg, quote_budget=pl["notional"])
+        else:
+            fill, info = await simulate_fill(symbol, "sell", price, cfg, base_qty=pl["notional"] / price)
+        qty = pl["notional"] / fill
+        lots = DK.lots_for(pl["notional"], int(dc["lots"]))
+        now = datetime.now(timezone.utc)
+        doc = {"id": str(uuid.uuid4()), "symbol": symbol, "status": "open", "side": side, "leverage": 1.0,
+               "entry": price, "fill_price": fill, "fill_model": info.get("fill_model"), "quantity": qty, "qty0": qty,
+               "notional": pl["notional"], "margin": pl["margin"], "stop": stop, "target": target,
+               "tp1": DK.tp1_price(side, fill, stop, float(dc["tp1_r"])) if lots > 1 else None,
+               "lots_total": lots, "lots_left": lots, "tp1_done": False, "realized_partial": 0.0,
+               "liquidation": None, "max_loss": pl["max_loss"], "rr": pl["rr"], "bias_at_entry": "terminale",
+               "forced": False, "auto": bool(auto), "funding_day_pct": float(dc["funding_day_pct"]),
+               "source": "terminale", "strategy": setup.get("strategy"), "strategy_name": setup.get("strategy_name"),
+               "opened_at": now.isoformat(), "opened_ts": now.timestamp()}
+        await db.desk_positions.insert_one(dict(doc))
+        await db.desk_wallet.update_one({"_id": "w"}, {"$inc": {"cash": -pl["margin"]}}, upsert=True)
+        await _desk_event(symbol, "%s %s a %.6g [%s] (importo %.2f in %d lotti, stop %.6g, obiettivo %.6g, perdita max %.2f)" % (
+            "APERTA DAL TERMINALE (auto)" if auto else "APERTA DAL TERMINALE", side, fill, setup.get("strategy_name"), pl["notional"], lots, stop, target, pl["max_loss"]))
+    doc.pop("_id", None)
+    return doc
+
+
+async def term_auto_pass() -> None:
+    tc = await _term_cfg()
+    if not tc["auto_enabled"] or not await _lab_get():
+        return
+    dc, cfg = await _desk_cfg(), await get_config()
+    for sym in tc["symbols"]:
+        if await db.desk_positions.find_one({"symbol": sym, "status": "open"}, {"_id": 1}):
+            continue
+        try:
+            an = await _term_analyze(sym, tc, cfg, risk_pct=float(tc["auto_risk_pct"]))
+            if an["verdict"] not in ("LONG", "SHORT"):
+                continue
+            setup = await db.term_setups.find_one({"id": an["setup_id"]}, {"_id": 0})
+            await _term_open_core(setup, dc, cfg, True, float(tc["auto_risk_pct"]))
+        except HTTPException as e:
+            key = "term|" + sym
+            st = await db.desk_state.find_one({"_id": key}) or {}
+            sig = __import__("re").sub(r"\d+(\.\d+)?", "#", str(e.detail))
+            if st.get("why") != sig or time.time() - float(st.get("ts", 0)) > 3600:
+                await db.desk_state.update_one({"_id": key}, {"$set": {"why": sig, "ts": time.time()}}, upsert=True)
+                await _desk_event(sym, "Terminale auto: setup trovato ma non apro - %s" % e.detail)
+        except Exception as e:  # noqa: BLE001
+            logger.warning("Terminale auto %s: %s", sym, e)
+
+
+async def term_loop() -> None:
+    last_auto = 0.0
+    await asyncio.sleep(40)
+    while True:
+        try:
+            tc = await _term_cfg()
+            if tc["enabled"]:
+                res = await _lab_get()
+                try:
+                    age = time.time() - datetime.fromisoformat(res["at"]).timestamp() if res else 1e12
+                except Exception:  # noqa: BLE001
+                    age = 1e12
+                if not _lab["running"] and age > 86400:
+                    asyncio.create_task(lab_run())
+                if tc["auto_enabled"] and time.time() - last_auto > float(tc["auto_every_min"]) * 60:
+                    last_auto = time.time()
+                    await term_auto_pass()
+        except Exception as e:  # noqa: BLE001
+            logger.exception("Terminale: errore nel ciclo: %s", e)
+        await asyncio.sleep(30)
+
+
+@api.get("/terminal/pairs")
+async def term_pairs() -> dict[str, Any]:
+    tc = await _term_cfg()
+    rows = await _term_pairs_raw()
+    by = {r["symbol"]: r for r in rows}
+    out = [by[s] for s in tc["symbols"] if s in by]
+    for r in rows:
+        if len(out) >= 24:
+            break
+        if r["symbol"] not in tc["symbols"]:
+            out.append(r)
+    return {"pairs": out}
+
+
+@api.get("/terminal/chart")
+async def term_chart(symbol: str, tf: str = "1h") -> dict[str, Any]:
+    if tf not in TF_MAP:
+        raise HTTPException(status_code=400, detail="Grafico non valido")
+    cs = await exchange.get_klines(symbol, tf, limit=130)
+    if not cs:
+        raise HTTPException(status_code=400, detail="Dati non disponibili per " + symbol)
+    rows = LAB.to_rows(cs)
+    rsi_all = LAB.rsi_series(rows)
+    show = 70
+    candles = [{"t": r[0], "o": r[1], "h": r[2], "l": r[3], "c": r[4], "v": r[5]} for r in rows[-show:]]
+    rsi = [None if x is None else round(x, 2) for x in rsi_all[-show:]]
+    tk: dict[str, Any] = {}
+    try:
+        d = await exchange._get("/v5/market/tickers", params={"category": exchange.category, "symbol": symbol})
+        it = (d or {}).get("result", {}).get("list", [{}])[0]
+        tk = {"last": float(it.get("lastPrice") or 0), "change": float(it.get("price24hPcnt") or 0) * 100.0,
+              "high": float(it.get("highPrice24h") or 0), "low": float(it.get("lowPrice24h") or 0), "turnover": float(it.get("turnover24h") or 0)}
+    except Exception:  # noqa: BLE001
+        pass
+    book: dict[str, Any] = {"bids": [], "asks": []}
+    try:
+        d = await exchange._get("/v5/market/orderbook", params={"category": exchange.category, "symbol": symbol, "limit": 12})
+        res = (d or {}).get("result", {})
+        book = {"bids": [[float(p), float(q)] for p, q in res.get("b", [])[:12]], "asks": [[float(p), float(q)] for p, q in res.get("a", [])[:12]]}
+    except Exception:  # noqa: BLE001
+        pass
+    pos = await db.desk_positions.find_one({"symbol": symbol, "status": "open"}, {"_id": 0, "side": 1, "fill_price": 1, "stop": 1, "target": 1})
+    return {"symbol": symbol, "tf": tf, "candles": candles, "rsi": rsi, "ticker": tk, "book": book, "position": pos}
+
+
+@api.post("/terminal/analyze")
+async def term_analyze(body: dict[str, Any]) -> dict[str, Any]:
+    symbol = str(body.get("symbol") or "")
+    if not symbol:
+        raise HTTPException(status_code=400, detail="Manca la coppia")
+    return await _term_analyze(symbol, await _term_cfg(), await get_config())
+
+
+@api.post("/terminal/open")
+async def term_open(body: dict[str, Any]) -> dict[str, Any]:
+    setup = await db.term_setups.find_one({"id": str(body.get("setup_id") or "")}, {"_id": 0})
+    if not setup:
+        raise HTTPException(status_code=400, detail="Setup non trovato: premi di nuovo Analizza")
+    if time.time() - float(setup["created_ts"]) > 1200:
+        raise HTTPException(status_code=400, detail="Setup scaduto (oltre 20 minuti): premi di nuovo Analizza")
+    dc, cfg = await _desk_cfg(), await get_config()
+    return {"ok": True, "position": await _term_open_core(setup, dc, cfg, False, float(dc["risk_pct"]))}
+
+
+@api.get("/terminal/lab")
+async def term_lab() -> dict[str, Any]:
+    tc = await _term_cfg()
+    res = await _lab_get()
+    out: dict[str, Any] = {"running": _lab["running"], "error": _lab["err"], "rigor": tc["rigor"], "config": tc}
+    if res:
+        rows = [r for r in res["rows"] if r.get("n", 0) >= 10]
+        for r in rows:
+            r["qualified"] = LAB.qualifies(r, tc["rigor"])
+        rows.sort(key=lambda r: -r.get("t", -99))
+        out.update({"at": res.get("at"), "fee_side": res.get("fee_side"), "symbols": res.get("symbols"), "tested": len(rows),
+                    "qualified": sum(1 for r in rows if r["qualified"]), "top": rows[:12],
+                    "candles": res.get("candles"), "all_candidates": len(res["rows"])})
+    return out
+
+
+@api.post("/terminal/lab/refresh")
+async def term_lab_refresh() -> dict[str, Any]:
+    if not _lab["running"]:
+        asyncio.create_task(lab_run())
+    return {"ok": True, "running": True}
+
+
+@api.post("/terminal/config")
+async def term_set_config(body: dict[str, Any]) -> dict[str, Any]:
+    cur = await _term_cfg()
+    new: dict[str, Any] = {}
+    for k, v in body.items():
+        if k not in LAB.DEFAULTS:
+            continue
+        if k in ("enabled", "auto_enabled"):
+            new[k] = bool(v)
+        elif k == "rigor":
+            if v not in LAB.RIGOR:
+                raise HTTPException(status_code=400, detail="Rigore non valido")
+            new[k] = v
+        elif k == "symbols":
+            syms = [str(x).upper().strip() for x in (v or []) if str(x).upper().strip().endswith("USDC")][:12]
+            if not syms:
+                raise HTTPException(status_code=400, detail="Serve almeno una coppia USDC")
+            new[k] = syms
+        else:
+            try:
+                x = float(v)
+            except (TypeError, ValueError):
+                raise HTTPException(status_code=400, detail="Valore non valido per " + k)
+            lo, hi = LAB.CFG_LIMITS[k]
+            if not (lo <= x <= hi):
+                raise HTTPException(status_code=400, detail="%s deve essere tra %g e %g" % (k, lo, hi))
+            new[k] = int(x) if k in ("auto_every_min", "max_universe") else x
+    cur.update(new)
+    await db.term_config.update_one({"_id": "term"}, {"$set": cur}, upsert=True)
+    return {"ok": True, "config": cur}
 
 
 # ============================================================================

@@ -63,6 +63,13 @@ const STRATEGIES: StrategyEntry[] = [
     route: "/desk",
   },
   {
+    key: "terminal",
+    title: "Terminale",
+    subtitle: "Coppie, grafico, volume, RSI e libro ordini. Il tasto Analizza dice long, short o passa (simulazione)",
+    icon: "pulse",
+    route: "/terminal",
+  },
+  {
     key: "real",
     title: "Trading reale",
     subtitle: "Soldi veri su Bybit: interruttore, limiti e STOP",
