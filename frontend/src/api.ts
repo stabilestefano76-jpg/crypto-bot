@@ -766,6 +766,40 @@ export const precheckApi = {
   save: (patch: Record<string, unknown>) =>
     req<{ settings: PrecheckSettings }>("/precheck/config", { method: "PUT", body: JSON.stringify(patch) }),
 };
+export type TermPair = { symbol: string; last: number; change: number; turnover: number };
+export type TermCandle = { t: number; o: number; h: number; l: number; c: number; v: number };
+export type TermChart = {
+  symbol: string; tf: string; candles: TermCandle[]; rsi: (number | null)[];
+  ticker: { last?: number; change?: number; high?: number; low?: number; turnover?: number };
+  book: { bids: number[][]; asks: number[][] };
+  position: { side: "long" | "short"; fill_price: number; stop: number; target: number } | null;
+};
+export type TermStrategy = {
+  id: string; name: string; family: string; tf: string; side: string; rr: number; n: number; coins: number;
+  net: number; gross: number; t: number; win: number; h1: number; h2: number; oos: number | null;
+};
+export type TermAnalysis = {
+  symbol: string; price: number; at: string; rigor: string; verdict: "LONG" | "SHORT" | "PASSA"; reasons: string[];
+  lab?: { tested: number; qualified: number; at?: string };
+  setup_id?: string; zone_from?: number; zone_to?: number; stop?: number; target?: number; simulation_only?: boolean;
+  plan?: DeskPlan; strategy?: TermStrategy; explain?: string;
+};
+export type TermLabRow = TermStrategy & { qualified: boolean };
+export type TermConfig = { enabled: boolean; rigor: string; auto_enabled: boolean; auto_risk_pct: number; symbols: string[]; lab_years: number; auto_every_min: number; max_universe: number };
+export type TermLab = {
+  running: boolean; error: string | null; rigor: string; config: TermConfig; at?: string; fee_side?: number; symbols?: string[];
+  tested?: number; qualified?: number; top?: TermLabRow[]; all_candidates?: number;
+};
+export const termApi = {
+  pairs: () => req<{ pairs: TermPair[] }>("/terminal/pairs"),
+  chart: (symbol: string, tf: string) => req<TermChart>(`/terminal/chart?symbol=${encodeURIComponent(symbol)}&tf=${tf}`),
+  analyze: (symbol: string) => req<TermAnalysis>("/terminal/analyze", { method: "POST", body: JSON.stringify({ symbol }) }),
+  open: (setup_id: string) => req<{ ok: boolean }>("/terminal/open", { method: "POST", body: JSON.stringify({ setup_id }) }),
+  lab: () => req<TermLab>("/terminal/lab"),
+  refreshLab: () => req<{ ok: boolean }>("/terminal/lab/refresh", { method: "POST" }),
+  setConfig: (c: Record<string, unknown>) => req<{ ok: boolean; config: TermConfig }>("/terminal/config", { method: "POST", body: JSON.stringify(c) }),
+};
+
 export type DeskPlan = {
   side: "long" | "short"; entry: number; stop: number; target: number; risk_pct_price: number; gain_pct_price: number;
   rr: number | null; leverage: number; safe_leverage: number; notional: number; margin: number;
