@@ -104,6 +104,113 @@ async def crus_real() -> dict[str, Any]:
     return out
 
 
+_crus_kr_cache: dict[str, Any] = {"at": 0.0, "val": None}
+_KR_NAMES = {"XXBT": "BTC", "XBT": "BTC", "XETH": "ETH", "XXRP": "XRP", "XLTC": "LTC", "XXDG": "DOGE", "ZEUR": "EUR", "ZUSD": "USD", "ZGBP": "GBP"}
+
+
+def kr_sign(secret_b64: str, path: str, nonce: int, postdata: str) -> str:
+    """Firma Kraken (API spot): HMAC-SHA512 di percorso + SHA256(nonce + dati), con il segreto decodificato base64."""
+    import base64, hashlib, hmac
+    sha = hashlib.sha256((str(nonce) + postdata).encode()).digest()
+    mac = hmac.new(base64.b64decode(secret_b64), path.encode() + sha, hashlib.sha512)
+    return base64.b64encode(mac.digest()).decode()
+
+
+async def kr_private(path: str, params: Optional[dict[str, Any]] = None) -> dict[str, Any]:
+    """Chiamata firmata a Kraken. SOLO percorsi di lettura (Balance, TradeBalance, OpenOrders...): gli ordini non sono previsti."""
+    from urllib.parse import urlencode
+    if path.split("/")[-1] not in ("Balance", "TradeBalance", "OpenOrders", "ClosedOrders", "TradesHistory", "Ledgers"):
+        raise RuntimeError("Percorso Kraken non consentito: solo lettura")
+    doc = await db.exchange_creds.find_one({"_id": "kraken"}, {"_id": 0})
+    if not doc:
+        raise RuntimeError("Nessuna chiave Kraken collegata")
+    nonce = time.time_ns() // 1000
+    post = urlencode({"nonce": nonce, **(params or {})})
+    headers = {"API-Key": decrypt_str(doc["api_key"]), "API-Sign": kr_sign(decrypt_str(doc["api_secret"]), path, nonce, post),
+               "Content-Type": "application/x-www-form-urlencoded"}
+    async with httpx.AsyncClient(timeout=15.0) as c:
+        r = await c.post("https://api.kraken.com" + path, content=post, headers=headers)
+    return r.json()
+
+
+def kr_error_text(errs: list[str]) -> str:
+    t = "; ".join(errs)
+    if "Permission denied" in t:
+        return "Manca un permesso sulla chiave (serve 'Query' fra i fondi). " + t
+    if "Invalid key" in t or "Invalid signature" in t:
+        return "Chiave o segreto non corretti. " + t
+    return t
+
+
+async def crus_kraken() -> dict[str, Any]:
+    """Saldi Kraken (spot), SOLA LETTURA. Cache 30 secondi."""
+    if _crus_kr_cache["val"] is not None and time.time() - _crus_kr_cache["at"] < 30:
+        return _crus_kr_cache["val"]
+    out: dict[str, Any] = {"connected": False, "error": None, "total_eur": None, "coins": [], "masked": None}
+    try:
+        doc = await db.exchange_creds.find_one({"_id": "kraken"}, {"_id": 0, "api_key_masked": 1})
+        if not doc:
+            out["error"] = "Nessuna chiave Kraken collegata"
+        else:
+            out["masked"] = doc.get("api_key_masked")
+            b = await kr_private("/0/private/Balance")
+            if b.get("error"):
+                out["error"] = kr_error_text(b["error"])
+            else:
+                coins = []
+                for k, v in (b.get("result") or {}).items():
+                    try:
+                        q = float(v)
+                    except (TypeError, ValueError):
+                        continue
+                    if q > 0:
+                        coins.append({"coin": _KR_NAMES.get(k, k), "qty": q})
+                tb = await kr_private("/0/private/TradeBalance", {"asset": "ZEUR"})
+                tot = None
+                if not tb.get("error"):
+                    try:
+                        tot = round(float((tb.get("result") or {}).get("eb")), 2)
+                    except (TypeError, ValueError):
+                        tot = None
+                out.update({"connected": True, "coins": coins[:15], "total_eur": tot})
+    except Exception as e:  # noqa: BLE001
+        out["error"] = str(e)[:160]
+    _crus_kr_cache.update({"at": time.time(), "val": out})
+    return out
+
+
+@api.post("/kraken/connect")
+async def kraken_connect(body: dict[str, Any]) -> dict[str, Any]:
+    if not os.environ.get("ENCRYPTION_SECRET", "").strip():
+        raise HTTPException(status_code=400, detail="Prima imposta la variabile ENCRYPTION_SECRET su Railway.")
+    key, sec = str(body.get("api_key") or "").strip(), str(body.get("api_secret") or "").strip()
+    if not key or not sec:
+        raise HTTPException(status_code=400, detail="Servono chiave e segreto")
+    try:
+        import base64
+        base64.b64decode(sec, validate=True)
+    except Exception:  # noqa: BLE001
+        raise HTTPException(status_code=400, detail="Il segreto non sembra corretto: deve essere copiato per intero.")
+    await db.exchange_creds.update_one({"_id": "kraken"}, {"$set": {
+        "api_key": encrypt_str(key), "api_secret": encrypt_str(sec),
+        "api_key_masked": (key[:4] + "…" + key[-4:]) if len(key) > 8 else "***",
+        "connected_at": datetime.now(timezone.utc).isoformat()}}, upsert=True)
+    _crus_kr_cache.update({"at": 0.0, "val": None})
+    res = await crus_kraken()
+    if not res["connected"]:
+        await db.exchange_creds.delete_one({"_id": "kraken"})
+        _crus_kr_cache.update({"at": 0.0, "val": None})
+        raise HTTPException(status_code=400, detail="Collegamento non riuscito: " + str(res.get("error")))
+    return res
+
+
+@api.post("/kraken/disconnect")
+async def kraken_disconnect() -> dict[str, Any]:
+    await db.exchange_creds.delete_one({"_id": "kraken"})
+    _crus_kr_cache.update({"at": 0.0, "val": None})
+    return {"ok": True}
+
+
 @api.get("/cruscotto")
 async def cruscotto() -> dict[str, Any]:
     st = await desk_status()
@@ -166,6 +273,7 @@ async def cruscotto() -> dict[str, Any]:
                  "scan_top": [r.get("symbol") for r in (scan.get("rows") or [])[:5]], "terminal": term},
         "events": st["events"][:8],
         "real": await crus_real(),
+        "kraken": await crus_kraken(),
     }
 
 

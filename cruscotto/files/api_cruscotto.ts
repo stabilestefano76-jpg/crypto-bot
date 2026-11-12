@@ -27,9 +27,13 @@ export type Cruscotto = {
     terminal: { installed: boolean; auto?: boolean; rigor?: string; qualified?: number | null; tested?: number | null; archive_at?: string | null; last_setups?: { symbol: string; side: string }[]; error?: string };
   };
   events: { at: string; symbol: string; text: string }[];
+  kraken: { connected: boolean; error: string | null; total_eur: number | null; coins: { coin: string; qty: number }[]; masked: string | null };
   real: { connected: boolean; error: string | null; total_usd: number | null; coins: { coin: string; qty: number; usd: number }[]; note: string };
 };
 export const crusApi = {
   get: () => req<Cruscotto>("/cruscotto"),
+  krakenConnect: (api_key: string, api_secret: string) =>
+    req<{ connected: boolean }>("/kraken/connect", { method: "POST", body: JSON.stringify({ api_key, api_secret }) }),
+  krakenDisconnect: () => req<{ ok: boolean }>("/kraken/disconnect", { method: "POST" }),
 };
 // CRUSCOTTO-FINE

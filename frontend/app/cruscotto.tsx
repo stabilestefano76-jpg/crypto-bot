@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useState } from "react";
-import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, View } from "react-native";
+import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, View } from "react-native";
 import { useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
@@ -119,6 +119,22 @@ export default function CruscottoScreen() {
   const [d, setD] = useState<Cruscotto | null>(null);
   const [err, setErr] = useState("");
   const [tab, setTab] = useState<"sim" | "real">("sim");
+  const [krKey, setKrKey] = useState("");
+  const [krSec, setKrSec] = useState("");
+  const [krMsg, setKrMsg] = useState("");
+  const [krBusy, setKrBusy] = useState(false);
+  const krConnect = async () => {
+    if (!krKey.trim() || !krSec.trim()) { setKrMsg("Scrivi chiave e segreto."); return; }
+    setKrBusy(true); setKrMsg("");
+    try { await crusApi.krakenConnect(krKey.trim(), krSec.trim()); setKrKey(""); setKrSec(""); setKrMsg("Collegato."); await load(); }
+    catch (e: any) { setKrMsg(String(e?.message ?? "Errore")); }
+    setKrBusy(false);
+  };
+  const krDisconnect = async () => {
+    setKrBusy(true);
+    try { await crusApi.krakenDisconnect(); setKrMsg("Scollegato."); await load(); } catch (e: any) { setKrMsg(String(e?.message ?? "Errore")); }
+    setKrBusy(false);
+  };
 
   const load = useCallback(async () => {
     try { setD(await crusApi.get()); setErr(""); } catch (e: any) { setErr(String(e?.message ?? "Errore")); }
@@ -251,6 +267,37 @@ export default function CruscottoScreen() {
 
           {tab === "real" && (
             <View style={st.card}>
+              <Text style={st.dim}>Portafoglio Kraken (sola lettura)</Text>
+              {d.kraken.connected ? (<>
+                <Text style={st.hero}>{d.kraken.total_eur === null ? "-" : `€${d.kraken.total_eur.toFixed(2)}`}</Text>
+                <Text style={st.dim}>Chiave {d.kraken.masked}</Text>
+                {d.kraken.coins.length === 0 && <Text style={[st.dim, { marginTop: 8 }]}>Nessun saldo sul conto spot.</Text>}
+                {d.kraken.coins.map((c) => (
+                  <View key={c.coin} style={[st.rowBetween, { marginTop: 8 }]}>
+                    <Text style={st.txt}>{c.coin}</Text>
+                    <Text style={st.txt}>{c.qty < 1 ? c.qty.toFixed(6) : c.qty.toFixed(4)}</Text>
+                  </View>
+                ))}
+                <Pressable style={[st.tab, { marginTop: 14, marginRight: 0, opacity: krBusy ? 0.4 : 1 }]} disabled={krBusy} onPress={krDisconnect}>
+                  <Text style={st.txt}>Scollega Kraken</Text>
+                </Pressable>
+              </>) : (<>
+                <Text style={[st.txt, { marginTop: 8 }]}>Non collegato.</Text>
+                <Text style={[st.dim, { marginTop: 6 }]}>Incolla qui la chiave e il segreto creati su Kraken con i soli permessi di lettura. Restano salvati cifrati sul server.</Text>
+                <TextInput style={st.inp} placeholder="Chiave (API key)" placeholderTextColor={DIM} value={krKey} onChangeText={setKrKey} autoCapitalize="none" autoCorrect={false} />
+                <TextInput style={st.inp} placeholder="Segreto (private key)" placeholderTextColor={DIM} value={krSec} onChangeText={setKrSec} autoCapitalize="none" autoCorrect={false} secureTextEntry />
+                <Pressable style={[st.tab, { marginTop: 12, marginRight: 0, backgroundColor: WARN, opacity: krBusy ? 0.4 : 1 }]} disabled={krBusy} onPress={krConnect}>
+                  <Text style={[st.txt, { color: "#000", fontWeight: "700" }]}>{krBusy ? "Controllo..." : "Collega Kraken"}</Text>
+                </Pressable>
+                {!!d.kraken.error && d.kraken.error !== "Nessuna chiave Kraken collegata" && <Text style={[st.dim, { color: WARN, marginTop: 8 }]}>{d.kraken.error}</Text>}
+              </>)}
+              {!!krMsg && <Text style={[st.dim, { color: WARN, marginTop: 8 }]}>{krMsg}</Text>}
+              <Text style={[st.dim, { marginTop: 12 }]}>Questa chiave legge solo i saldi: non ha il permesso di fare ordini né prelievi. Lo short vero sui derivati si aggiunge dopo.</Text>
+            </View>
+          )}
+
+          {tab === "real" && (
+            <View style={st.card}>
               <Text style={st.dim}>Portafoglio reale su Bybit</Text>
               {d.real.connected ? (<>
                 <Text style={st.hero}>{usdp(d.real.total_usd)}</Text>
@@ -293,5 +340,6 @@ const st = StyleSheet.create({
   badgeTxt: { color: "#000", fontSize: 11, fontWeight: "800" },
   pbar: { height: 8, backgroundColor: LINE, borderRadius: 4, marginVertical: 8, overflow: "visible" },
   pfill: { height: 8, borderRadius: 4, opacity: 0.8 },
+  inp: { backgroundColor: BG, color: TXT, borderRadius: 8, padding: 10, marginTop: 10, borderWidth: 1, borderColor: LINE, fontSize: 14 },
   pmark: { position: "absolute", top: -3, width: 2, height: 14 },
 });
