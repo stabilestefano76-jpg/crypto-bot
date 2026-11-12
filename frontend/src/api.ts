@@ -889,7 +889,22 @@ export type CrusConfronto = {
   kraken_ok: boolean; note: string;
   rows: { symbol: string; bybit: number | null; kraken_symbol: string | null; kraken: number | null; diff_pct: number | null; kraken_spread_pct: number | null; funding_day_pct: number | null }[];
 };
+export type CrusTrade = {
+  id: string; symbol: string; side: "long" | "short"; leverage: number; auto: boolean; opened_at?: string; closed_at?: string; hold_h: number | null;
+  entry: number | null; exit: number | null; stop: number | null; target: number | null; notional: number | null; margin: number | null;
+  pnl: number; pnl_pct_margin: number | null; r: number | null; reason?: string | null; carry?: number | null;
+};
+export type CrusReport = {
+  total: number; page: number; per: number; symbols: string[];
+  summary: (CrusPart & { long: CrusPart; short: CrusPart; best: number | null; worst: number | null; max_loss_streak: number; avg_hold_h: number | null; carry_total: number; auto_n: number }) | null;
+  by_symbol: { symbol: string; n: number; win_rate: number | null; pnl: number }[];
+  by_reason: { reason: string; n: number; win_rate: number | null; pnl: number }[];
+  by_day: { day: string; pnl: number }[];
+  trades: CrusTrade[];
+};
 export const crusApi = {
+  report: (q: { side?: string; esito?: string; symbol?: string; page?: number }) =>
+    req<CrusReport>(`/cruscotto/report?side=${q.side ?? ""}&esito=${q.esito ?? ""}&symbol=${q.symbol ?? ""}&page=${q.page ?? 0}&per=30`),
   setSettings: (b: { capital?: number; rr?: number }) => req<{ ok: boolean }>("/cruscotto/impostazioni", { method: "POST", body: JSON.stringify(b) }),
   confronto: () => req<CrusConfronto>("/cruscotto/confronto"),
   get: () => req<Cruscotto>("/cruscotto"),

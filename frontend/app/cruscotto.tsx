@@ -273,8 +273,8 @@ export default function CruscottoScreen() {
               <Text style={st.h}>Capitale e rendimento/rischio</Text>
               <Text style={[st.dim, { marginTop: 8 }]}>Capitale del portafoglio simulato: ${d.settings.capital.toFixed(2)}</Text>
               <View style={{ flexDirection: "row", marginTop: 8 }}>
-                <TextInput style={[st.inp, { flex: 1, marginTop: 0 }]} placeholder="Nuovo capitale (10 - 100000)" placeholderTextColor={DIM} value={capIn} onChangeText={setCapIn} keyboardType="decimal-pad" />
-                <Pressable style={[st.tab, { marginLeft: 8, marginRight: 0, flex: 0, paddingHorizontal: 14, opacity: d.settings.can_change_capital ? 1 : 0.4 }]} disabled={!d.settings.can_change_capital}
+                <TextInput style={[st.inp, { flex: 1, minWidth: 0, marginTop: 0 }]} placeholder="Nuovo capitale (10 - 100000)" placeholderTextColor={DIM} value={capIn} onChangeText={setCapIn} keyboardType="decimal-pad" />
+                <Pressable style={[st.tab, { marginLeft: 8, marginRight: 0, flex: 0, width: 96, paddingHorizontal: 4, opacity: d.settings.can_change_capital ? 1 : 0.4 }]} disabled={!d.settings.can_change_capital}
                   onPress={() => { const v = num(capIn); if (isNaN(v)) { setSetMsg("Scrivi un numero."); return; } saveSettings({ capital: v }, "Capitale cambiato: il portafoglio riparte da qui."); setCapIn(""); }}>
                   <Text style={[st.txt, { fontWeight: "700" }]}>Imposta</Text>
                 </Pressable>
@@ -298,8 +298,8 @@ export default function CruscottoScreen() {
                 })}
               </View>
               <View style={{ flexDirection: "row", marginTop: 8 }}>
-                <TextInput style={[st.inp, { flex: 1, marginTop: 0 }]} placeholder="Altro valore (0,8 - 6)" placeholderTextColor={DIM} value={rrIn} onChangeText={setRrIn} keyboardType="decimal-pad" />
-                <Pressable style={[st.tab, { marginLeft: 8, marginRight: 0, flex: 0, paddingHorizontal: 14 }]}
+                <TextInput style={[st.inp, { flex: 1, minWidth: 0, marginTop: 0 }]} placeholder="Altro valore (0,8 - 6)" placeholderTextColor={DIM} value={rrIn} onChangeText={setRrIn} keyboardType="decimal-pad" />
+                <Pressable style={[st.tab, { marginLeft: 8, marginRight: 0, flex: 0, width: 96, paddingHorizontal: 4 }]}
                   onPress={() => { const v = num(rrIn); if (isNaN(v)) { setSetMsg("Scrivi un numero."); return; } saveSettings({ rr: v }, `RR impostato a 1 a ${v}.`); setRrIn(""); }}>
                   <Text style={[st.txt, { fontWeight: "700" }]}>Imposta</Text>
                 </Pressable>
@@ -337,18 +337,20 @@ export default function CruscottoScreen() {
               </>) : <Text style={[st.dim, { marginTop: 6 }]}>Terminale non installato.</Text>}
             </View>
 
-            {!!d.recent_closed.length && (
-              <View style={st.card}>
-                <Text style={st.h}>Ultime chiusure</Text>
-                {d.recent_closed.map((c, i) => (
-                  <View key={i} style={[st.rowBetween, { marginTop: 6 }]}>
-                    <Text style={st.txt}>{c.symbol} · {c.side.toUpperCase()}</Text>
-                    <Text style={[st.dim, { flex: 1, textAlign: "center" }]}>{c.reason === "chiusura_manuale" ? "chiusa da te" : c.reason ?? ""}</Text>
-                    <Text style={[st.txt, { color: col(c.pnl), fontWeight: "700" }]}>{usd(c.pnl)}</Text>
-                  </View>
-                ))}
-              </View>
-            )}
+            <View style={st.card}>
+              <Text style={st.h}>Ultime chiusure</Text>
+              {d.recent_closed.length === 0 && <Text style={[st.dim, { marginTop: 6 }]}>Ancora nessuna operazione chiusa.</Text>}
+              {d.recent_closed.map((c, i) => (
+                <View key={i} style={[st.rowBetween, { marginTop: 6 }]}>
+                  <Text style={st.txt}>{c.symbol} · {c.side.toUpperCase()}</Text>
+                  <Text style={[st.dim, { flex: 1, textAlign: "center" }]}>{c.reason === "chiusura_manuale" ? "chiusa da te" : c.reason ?? ""}</Text>
+                  <Text style={[st.txt, { color: col(c.pnl), fontWeight: "700" }]}>{usd(c.pnl)}</Text>
+                </View>
+              ))}
+              <Pressable style={[st.tab, { marginTop: 12, marginRight: 0, backgroundColor: WARN }]} onPress={() => router.push("/report")}>
+                <Text style={[st.txt, { fontWeight: "700", color: "#000" }]}>Apri il report completo</Text>
+              </Pressable>
+            </View>
 
             <View style={st.card}>
               <Text style={st.h}>Ultimi eventi</Text>

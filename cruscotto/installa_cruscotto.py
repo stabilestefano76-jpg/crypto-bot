@@ -111,7 +111,7 @@ def patch_strategies(s):
 
 
 PATCHES = {"backend/server.py": patch_server, "frontend/src/api.ts": patch_api, "frontend/app/strategies.tsx": patch_strategies}
-NEW = {"frontend/app/cruscotto.tsx": ("frontend", "app", "cruscotto.tsx")}
+NEW = {"frontend/app/cruscotto.tsx": ("frontend", "app", "cruscotto.tsx"), "frontend/app/report.tsx": ("frontend", "app", "report.tsx")}
 
 
 def apply_all(root):

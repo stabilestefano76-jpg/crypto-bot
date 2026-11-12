@@ -5967,9 +5967,12 @@ async def kr_book(bybit_symbol: str) -> Optional[tuple[list[list[float]], list[l
     j = await kr_pub("/derivatives/api/v3/orderbook", {"symbol": sym})
     try:
         ob = (j or {}).get("orderBook") or {}
-        bids = [[float(r[0]), float(r[1])] for r in ob.get("bids", [])][:50]
-        asks = [[float(r[0]), float(r[1])] for r in ob.get("asks", [])][:50]
+        # l'ordine delle righe non e' garantito: ordino io (offerte dal prezzo piu' alto, richieste dal piu' basso)
+        bids = sorted(([float(r[0]), float(r[1])] for r in ob.get("bids", [])), key=lambda r: -r[0])[:50]
+        asks = sorted(([float(r[0]), float(r[1])] for r in ob.get("asks", [])), key=lambda r: r[0])[:50]
         if not bids or not asks or bids[0][0] <= 0 or asks[0][0] < bids[0][0]:
+            return None
+        if (asks[0][0] / bids[0][0] - 1.0) * 100.0 > 1.0:       # scarto oltre l'1%: il libro non e' affidabile, si usa Bybit
             return None
         return bids, asks
     except (TypeError, ValueError, IndexError):
@@ -6123,6 +6126,73 @@ async def cruscotto_set_costs(body: dict[str, Any]) -> dict[str, Any]:
     await db.crus_config.update_one({"_id": "cost"}, {"$set": {"mode": mode}}, upsert=True)
     await crus_cost_load()
     return {"ok": True, "mode": mode}
+
+
+def _crus_hold_h(a: Any, b: Any) -> Optional[float]:
+    try:
+        return round((datetime.fromisoformat(str(b)) - datetime.fromisoformat(str(a))).total_seconds() / 3600.0, 2)
+    except (TypeError, ValueError):
+        return None
+
+
+def crus_report_summary(rows: list[dict[str, Any]]) -> dict[str, Any]:
+    st = crus_stats(rows)
+    chron = sorted(rows, key=lambda r: str(r.get("closed_at") or ""))
+    run = mx = 0
+    for r in chron:
+        if float(r.get("pnl_usdt") or 0.0) < 0:
+            run += 1
+            mx = max(mx, run)
+        else:
+            run = 0
+    holds = [h for h in (_crus_hold_h(r.get("opened_at"), r.get("closed_at")) for r in rows) if h is not None]
+    st["max_loss_streak"] = mx
+    st["avg_hold_h"] = round(sum(holds) / len(holds), 2) if holds else None
+    st["carry_total"] = round(sum(float(r.get("carry_usdt") or 0.0) for r in rows), 4)
+    st["auto_n"] = len([r for r in rows if r.get("auto")])
+    return st
+
+
+@api.get("/cruscotto/report")
+async def cruscotto_report(side: str = "", esito: str = "", symbol: str = "", page: int = 0, per: int = 30) -> dict[str, Any]:
+    """Report completo di tutte le operazioni chiuse di Analisi e rischio, con filtri e pagine."""
+    docs = await db.desk_positions.find({"status": "closed"}, {"_id": 0}).sort("closed_at", -1).to_list(5000)
+    rows = [d for d in docs
+            if (side not in ("long", "short") or d.get("side") == side)
+            and (esito != "vinte" or float(d.get("pnl_usdt") or 0.0) > 0)
+            and (esito != "perse" or float(d.get("pnl_usdt") or 0.0) <= 0)
+            and (not symbol or d.get("symbol") == symbol)]
+    per = max(5, min(int(per), 100))
+    page = max(0, int(page))
+    by_sym: dict[str, list[dict[str, Any]]] = {}
+    by_rsn: dict[str, list[dict[str, Any]]] = {}
+    by_day: dict[str, float] = {}
+    for r in rows:
+        by_sym.setdefault(str(r.get("symbol")), []).append(r)
+        by_rsn.setdefault(str(r.get("close_reason") or "-"), []).append(r)
+        day = str(r.get("closed_at") or "")[:10]
+        by_day[day] = by_day.get(day, 0.0) + float(r.get("pnl_usdt") or 0.0)
+    def agg(g: dict[str, list[dict[str, Any]]], key: str) -> list[dict[str, Any]]:
+        out = []
+        for k, v in g.items():
+            p = crus_stats(v)
+            out.append({key: k, "n": p["n"], "win_rate": p["win_rate"], "pnl": p["pnl"]})
+        return sorted(out, key=lambda x: -x["pnl"])
+    trades = []
+    for r in rows[page * per:(page + 1) * per]:
+        pnl = float(r.get("pnl_usdt") or 0.0)
+        ml = float(r.get("max_loss") or 0.0)
+        mg = float(r.get("margin") or 0.0)
+        trades.append({"id": r.get("id"), "symbol": r.get("symbol"), "side": r.get("side"), "leverage": r.get("leverage"), "auto": bool(r.get("auto")),
+                       "opened_at": r.get("opened_at"), "closed_at": r.get("closed_at"), "hold_h": _crus_hold_h(r.get("opened_at"), r.get("closed_at")),
+                       "entry": r.get("fill_price"), "exit": r.get("close_price"), "stop": r.get("stop"), "target": r.get("target"),
+                       "notional": r.get("notional"), "margin": r.get("margin"), "pnl": round(pnl, 4),
+                       "pnl_pct_margin": round(pnl / mg * 100.0, 2) if mg > 0 else None, "r": round(pnl / ml, 2) if ml > 0 else None,
+                       "reason": r.get("close_reason"), "carry": r.get("carry_usdt")})
+    symbols = sorted({str(d.get("symbol")) for d in docs})
+    return {"total": len(rows), "page": page, "per": per, "symbols": symbols, "summary": crus_report_summary(rows) if rows else None,
+            "by_symbol": agg(by_sym, "symbol"), "by_reason": agg(by_rsn, "reason"),
+            "by_day": [{"day": d, "pnl": round(v, 4)} for d, v in sorted(by_day.items())[-14:]], "trades": trades}
 
 
 @api.get("/cruscotto")
