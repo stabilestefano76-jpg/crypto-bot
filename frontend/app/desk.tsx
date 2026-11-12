@@ -24,6 +24,7 @@ export default function DeskScreen() {
   const [risk, setRisk] = useState("1");
   const [an, setAn] = useState<DeskAnalysis | null>(null);
   const [msg, setMsg] = useState("");
+  const [saveMsg, setSaveMsg] = useState("");
   const [busy, setBusy] = useState(false);
   const [capital, setCapital] = useState("");
   const [af, setAf] = useState<Record<string, string> | null>(null);
@@ -71,8 +72,13 @@ export default function DeskScreen() {
   };
   const setAuto = async (patch: Record<string, unknown>) => {
     setBusy(true);
-    try { await deskApi.setConfig(patch); setMsg("Salvato."); }
-    catch (e: any) { setMsg("ERRORE: " + String(e?.message ?? e)); }
+    setSaveMsg("");
+    try {
+      await deskApi.setConfig(patch);
+      setSaveMsg("✓ Salvato. I valori qui sopra sono quelli ora in uso dal bot.");
+      if (af && Object.keys(patch).some((k) => k in af)) setAf(null);
+    }
+    catch (e: any) { setSaveMsg("NON salvato: " + String(e?.message ?? e)); }
     setBusy(false); load();
   };
   const saveAutoNums = () => {
@@ -80,7 +86,7 @@ export default function DeskScreen() {
     const patch: Record<string, number> = {};
     for (const k of Object.keys(af)) {
       const n = num(af[k]);
-      if (!isFinite(n) || n < 0) { setMsg("ERRORE: scrivi numeri validi."); return; }
+      if (!isFinite(n) || n < 0) { setSaveMsg("NON salvato: scrivi numeri validi (con il punto o la virgola)."); return; }
       patch[k] = n;
     }
     setAuto(patch);
@@ -176,14 +182,14 @@ export default function DeskScreen() {
           <Text style={styles.line}>Rischio aperto {usd(st.risk.open_risk)} su massimo {usd(st.risk.open_risk_limit)}</Text>
           <Text style={styles.line}>Risultato di oggi {usd(st.risk.today_pnl)} (limite {usd(st.risk.daily_limit)}) · aperture del bot oggi {st.risk.auto_today}</Text>
           {!!st.risk.pause && <Text style={[styles.note, { color: colors.warning }]}>⏸ {st.risk.pause}</Text>}
-          {autoField("Leva massima del bot (si abbassa da sola se serve)", "auto_leverage")}
-          {autoField("Rischio per operazione (% del capitale)", "auto_risk_pct")}
-          {autoField("Rischio totale massimo di tutte le posizioni (% del capitale)", "max_total_risk_pct")}
-          {autoField("Perdita massima al giorno (% del capitale)", "daily_loss_pct")}
-          {autoField("Aperture automatiche al giorno (massimo)", "max_trades_day")}
+          {autoField("Leva massima del bot, da 1 a 10 (si abbassa da sola se serve)", "auto_leverage")}
+          {autoField("Rischio per operazione (% del capitale, da 0,1 a 3)", "auto_risk_pct")}
+          {autoField("Rischio totale massimo di tutte le posizioni (% del capitale, da 0,5 a 10)", "max_total_risk_pct")}
+          {autoField("Perdita massima al giorno (% del capitale, da 0,5 a 10)", "daily_loss_pct")}
+          {autoField("Aperture automatiche al giorno (massimo, da 1 a 20)", "max_trades_day")}
           {autoField("Lotti (1-3)", "lots")}
-          {autoField("Primo lotto chiuso quando il guadagno vale (volte il rischio)", "tp1_r")}
-          {autoField("Attesa su una moneta dopo una chiusura (minuti)", "cooldown_min")}
+          {autoField("Primo lotto chiuso quando il guadagno vale (volte il rischio, da 0,3 a 3)", "tp1_r")}
+          {autoField("Attesa su una moneta dopo una chiusura (minuti, da 0 a 1440)", "cooldown_min")}
           <View style={styles.row}>
             <Text style={styles.line}>Stop a pareggio dopo il primo lotto</Text>
             <Switch value={st.config.be_after_tp1} disabled={busy} onValueChange={(v) => setAuto({ be_after_tp1: v })} testID="desk-be-switch" />
@@ -191,6 +197,7 @@ export default function DeskScreen() {
           <Pressable style={[styles.btn, { opacity: busy || !af ? 0.4 : 1 }]} disabled={busy || !af} onPress={saveAutoNums}>
             <Text style={styles.btnText}>Salva impostazioni</Text>
           </Pressable>
+          {!!saveMsg && <Text style={[styles.msg, { marginTop: 8, color: saveMsg.startsWith("✓") ? colors.success : colors.error }]}>{saveMsg}</Text>}
           <Text style={styles.note}>Dopo {st.config.streak_pause} perdite di fila il bot si ferma per {st.config.streak_pause_h} ore. Il rischio totale e il limite giornaliero valgono anche se apri tu.</Text>
         </View>
 
@@ -207,6 +214,7 @@ export default function DeskScreen() {
           <Pressable style={[styles.btn, { opacity: busy || !af ? 0.4 : 1 }]} disabled={busy || !af} onPress={saveAutoNums}>
             <Text style={styles.btnText}>Salva impostazioni</Text>
           </Pressable>
+          {!!saveMsg && <Text style={[styles.msg, { marginTop: 8, color: saveMsg.startsWith("✓") ? colors.success : colors.error }]}>{saveMsg}</Text>}
           <Pressable style={[styles.btn, styles.btnGhost, { opacity: busy || st.scan.running ? 0.4 : 1 }]} disabled={busy || st.scan.running} onPress={async () => { setBusy(true); try { await deskApi.scan(); setMsg("Scansione avviata: ci vuole un minuto circa."); } catch (e: any) { setMsg("ERRORE: " + String(e?.message ?? e)); } setBusy(false); load(); }}>
             <Text style={[styles.btnText, { color: colors.onSurface }]}>{st.scan.running ? "Scansione in corso..." : "Scandaglia ora"}</Text>
           </Pressable>
