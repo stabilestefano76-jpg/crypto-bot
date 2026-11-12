@@ -372,6 +372,51 @@ async def crus_cost_load() -> None:
     doc = await db.crus_config.find_one({"_id": "cost"}, {"_id": 0}) or {}
     mode = doc.get("mode") if doc.get("mode") in ("bybit", "kraken") else "bybit"
     _crus_cost.update({"mode": mode, "fee": KRAKEN_PERP_FEE_SIDE if mode == "kraken" else None})
+    rr = (await db.crus_config.find_one({"_id": "rr"}, {"_id": 0}) or {}).get("rr")
+    _crus_rr["rr"] = float(rr) if rr else None
+
+
+_crus_rr: dict[str, Any] = {"rr": None}      # None = automatico (come prima: obiettivo a 4 ATR, rendimento/rischio fra 1,6 e 2,7 circa)
+
+
+def _desk_risk_plan(side: str, price: float, candles_1h: list[list[float]], atr_val: float, **kw: Any) -> dict[str, Any]:
+    """Piano di Analisi e rischio; se hai scelto un rendimento/rischio (RR) fisso, l'obiettivo si mette a RR volte la distanza dello stop."""
+    pl = DK.risk_plan(side, price, candles_1h, atr_val, **kw)
+    rr = _crus_rr.get("rr")
+    if rr and pl.get("risk_pct_price"):
+        risk_frac = pl["risk_pct_price"] / 100.0
+        gain_frac = float(rr) * risk_frac
+        pl["target"] = price * (1.0 + gain_frac) if side == "long" else price * (1.0 - gain_frac)
+        pl["gain_pct_price"] = gain_frac * 100.0
+        pl["rr"] = float(rr)
+        pl["expected_gain"] = pl["notional"] * (gain_frac - pl["cost_pct"] / 100.0)
+    return pl
+
+
+@api.post("/cruscotto/impostazioni")
+async def cruscotto_settings(body: dict[str, Any]) -> dict[str, Any]:
+    """Capitale del portafoglio simulato e rendimento/rischio (RR) delle nuove analisi."""
+    out: dict[str, Any] = {}
+    if "rr" in body:
+        try:
+            v = float(body["rr"] or 0.0)
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="RR non valido")
+        if v != 0.0 and not (0.8 <= v <= 6.0):
+            raise HTTPException(status_code=400, detail="RR tra 0,8 e 6 (oppure automatico).")
+        await db.crus_config.update_one({"_id": "rr"}, {"$set": {"rr": v if v else None}}, upsert=True)
+        await crus_cost_load()
+        out["rr"] = _crus_rr["rr"]
+    if "capital" in body:
+        try:
+            c = float(body["capital"])
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Capitale non valido")
+        await desk_set_config({"capital": c})                  # controlla i limiti, rifiuta se ci sono posizioni aperte e rimette il contante a c
+        await db.desk_equity.delete_many({})                    # la curva riparte dal nuovo capitale
+        await crus_snapshot(force=True)
+        out["capital"] = c
+    return {"ok": True, **out}
 
 
 @api.post("/cruscotto/costs")
@@ -450,6 +495,7 @@ async def cruscotto() -> dict[str, Any]:
                  "scan_top": [r.get("symbol") for r in (scan.get("rows") or [])[:5]], "terminal": term},
         "events": st["events"][:8],
         "real": await crus_real(),
+        "settings": {"capital": cap0, "rr": _crus_rr["rr"], "can_change_capital": len(st["open"]) == 0},
         "kraken": await crus_kraken(),
         "costs": {"mode": _crus_cost["mode"], "fee_side_pct": round(_desk_fee(await get_config()), 4),
                   "round_trip_pct": round(2 * _desk_fee(await get_config()), 4)},

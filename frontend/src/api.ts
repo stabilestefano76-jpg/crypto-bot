@@ -880,6 +880,7 @@ export type Cruscotto = {
     terminal: { installed: boolean; auto?: boolean; rigor?: string; qualified?: number | null; tested?: number | null; archive_at?: string | null; last_setups?: { symbol: string; side: string }[]; error?: string };
   };
   events: { at: string; symbol: string; text: string }[];
+  settings: { capital: number; rr: number | null; can_change_capital: boolean };
   costs: { mode: "bybit" | "kraken"; fee_side_pct: number; round_trip_pct: number };
   kraken: { connected: boolean; error: string | null; total_eur: number | null; coins: { coin: string; qty: number }[]; masked: string | null };
   real: { connected: boolean; error: string | null; total_usd: number | null; coins: { coin: string; qty: number; usd: number }[]; note: string };
@@ -889,6 +890,7 @@ export type CrusConfronto = {
   rows: { symbol: string; bybit: number | null; kraken_symbol: string | null; kraken: number | null; diff_pct: number | null; kraken_spread_pct: number | null; funding_day_pct: number | null }[];
 };
 export const crusApi = {
+  setSettings: (b: { capital?: number; rr?: number }) => req<{ ok: boolean }>("/cruscotto/impostazioni", { method: "POST", body: JSON.stringify(b) }),
   confronto: () => req<CrusConfronto>("/cruscotto/confronto"),
   get: () => req<Cruscotto>("/cruscotto"),
   krakenConnect: (api_key: string, api_secret: string) =>

@@ -73,6 +73,8 @@ def patch_data(s):
         if reg.count("simulate_fill(") != 7:
             raise SystemExit("STOP: attese 7 chiamate di prezzo in Analisi e rischio, trovate %d. Non tocco nulla." % reg.count("simulate_fill("))
         s = s[:i] + reg.replace("simulate_fill(", "_desk_fill(") + s[k2:]
+    if 'pl = DK.risk_plan(side, price, frames["1h"]' in s:
+        s = _once(s, 'pl = DK.risk_plan(side, price, frames["1h"]', 'pl = _desk_risk_plan(side, price, frames["1h"]', "piano RR")
     if "kr_price(symbol)" not in s:
         s = _once(s, "async def _desk_price(symbol: str) -> Optional[float]:\n",
                   "async def _desk_price(symbol: str) -> Optional[float]:\n    if _crus_cost[\"mode\"] == \"kraken\":\n        _kp = await kr_price(symbol)\n        if _kp:\n            return _kp\n", "prezzo")

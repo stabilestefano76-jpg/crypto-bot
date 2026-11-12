@@ -124,6 +124,14 @@ export default function CruscottoScreen() {
   const [krMsg, setKrMsg] = useState("");
   const [krBusy, setKrBusy] = useState(false);
   const [costMsg, setCostMsg] = useState("");
+  const [capIn, setCapIn] = useState("");
+  const [rrIn, setRrIn] = useState("");
+  const [setMsg, setSetMsg] = useState("");
+  const saveSettings = async (b: { capital?: number; rr?: number }, ok: string) => {
+    setSetMsg("");
+    try { await crusApi.setSettings(b); await load(); setSetMsg(ok); } catch (e: any) { setSetMsg(String(e?.message ?? "Errore")); }
+  };
+  const num = (t: string) => parseFloat(t.replace(",", "."));
   const [conf, setConf] = useState<CrusConfronto | null>(null);
   const [confBusy, setConfBusy] = useState(false);
   const loadConf = async () => {
@@ -262,6 +270,45 @@ export default function CruscottoScreen() {
             </View>
 
             <View style={st.card}>
+              <Text style={st.h}>Capitale e rendimento/rischio</Text>
+              <Text style={[st.dim, { marginTop: 8 }]}>Capitale del portafoglio simulato: ${d.settings.capital.toFixed(2)}</Text>
+              <View style={{ flexDirection: "row", marginTop: 8 }}>
+                <TextInput style={[st.inp, { flex: 1, marginTop: 0 }]} placeholder="Nuovo capitale (10 - 100000)" placeholderTextColor={DIM} value={capIn} onChangeText={setCapIn} keyboardType="decimal-pad" />
+                <Pressable style={[st.tab, { marginLeft: 8, marginRight: 0, flex: 0, paddingHorizontal: 14, opacity: d.settings.can_change_capital ? 1 : 0.4 }]} disabled={!d.settings.can_change_capital}
+                  onPress={() => { const v = num(capIn); if (isNaN(v)) { setSetMsg("Scrivi un numero."); return; } saveSettings({ capital: v }, "Capitale cambiato: il portafoglio riparte da qui."); setCapIn(""); }}>
+                  <Text style={[st.txt, { fontWeight: "700" }]}>Imposta</Text>
+                </Pressable>
+              </View>
+              <Text style={[st.dim, { marginTop: 6 }]}>
+                {d.settings.can_change_capital ? "Il contante riparte dal nuovo importo e la curva si azzera. Lo storico delle operazioni resta." : "Per cambiare il capitale chiudi prima le posizioni aperte."}
+              </Text>
+
+              <Text style={[st.txt, { marginTop: 16, fontWeight: "700" }]}>Rendimento/rischio (RR) delle nuove analisi</Text>
+              <Text style={[st.dim, { marginTop: 4 }]}>
+                {d.settings.rr ? `Ora: 1 a ${d.settings.rr}. L'obiettivo sta a ${d.settings.rr} volte la distanza dello stop.` : "Ora: automatico (circa da 1,6 a 2,7, secondo la volatilità)."}
+              </Text>
+              <View style={{ flexDirection: "row", flexWrap: "wrap", marginTop: 8 }}>
+                {[0, 1.5, 2, 3, 4].map((v) => {
+                  const on = v === 0 ? !d.settings.rr : d.settings.rr === v;
+                  return (
+                    <Pressable key={v} onPress={() => saveSettings({ rr: v }, v ? `RR impostato a 1 a ${v}.` : "RR automatico.")} style={[st.chip, on && { backgroundColor: WARN }]}>
+                      <Text style={[st.txt, { fontWeight: "700", color: on ? "#000" : TXT }]}>{v === 0 ? "Auto" : `1:${v}`}</Text>
+                    </Pressable>
+                  );
+                })}
+              </View>
+              <View style={{ flexDirection: "row", marginTop: 8 }}>
+                <TextInput style={[st.inp, { flex: 1, marginTop: 0 }]} placeholder="Altro valore (0,8 - 6)" placeholderTextColor={DIM} value={rrIn} onChangeText={setRrIn} keyboardType="decimal-pad" />
+                <Pressable style={[st.tab, { marginLeft: 8, marginRight: 0, flex: 0, paddingHorizontal: 14 }]}
+                  onPress={() => { const v = num(rrIn); if (isNaN(v)) { setSetMsg("Scrivi un numero."); return; } saveSettings({ rr: v }, `RR impostato a 1 a ${v}.`); setRrIn(""); }}>
+                  <Text style={[st.txt, { fontWeight: "700" }]}>Imposta</Text>
+                </Pressable>
+              </View>
+              <Text style={[st.dim, { marginTop: 6 }]}>Vale per i nuovi setup e le nuove aperture di Analisi e rischio, non per le posizioni già aperte. Un RR alto mette l'obiettivo più lontano: guadagni di più quando vinci, ma vinci più di rado. Non è un vantaggio in sé. Il Terminale sceglie il suo RR da solo.</Text>
+              {!!setMsg && <Text style={[st.dim, { color: WARN, marginTop: 8 }]}>{setMsg}</Text>}
+            </View>
+
+            <View style={st.card}>
               <Text style={st.h}>Posizioni aperte ({d.positions.length})</Text>
               {d.positions.length === 0 && <Text style={[st.dim, { marginTop: 6 }]}>Nessuna posizione aperta.</Text>}
               {d.positions.map((p) => <PosCard key={p.id} p={p} />)}
@@ -387,6 +434,7 @@ const st = StyleSheet.create({
   badgeTxt: { color: "#000", fontSize: 11, fontWeight: "800" },
   pbar: { height: 8, backgroundColor: LINE, borderRadius: 4, marginVertical: 8, overflow: "visible" },
   pfill: { height: 8, borderRadius: 4, opacity: 0.8 },
+  chip: { paddingHorizontal: 14, paddingVertical: 8, backgroundColor: BG, borderRadius: 8, marginRight: 8, marginBottom: 8, borderWidth: 1, borderColor: LINE },
   inp: { backgroundColor: BG, color: TXT, borderRadius: 8, padding: 10, marginTop: 10, borderWidth: 1, borderColor: LINE, fontSize: 14 },
   pmark: { position: "absolute", top: -3, width: 2, height: 14 },
 });

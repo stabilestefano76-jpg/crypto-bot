@@ -3,7 +3,7 @@ import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, 
 import { useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
-import { crusApi, Cruscotto, CrusPart, CrusPos } from "@/src/api";
+import { crusApi, Cruscotto, CrusConfronto, CrusPart, CrusPos } from "@/src/api";
 
 const BG = "#0B0E11";
 const PANEL = "#12161C";
@@ -124,6 +124,13 @@ export default function CruscottoScreen() {
   const [krMsg, setKrMsg] = useState("");
   const [krBusy, setKrBusy] = useState(false);
   const [costMsg, setCostMsg] = useState("");
+  const [conf, setConf] = useState<CrusConfronto | null>(null);
+  const [confBusy, setConfBusy] = useState(false);
+  const loadConf = async () => {
+    setConfBusy(true);
+    try { setConf(await crusApi.confronto()); } catch (e: any) { setCostMsg(String(e?.message ?? "Errore")); }
+    setConfBusy(false);
+  };
   const setCosts = async (m: "bybit" | "kraken") => {
     setCostMsg("");
     try { await crusApi.setCosts(m); await load(); setCostMsg("Salvato."); } catch (e: any) { setCostMsg(String(e?.message ?? "Errore")); }
@@ -220,9 +227,9 @@ export default function CruscottoScreen() {
             </View>
 
             <View style={st.card}>
-              <Text style={st.h}>Costi della simulazione</Text>
+              <Text style={st.h}>Dati e costi della simulazione</Text>
               <Text style={[st.dim, { marginTop: 6 }]}>
-                Ora ogni operazione paga {d.costs.fee_side_pct}% per lato, cioè {d.costs.round_trip_pct}% per entrare e uscire.
+                Ora Analisi e rischio usa {d.costs.mode === "kraken" ? "prezzi, candele e libro ordini di KRAKEN derivati" : "prezzi, candele e libro ordini di BYBIT"} e paga {d.costs.fee_side_pct}% per lato ({d.costs.round_trip_pct}% in tutto).
               </Text>
               <View style={{ flexDirection: "row", marginTop: 10 }}>
                 <Pressable onPress={() => setCosts("bybit")} style={[st.tab, d.costs.mode === "bybit" && { backgroundColor: WARN }]}>
@@ -232,7 +239,25 @@ export default function CruscottoScreen() {
                   <Text style={[st.txt, { fontWeight: "700", color: d.costs.mode === "kraken" ? "#000" : TXT }]}>Kraken derivati</Text>
                 </Pressable>
               </View>
-              <Text style={[st.dim, { marginTop: 8 }]}>Kraken derivati: 0,05% per lato (commissione taker, ordini a mercato; il maker costa 0,02%). Il finanziamento si regola in "Analisi e rischio". Si cambia solo senza posizioni aperte.</Text>
+              <Text style={[st.dim, { marginTop: 8 }]}>Kraken derivati: 0,05% per lato (taker, ordini a mercato; il maker costa 0,02%). Le monete che Kraken non ha restano su Bybit. Si cambia solo senza posizioni aperte. Il finanziamento si regola in "Analisi e rischio".</Text>
+              <Pressable style={[st.tab, { marginTop: 10, marginRight: 0, opacity: confBusy ? 0.4 : 1 }]} disabled={confBusy} onPress={loadConf}>
+                <Text style={st.txt}>{confBusy ? "Controllo..." : "Confronta i prezzi ora"}</Text>
+              </Pressable>
+              {conf && !conf.kraken_ok && <Text style={[st.dim, { color: WARN, marginTop: 8 }]}>Kraken non risponde adesso.</Text>}
+              {conf && conf.rows.map((r) => (
+                <View key={r.symbol} style={{ marginTop: 8 }}>
+                  <View style={st.rowBetween}>
+                    <Text style={st.txt}>{r.symbol.replace("USDC", "")}</Text>
+                    <Text style={st.dim}>Bybit {px(r.bybit)} · Kraken {r.kraken === null ? "non c'è" : px(r.kraken)}</Text>
+                  </View>
+                  {r.kraken !== null && (
+                    <Text style={st.dim}>
+                      Differenza {r.diff_pct === null ? "-" : (r.diff_pct > 0 ? "+" : "") + r.diff_pct + "%"} · scarto Kraken {r.kraken_spread_pct ?? "-"}% · finanziamento {r.funding_day_pct === null ? "-" : r.funding_day_pct + "%/giorno"}
+                    </Text>
+                  )}
+                </View>
+              ))}
+              {conf && <Text style={[st.dim, { marginTop: 8 }]}>{conf.note}</Text>}
               {!!costMsg && <Text style={[st.dim, { color: WARN, marginTop: 6 }]}>{costMsg}</Text>}
             </View>
 
