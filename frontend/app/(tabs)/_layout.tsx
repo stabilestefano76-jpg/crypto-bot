@@ -23,7 +23,7 @@ export default function TabsLayout() {
       <Tabs.Screen
         name="index"
         options={{
-          title: "Signals",
+          title: "Oggi",
           tabBarIcon: ({ color, size }) => (
             <Ionicons name="pulse" size={size} color={color} />
           ),
@@ -43,7 +43,7 @@ export default function TabsLayout() {
       <Tabs.Screen
         name="portfolio"
         options={{
-          title: "Portfolio",
+          title: "Portafoglio",
           tabBarIcon: ({ color, size }) => (
             <Ionicons name="wallet-outline" size={size} color={color} />
           ),
@@ -53,7 +53,7 @@ export default function TabsLayout() {
       <Tabs.Screen
         name="history"
         options={{
-          title: "History",
+          title: "Storico",
           tabBarIcon: ({ color, size }) => (
             <Ionicons name="time-outline" size={size} color={color} />
           ),
@@ -63,7 +63,7 @@ export default function TabsLayout() {
       <Tabs.Screen
         name="settings"
         options={{
-          title: "Settings",
+          title: "Impostazioni",
           tabBarIcon: ({ color, size }) => (
             <Ionicons name="settings-outline" size={size} color={color} />
           ),
