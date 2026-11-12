@@ -211,6 +211,153 @@ async def kraken_disconnect() -> dict[str, Any]:
     return {"ok": True}
 
 
+_kr_cache: dict[str, Any] = {"tickers": (0.0, {}), "candles": {}}
+_KR_BASE = {"BTC": "XBT"}
+
+
+async def kr_pub(path: str, params: Optional[dict[str, Any]] = None) -> Optional[dict[str, Any]]:
+    """Dati PUBBLICI dei future Kraken (nessuna chiave). None se non risponde."""
+    try:
+        async with httpx.AsyncClient(timeout=10.0) as c:
+            r = await c.get("https://futures.kraken.com" + path, params=params)
+        j = r.json()
+        return j if isinstance(j, dict) else None
+    except Exception:  # noqa: BLE001
+        return None
+
+
+async def kr_tickers() -> dict[str, dict[str, Any]]:
+    at, cur = _kr_cache["tickers"]
+    if cur and time.time() - at < 4:
+        return cur
+    j = await kr_pub("/derivatives/api/v3/tickers")
+    if j and j.get("result") == "success":
+        t = {x["symbol"]: x for x in j.get("tickers", []) if x.get("symbol") and x.get("tag") == "perpetual" and not x.get("suspended")}
+        if t:
+            _kr_cache["tickers"] = (time.time(), t)
+            return t
+    return cur if cur and time.time() - at < 120 else {}
+
+
+def kr_symbol(bybit_symbol: str, tickers: dict[str, dict[str, Any]]) -> Optional[str]:
+    """BTCUSDC -> PF_XBTUSD (se esiste fra i perpetui di Kraken)."""
+    if not bybit_symbol.endswith("USDC"):
+        return None
+    base = bybit_symbol[:-4]
+    for b in (_KR_BASE.get(base, base), base):
+        sym = "PF_%sUSD" % b
+        if sym in tickers:
+            return sym
+    return None
+
+
+async def kr_price(bybit_symbol: str) -> Optional[float]:
+    t = await kr_tickers()
+    sym = kr_symbol(bybit_symbol, t)
+    if not sym:
+        return None
+    x = t[sym]
+    for k in ("last", "markPrice"):
+        try:
+            v = float(x.get(k))
+            if v > 0:
+                return v
+        except (TypeError, ValueError):
+            pass
+    return None
+
+
+async def kr_book(bybit_symbol: str) -> Optional[tuple[list[list[float]], list[list[float]]]]:
+    t = await kr_tickers()
+    sym = kr_symbol(bybit_symbol, t)
+    if not sym:
+        return None
+    j = await kr_pub("/derivatives/api/v3/orderbook", {"symbol": sym})
+    try:
+        ob = (j or {}).get("orderBook") or {}
+        bids = [[float(r[0]), float(r[1])] for r in ob.get("bids", [])][:50]
+        asks = [[float(r[0]), float(r[1])] for r in ob.get("asks", [])][:50]
+        if not bids or not asks or bids[0][0] <= 0 or asks[0][0] < bids[0][0]:
+            return None
+        return bids, asks
+    except (TypeError, ValueError, IndexError):
+        return None
+
+
+async def kr_candles(bybit_symbol: str, tf: str) -> list[list[float]]:
+    """Candele dei future Kraken nel formato del bot [tempo_s, apertura, chiusura, massimo, minimo, volume], senza l'ultima ancora in formazione."""
+    if tf not in ("15m", "1h", "4h", "1d"):
+        return []
+    t = await kr_tickers()
+    sym = kr_symbol(bybit_symbol, t)
+    if not sym:
+        return []
+    key = sym + "|" + tf
+    hit = _kr_cache["candles"].get(key)
+    if hit and time.time() - hit[0] < (60 if tf in ("15m", "1h") else 180):
+        return hit[1]
+    j = await kr_pub("/api/charts/v1/trade/%s/%s" % (sym, tf), {"count": 301})
+    out: list[list[float]] = []
+    try:
+        for c in (j or {}).get("candles", []):
+            out.append([float(c["time"]) / 1000.0, float(c["open"]), float(c["close"]), float(c["high"]), float(c["low"]), float(c.get("volume") or 0)])
+    except (TypeError, ValueError, KeyError):
+        out = []
+    out.sort(key=lambda r: r[0])
+    if len(out) > 1:
+        out = out[:-1]
+    out = out[-300:]
+    if len(out) >= 50:
+        _kr_cache["candles"][key] = (time.time(), out)
+        return out
+    return hit[1] if hit and time.time() - hit[0] < 1800 else []
+
+
+async def _desk_fill(symbol: str, side: str, ref_price: float, cfg: Any, *, quote_budget: Optional[float] = None, base_qty: Optional[float] = None) -> tuple[float, dict[str, Any]]:
+    """Prezzo a cui verrebbe eseguito un ordine a mercato in Analisi e rischio: libro di Kraken se il modo e' Kraken e la moneta c'e' li', altrimenti Bybit."""
+    if _crus_cost["mode"] == "kraken" and cfg.sim_realistic_fills:
+        book = await kr_book(symbol)
+        if book:
+            bids, asks = book
+            avg = walk_book(asks, quote_budget=quote_budget) if side == "buy" else walk_book(bids, base_qty=base_qty)
+            if avg:
+                spread = (asks[0][0] / bids[0][0] - 1.0) * 100.0
+                cost = (avg / ref_price - 1.0) * 100.0 if side == "buy" else (1.0 - avg / ref_price) * 100.0
+                return avg, {"fill_model": "book", "source": "kraken", "spread_pct": round(spread, 4), "cost_pct": round(cost, 4)}
+    return await simulate_fill(symbol, side, ref_price, cfg, quote_budget=quote_budget, base_qty=base_qty)
+
+
+@api.get("/cruscotto/confronto")
+async def cruscotto_confronto() -> dict[str, Any]:
+    """Prezzi di Bybit e di Kraken a confronto, per controllare che i dati corrispondano a quello che vedi sui due siti."""
+    dc = await _desk_cfg()
+    t = await kr_tickers()
+    rows = []
+    for sym in list(dc["symbols"])[:8]:
+        try:
+            bp = price_feed.get(sym) or await price_feed.price_or_rest(sym)
+        except Exception:  # noqa: BLE001
+            bp = None
+        ks = kr_symbol(sym, t)
+        x = t.get(ks) if ks else None
+        row: dict[str, Any] = {"symbol": sym, "bybit": float(bp) if bp else None, "kraken_symbol": ks, "kraken": None, "diff_pct": None,
+                               "kraken_spread_pct": None, "funding_day_pct": None}
+        if x:
+            try:
+                row["kraken"] = float(x.get("last") or x.get("markPrice"))
+                if x.get("bid") and x.get("ask"):
+                    row["kraken_spread_pct"] = round((float(x["ask"]) / float(x["bid"]) - 1.0) * 100.0, 4)
+                if x.get("relativeFundingRate") is not None:
+                    row["funding_day_pct"] = round(float(x["relativeFundingRate"]) * 24.0 * 100.0, 4)
+                if row["bybit"] and row["kraken"]:
+                    row["diff_pct"] = round((row["kraken"] / row["bybit"] - 1.0) * 100.0, 3)
+            except (TypeError, ValueError):
+                pass
+        rows.append(row)
+    return {"kraken_ok": bool(t), "rows": rows,
+            "note": "Finanziamento: stima ricavata dal tasso relativo di Kraken per 24 ore. Positivo = i long pagano e gli short incassano (da verificare sul sito)."}
+
+
 _crus_cost: dict[str, Any] = {"mode": "bybit", "fee": None}
 KRAKEN_PERP_FEE_SIDE = 0.05      # % per lato: taker dei future Kraken (maker 0,02%): scelta prudente, tutti gli ordini a mercato
 
@@ -234,6 +381,8 @@ async def cruscotto_set_costs(body: dict[str, Any]) -> dict[str, Any]:
         raise HTTPException(status_code=400, detail="Scelta non valida")
     if await db.desk_positions.find_one({"status": "open"}, {"_id": 1}):
         raise HTTPException(status_code=400, detail="Chiudi prima le posizioni aperte: cambiare i costi a meta' falserebbe i risultati.")
+    if mode == "kraken" and not await kr_tickers():
+        raise HTTPException(status_code=400, detail="Kraken non risponde adesso: resto su Bybit. Riprova fra poco.")
     await db.crus_config.update_one({"_id": "cost"}, {"$set": {"mode": mode}}, upsert=True)
     await crus_cost_load()
     return {"ok": True, "mode": mode}

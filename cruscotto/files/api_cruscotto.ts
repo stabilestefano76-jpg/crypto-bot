@@ -31,7 +31,12 @@ export type Cruscotto = {
   kraken: { connected: boolean; error: string | null; total_eur: number | null; coins: { coin: string; qty: number }[]; masked: string | null };
   real: { connected: boolean; error: string | null; total_usd: number | null; coins: { coin: string; qty: number; usd: number }[]; note: string };
 };
+export type CrusConfronto = {
+  kraken_ok: boolean; note: string;
+  rows: { symbol: string; bybit: number | null; kraken_symbol: string | null; kraken: number | null; diff_pct: number | null; kraken_spread_pct: number | null; funding_day_pct: number | null }[];
+};
 export const crusApi = {
+  confronto: () => req<CrusConfronto>("/cruscotto/confronto"),
   get: () => req<Cruscotto>("/cruscotto"),
   krakenConnect: (api_key: string, api_secret: string) =>
     req<{ connected: boolean }>("/kraken/connect", { method: "POST", body: JSON.stringify({ api_key, api_secret }) }),

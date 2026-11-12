@@ -36,13 +36,13 @@ def patch_server(s):
         ends = [s.index(m, i) for m in (TERM, DESK) if m in s[i:]]
         if not ends:
             raise SystemExit("STOP: fine del blocco non trovata. Non tocco nulla.")
-        return patch_fees(s[:i] + block + s[min(ends):])
+        return patch_data(patch_fees(s[:i] + block + s[min(ends):]))
     anchor = TERM if s.count(TERM) == 1 else DESK
     s = _once(s, anchor, block + anchor, "blocco")
     s = _once(s, "    desk_task = asyncio.create_task(desk_loop())\n",
               "    desk_task = asyncio.create_task(desk_loop())\n    crus_task = asyncio.create_task(crus_loop())\n", "avvio")
     s = _once(s, "    desk_task.cancel()\n", "    desk_task.cancel()\n    crus_task.cancel()\n", "stop")
-    return patch_fees(s)
+    return patch_data(patch_fees(s))
 
 
 FEE_PATCHES = [
@@ -60,6 +60,25 @@ def patch_fees(s):
             s = _once(s, old, new, "costi: " + old[:40])
         elif new not in s:
             raise SystemExit("STOP: punto dei costi non trovato (%s). Non tocco nulla." % old[:40])
+    return s
+
+
+def patch_data(s):
+    """Prezzi, candele e libro ordini di Kraken per Analisi e rischio (solo quando il modo e' Kraken)."""
+    i = s.index(DESK)
+    k1 = s.index(LINE, i + len(DESK))
+    k2 = s.index(LINE, k1 + len(LINE))
+    reg = s[i:k2]
+    if "simulate_fill(" in reg:
+        if reg.count("simulate_fill(") != 7:
+            raise SystemExit("STOP: attese 7 chiamate di prezzo in Analisi e rischio, trovate %d. Non tocco nulla." % reg.count("simulate_fill("))
+        s = s[:i] + reg.replace("simulate_fill(", "_desk_fill(") + s[k2:]
+    if "kr_price(symbol)" not in s:
+        s = _once(s, "async def _desk_price(symbol: str) -> Optional[float]:\n",
+                  "async def _desk_price(symbol: str) -> Optional[float]:\n    if _crus_cost[\"mode\"] == \"kraken\":\n        _kp = await kr_price(symbol)\n        if _kp:\n            return _kp\n", "prezzo")
+    if "kr_candles(symbol, tf)" not in s:
+        s = _once(s, "async def _desk_candles(symbol: str, tf: str) -> list[list[float]]:\n",
+                  "async def _desk_candles(symbol: str, tf: str) -> list[list[float]]:\n    if _crus_cost[\"mode\"] == \"kraken\":\n        _kc = await kr_candles(symbol, tf)\n        if _kc:\n            return _kc\n", "candele")
     return s
 
 
