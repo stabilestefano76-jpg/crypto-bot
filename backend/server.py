@@ -5903,6 +5903,34 @@ async def kraken_disconnect() -> dict[str, Any]:
     return {"ok": True}
 
 
+_crus_cost: dict[str, Any] = {"mode": "bybit", "fee": None}
+KRAKEN_PERP_FEE_SIDE = 0.05      # % per lato: taker dei future Kraken (maker 0,02%): scelta prudente, tutti gli ordini a mercato
+
+
+def _desk_fee(cfg: Any) -> float:
+    """Commissione per lato usata da Analisi e rischio: quella di Bybit spot (impostazioni del bot) oppure quella dei future Kraken."""
+    f = _crus_cost.get("fee")
+    return float(f) if f is not None else float(cfg.sim_fee_pct)
+
+
+async def crus_cost_load() -> None:
+    doc = await db.crus_config.find_one({"_id": "cost"}, {"_id": 0}) or {}
+    mode = doc.get("mode") if doc.get("mode") in ("bybit", "kraken") else "bybit"
+    _crus_cost.update({"mode": mode, "fee": KRAKEN_PERP_FEE_SIDE if mode == "kraken" else None})
+
+
+@api.post("/cruscotto/costs")
+async def cruscotto_set_costs(body: dict[str, Any]) -> dict[str, Any]:
+    mode = str(body.get("mode") or "")
+    if mode not in ("bybit", "kraken"):
+        raise HTTPException(status_code=400, detail="Scelta non valida")
+    if await db.desk_positions.find_one({"status": "open"}, {"_id": 1}):
+        raise HTTPException(status_code=400, detail="Chiudi prima le posizioni aperte: cambiare i costi a meta' falserebbe i risultati.")
+    await db.crus_config.update_one({"_id": "cost"}, {"$set": {"mode": mode}}, upsert=True)
+    await crus_cost_load()
+    return {"ok": True, "mode": mode}
+
+
 @api.get("/cruscotto")
 async def cruscotto() -> dict[str, Any]:
     st = await desk_status()
@@ -5966,13 +5994,16 @@ async def cruscotto() -> dict[str, Any]:
         "events": st["events"][:8],
         "real": await crus_real(),
         "kraken": await crus_kraken(),
+        "costs": {"mode": _crus_cost["mode"], "fee_side_pct": round(_desk_fee(await get_config()), 4),
+                  "round_trip_pct": round(2 * _desk_fee(await get_config()), 4)},
     }
 
 
 async def crus_loop() -> None:
-    await asyncio.sleep(25)
+    await asyncio.sleep(3)
     while True:
         try:
+            await crus_cost_load()
             await crus_snapshot()
         except Exception as e:  # noqa: BLE001
             logger.exception("Cruscotto: errore nel salvataggio della curva: %s", e)
@@ -6529,13 +6560,13 @@ async def _desk_build(symbol: str, leverage: float, risk_pct: float, dc: dict[st
     plans = {}
     for side in ("long", "short"):
         pl = DK.risk_plan(side, price, frames["1h"], a1, capital=float(dc["capital"]), risk_pct=risk_pct, leverage=leverage,
-                          fee_pct=cfg.sim_fee_pct, funding_day_pct=float(dc["funding_day_pct"]), max_leverage=float(dc["max_leverage"]),
+                          fee_pct=_desk_fee(cfg), funding_day_pct=float(dc["funding_day_pct"]), max_leverage=float(dc["max_leverage"]),
                           max_loss_usdc=s["max_loss_usdc"] if s["check_max_loss"] else None)
         _, info = await simulate_fill(symbol, "buy" if side == "long" else "sell", price, cfg,
                                       quote_budget=pl["notional"] if side == "long" else None,
                                       base_qty=None if side == "long" else pl["notional"] / price)
         st_m, tg_m = DK.mirror_for_check(pl)
-        ev = PEC.evaluate(price=price, notional=pl["notional"], fee_pct=cfg.sim_fee_pct, stop=st_m, target=tg_m,
+        ev = PEC.evaluate(price=price, notional=pl["notional"], fee_pct=_desk_fee(cfg), stop=st_m, target=tg_m,
                           book_cost_pct=abs(float(info.get("cost_pct") or 0.0)), spread_pct=info.get("spread_pct"),
                           book_model=str(info.get("fill_model")), s=s, use_max_loss=False)
         pl["checks"] = {"ok": ev["ok"], "reasons": ev["reasons"]}
@@ -6567,7 +6598,7 @@ async def _desk_close(p: dict[str, Any], cfg: Config, reason: str, cur: float) -
                 exit_price, _ = await simulate_fill(p["symbol"], "sell", cur, cfg, base_qty=p["quantity"])
             else:
                 exit_price, _ = await simulate_fill(p["symbol"], "buy", cur, cfg, quote_budget=cur * p["quantity"])
-        res_pnl = DK.pnl(p["side"], p["fill_price"], exit_price, p["quantity"], cfg.sim_fee_pct, carry, p["margin"])
+        res_pnl = DK.pnl(p["side"], p["fill_price"], exit_price, p["quantity"], _desk_fee(cfg), carry, p["margin"])
         done = float(p.get("realized_partial") or 0.0)
         r = await db.desk_positions.update_one({"id": p["id"], "status": "open"}, {"$set": {
             "status": "closed", "close_price": exit_price, "close_reason": reason, "pnl_usdt": round(res_pnl + done, 4),
@@ -6594,7 +6625,7 @@ async def _desk_take_lot(p: dict[str, Any], cfg: Config, cur: float) -> None:
             ex, _ = await simulate_fill(p["symbol"], "buy", cur, cfg, quote_budget=cur * part_qty)
         days = max(0.0, (time.time() - p["opened_ts"]) / 86400.0)
         carry = part_notional * (p["funding_day_pct"] / 100.0) * days if (p["leverage"] > 1.0 or p["side"] == "short") else 0.0
-        pp = DK.pnl(p["side"], p["fill_price"], ex, part_qty, cfg.sim_fee_pct, carry, part_margin)
+        pp = DK.pnl(p["side"], p["fill_price"], ex, part_qty, _desk_fee(cfg), carry, part_margin)
         dc = await _desk_cfg()
         new_stop = p["fill_price"] if dc["be_after_tp1"] else p["stop"]
         if p["side"] == "long":
@@ -6794,7 +6825,7 @@ async def desk_status() -> dict[str, Any]:
         cur = await _desk_price(p["symbol"]) or p["fill_price"]
         days = max(0.0, (time.time() - p["opened_ts"]) / 86400.0)
         carry = p["notional"] * (p["funding_day_pct"] / 100.0) * days if (p["leverage"] > 1.0 or p["side"] == "short") else 0.0
-        fl = DK.pnl(p["side"], p["fill_price"], cur, p["quantity"], cfg.sim_fee_pct, carry, p["margin"])
+        fl = DK.pnl(p["side"], p["fill_price"], cur, p["quantity"], _desk_fee(cfg), carry, p["margin"])
         margins += p["margin"]; floating += fl
         o_out.append({**p, "current_price": cur, "floating_pnl": round(fl + float(p.get("realized_partial") or 0.0), 4)})
     closed = await db.desk_positions.find({"status": "closed"}, {"_id": 0}).sort("closed_at", -1).to_list(40)

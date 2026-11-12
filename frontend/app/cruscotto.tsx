@@ -123,6 +123,11 @@ export default function CruscottoScreen() {
   const [krSec, setKrSec] = useState("");
   const [krMsg, setKrMsg] = useState("");
   const [krBusy, setKrBusy] = useState(false);
+  const [costMsg, setCostMsg] = useState("");
+  const setCosts = async (m: "bybit" | "kraken") => {
+    setCostMsg("");
+    try { await crusApi.setCosts(m); await load(); setCostMsg("Salvato."); } catch (e: any) { setCostMsg(String(e?.message ?? "Errore")); }
+  };
   const krConnect = async () => {
     if (!krKey.trim() || !krSec.trim()) { setKrMsg("Scrivi chiave e segreto."); return; }
     setKrBusy(true); setKrMsg("");
@@ -212,6 +217,23 @@ export default function CruscottoScreen() {
               <Gauge label="Posizioni aperte" used={d.risk.open_n} limit={d.risk.max_open} text={`${d.risk.open_n} / ${d.risk.max_open}`} />
               <Gauge label="Aperture automatiche oggi" used={d.risk.auto_today} limit={d.risk.max_trades_day} text={`${d.risk.auto_today} / ${d.risk.max_trades_day}`} />
               {!!d.risk.pause && <Text style={[st.dim, { color: WARN, marginTop: 10 }]}>⏸ {d.risk.pause}</Text>}
+            </View>
+
+            <View style={st.card}>
+              <Text style={st.h}>Costi della simulazione</Text>
+              <Text style={[st.dim, { marginTop: 6 }]}>
+                Ora ogni operazione paga {d.costs.fee_side_pct}% per lato, cioè {d.costs.round_trip_pct}% per entrare e uscire.
+              </Text>
+              <View style={{ flexDirection: "row", marginTop: 10 }}>
+                <Pressable onPress={() => setCosts("bybit")} style={[st.tab, d.costs.mode === "bybit" && { backgroundColor: WARN }]}>
+                  <Text style={[st.txt, { fontWeight: "700", color: d.costs.mode === "bybit" ? "#000" : TXT }]}>Bybit spot</Text>
+                </Pressable>
+                <Pressable onPress={() => setCosts("kraken")} style={[st.tab, { marginRight: 0 }, d.costs.mode === "kraken" && { backgroundColor: WARN }]}>
+                  <Text style={[st.txt, { fontWeight: "700", color: d.costs.mode === "kraken" ? "#000" : TXT }]}>Kraken derivati</Text>
+                </Pressable>
+              </View>
+              <Text style={[st.dim, { marginTop: 8 }]}>Kraken derivati: 0,05% per lato (commissione taker, ordini a mercato; il maker costa 0,02%). Il finanziamento si regola in "Analisi e rischio". Si cambia solo senza posizioni aperte.</Text>
+              {!!costMsg && <Text style={[st.dim, { color: WARN, marginTop: 6 }]}>{costMsg}</Text>}
             </View>
 
             <View style={st.card}>

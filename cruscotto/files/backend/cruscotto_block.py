@@ -211,6 +211,34 @@ async def kraken_disconnect() -> dict[str, Any]:
     return {"ok": True}
 
 
+_crus_cost: dict[str, Any] = {"mode": "bybit", "fee": None}
+KRAKEN_PERP_FEE_SIDE = 0.05      # % per lato: taker dei future Kraken (maker 0,02%): scelta prudente, tutti gli ordini a mercato
+
+
+def _desk_fee(cfg: Any) -> float:
+    """Commissione per lato usata da Analisi e rischio: quella di Bybit spot (impostazioni del bot) oppure quella dei future Kraken."""
+    f = _crus_cost.get("fee")
+    return float(f) if f is not None else float(cfg.sim_fee_pct)
+
+
+async def crus_cost_load() -> None:
+    doc = await db.crus_config.find_one({"_id": "cost"}, {"_id": 0}) or {}
+    mode = doc.get("mode") if doc.get("mode") in ("bybit", "kraken") else "bybit"
+    _crus_cost.update({"mode": mode, "fee": KRAKEN_PERP_FEE_SIDE if mode == "kraken" else None})
+
+
+@api.post("/cruscotto/costs")
+async def cruscotto_set_costs(body: dict[str, Any]) -> dict[str, Any]:
+    mode = str(body.get("mode") or "")
+    if mode not in ("bybit", "kraken"):
+        raise HTTPException(status_code=400, detail="Scelta non valida")
+    if await db.desk_positions.find_one({"status": "open"}, {"_id": 1}):
+        raise HTTPException(status_code=400, detail="Chiudi prima le posizioni aperte: cambiare i costi a meta' falserebbe i risultati.")
+    await db.crus_config.update_one({"_id": "cost"}, {"$set": {"mode": mode}}, upsert=True)
+    await crus_cost_load()
+    return {"ok": True, "mode": mode}
+
+
 @api.get("/cruscotto")
 async def cruscotto() -> dict[str, Any]:
     st = await desk_status()
@@ -274,13 +302,16 @@ async def cruscotto() -> dict[str, Any]:
         "events": st["events"][:8],
         "real": await crus_real(),
         "kraken": await crus_kraken(),
+        "costs": {"mode": _crus_cost["mode"], "fee_side_pct": round(_desk_fee(await get_config()), 4),
+                  "round_trip_pct": round(2 * _desk_fee(await get_config()), 4)},
     }
 
 
 async def crus_loop() -> None:
-    await asyncio.sleep(25)
+    await asyncio.sleep(3)
     while True:
         try:
+            await crus_cost_load()
             await crus_snapshot()
         except Exception as e:  # noqa: BLE001
             logger.exception("Cruscotto: errore nel salvataggio della curva: %s", e)

@@ -36,12 +36,30 @@ def patch_server(s):
         ends = [s.index(m, i) for m in (TERM, DESK) if m in s[i:]]
         if not ends:
             raise SystemExit("STOP: fine del blocco non trovata. Non tocco nulla.")
-        return s[:i] + block + s[min(ends):]
+        return patch_fees(s[:i] + block + s[min(ends):])
     anchor = TERM if s.count(TERM) == 1 else DESK
     s = _once(s, anchor, block + anchor, "blocco")
     s = _once(s, "    desk_task = asyncio.create_task(desk_loop())\n",
               "    desk_task = asyncio.create_task(desk_loop())\n    crus_task = asyncio.create_task(crus_loop())\n", "avvio")
     s = _once(s, "    desk_task.cancel()\n", "    desk_task.cancel()\n    crus_task.cancel()\n", "stop")
+    return patch_fees(s)
+
+
+FEE_PATCHES = [
+    ('fee_pct=cfg.sim_fee_pct, funding_day_pct=', 'fee_pct=_desk_fee(cfg), funding_day_pct='),
+    ('\n        ev = PEC.evaluate(price=price, notional=pl["notional"], fee_pct=cfg.sim_fee_pct,', '\n        ev = PEC.evaluate(price=price, notional=pl["notional"], fee_pct=_desk_fee(cfg),'),
+    ('exit_price, p["quantity"], cfg.sim_fee_pct, carry, p["margin"])', 'exit_price, p["quantity"], _desk_fee(cfg), carry, p["margin"])'),
+    ('ex, part_qty, cfg.sim_fee_pct, carry, part_margin)', 'ex, part_qty, _desk_fee(cfg), carry, part_margin)'),
+    ('cur, p["quantity"], cfg.sim_fee_pct, carry, p["margin"])', 'cur, p["quantity"], _desk_fee(cfg), carry, p["margin"])'),
+]
+
+
+def patch_fees(s):
+    for old, new in FEE_PATCHES:
+        if old in s:
+            s = _once(s, old, new, "costi: " + old[:40])
+        elif new not in s:
+            raise SystemExit("STOP: punto dei costi non trovato (%s). Non tocco nulla." % old[:40])
     return s
 
 
