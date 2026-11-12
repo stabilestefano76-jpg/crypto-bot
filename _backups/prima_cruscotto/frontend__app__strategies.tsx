@@ -63,6 +63,13 @@ const STRATEGIES: StrategyEntry[] = [
     route: "/desk",
   },
   {
+    key: "cruscotto",
+    title: "Cruscotto",
+    subtitle: "Tutto in una schermata: capitale, long e short, rischio, posizioni, bot (simulazione)",
+    icon: "speedometer",
+    route: "/cruscotto",
+  },
+  {
     key: "terminal",
     title: "Terminale",
     subtitle: "Coppie, grafico, volume, RSI e libro ordini. Il tasto Analizza dice long, short o passa (simulazione)",
