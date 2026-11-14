@@ -38,7 +38,7 @@ export default function DeskScreen() {
       setAf((c) => c ?? {
         auto_leverage: String(s.config.auto_leverage), auto_risk_pct: String(s.config.auto_risk_pct),
         max_total_risk_pct: String(s.config.max_total_risk_pct), daily_loss_pct: String(s.config.daily_loss_pct),
-        max_trades_day: String(s.config.max_trades_day), lots: String(s.config.lots), tp1_r: String(s.config.tp1_r),
+        max_trades_day: String(s.config.max_trades_day), max_open: String(s.config.max_open), lots: String(s.config.lots), tp1_r: String(s.config.tp1_r),
         cooldown_min: String(s.config.cooldown_min), scan_top: String(s.config.scan_top), scan_pool: String(s.config.scan_pool),
         scan_min_volume: String(s.config.scan_min_volume), scan_every_min: String(s.config.scan_every_min),
       });
@@ -187,6 +187,7 @@ export default function DeskScreen() {
           {autoField("Rischio totale massimo di tutte le posizioni (% del capitale, da 0,5 a 15)", "max_total_risk_pct")}
           {autoField("Perdita massima al giorno (% del capitale, da 0,5 a 15)", "daily_loss_pct")}
           {autoField("Aperture automatiche al giorno (massimo, da 1 a 20)", "max_trades_day")}
+          {autoField("Posizioni aperte insieme (massimo, da 1 a 6)", "max_open")}
           {autoField("Lotti (1-3)", "lots")}
           {autoField("Primo lotto chiuso quando il guadagno vale (volte il rischio, da 0,3 a 3)", "tp1_r")}
           {autoField("Attesa su una moneta dopo una chiusura (minuti, da 0 a 1440)", "cooldown_min")}
