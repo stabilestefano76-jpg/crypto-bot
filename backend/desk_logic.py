@@ -32,8 +32,8 @@ DEFAULTS: dict[str, Any] = {
     "scan_every_min": 60,        # ogni quanto rifa' la scansione (minuti)
 }
 CFG_LIMITS = {"risk_pct": (0.1, 3.0), "max_leverage": (1.0, float(MAX_LEVERAGE)), "funding_day_pct": (0.0, 1.0), "max_open": (1, 6),
-              "auto_leverage": (1.0, float(MAX_LEVERAGE)), "auto_risk_pct": (0.1, 3.0), "max_total_risk_pct": (0.5, 10.0),
-              "daily_loss_pct": (0.5, 10.0), "max_trades_day": (1, 20), "cooldown_min": (0, 1440), "lots": (1, 3),
+              "auto_leverage": (1.0, float(MAX_LEVERAGE)), "auto_risk_pct": (0.1, 3.0), "max_total_risk_pct": (0.5, 15.0),
+              "daily_loss_pct": (0.5, 15.0), "max_trades_day": (1, 20), "cooldown_min": (0, 1440), "lots": (1, 3),
               "tp1_r": (0.3, 3.0), "streak_pause": (1, 10), "streak_pause_h": (1, 48),
               "scan_top": (1, 12), "scan_pool": (10, 80), "scan_min_volume": (1000.0, 1e9), "scan_every_min": (15, 1440)}
 INT_KEYS = ("max_open", "max_trades_day", "cooldown_min", "lots", "streak_pause", "streak_pause_h", "scan_top", "scan_pool", "scan_every_min")

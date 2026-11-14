@@ -184,8 +184,8 @@ export default function DeskScreen() {
           {!!st.risk.pause && <Text style={[styles.note, { color: colors.warning }]}>⏸ {st.risk.pause}</Text>}
           {autoField("Leva massima del bot, da 1 a 10 (si abbassa da sola se serve)", "auto_leverage")}
           {autoField("Rischio per operazione (% del capitale, da 0,1 a 3)", "auto_risk_pct")}
-          {autoField("Rischio totale massimo di tutte le posizioni (% del capitale, da 0,5 a 10)", "max_total_risk_pct")}
-          {autoField("Perdita massima al giorno (% del capitale, da 0,5 a 10)", "daily_loss_pct")}
+          {autoField("Rischio totale massimo di tutte le posizioni (% del capitale, da 0,5 a 15)", "max_total_risk_pct")}
+          {autoField("Perdita massima al giorno (% del capitale, da 0,5 a 15)", "daily_loss_pct")}
           {autoField("Aperture automatiche al giorno (massimo, da 1 a 20)", "max_trades_day")}
           {autoField("Lotti (1-3)", "lots")}
           {autoField("Primo lotto chiuso quando il guadagno vale (volte il rischio, da 0,3 a 3)", "tp1_r")}
