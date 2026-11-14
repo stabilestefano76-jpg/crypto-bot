@@ -23,7 +23,7 @@ const px = (n?: number | null) => {
 };
 const when = (iso?: string) => (iso ? `${iso.slice(8, 10)}/${iso.slice(5, 7)} ${iso.slice(11, 16)}` : "-");
 const dur = (h?: number | null) => (h === null || h === undefined ? "-" : h < 1 ? `${Math.round(h * 60)} min` : h < 48 ? `${h.toFixed(1)} h` : `${(h / 24).toFixed(1)} g`);
-const why = (r?: string | null) => (r === "chiusura_manuale" ? "chiusa da te" : r === "obiettivo" ? "obiettivo" : r === "stop" ? "stop" : r ?? "-");
+const why = (r?: string | null) => (r === "chiusura_manuale" ? "chiusa da te" : r === "obiettivo" ? "obiettivo" : r === "stop" ? "stop" : r === "uscita_anticipata" ? "uscita anticipata (bot)" : r ?? "-");
 
 function Kpi({ label, value, color }: { label: string; value: string; color?: string }) {
   return (
@@ -181,6 +181,18 @@ export default function ReportScreen() {
                 </View>
               ))}
             </View>
+
+            {(data as any).gestione && ((data as any).gestione.n_done + (data as any).gestione.n_pending) > 0 && (() => {
+              const g = (data as any).gestione;
+              return (
+                <View style={st.card}>
+                  <Text style={st.h}>Gestione del trade: ha aiutato?</Text>
+                  <Text style={[st.txt, { marginTop: 6, color: col(g.net), fontWeight: "700" }]}>Effetto totale {usd(g.net)} su {g.n_done} interventi</Text>
+                  <Text style={st.dim}>Ha aiutato {g.helped} volte, peggio {g.hurt} volte, {g.n_pending} in attesa. Positivo = senza la gestione avresti guadagnato di meno.</Text>
+                  <Text style={st.dim}>Uscite anticipate {usd(g.net_uscita)} ({g.n_uscita}) · stop stretti {usd(g.net_stop)} ({g.n_stop})</Text>
+                </View>
+              );
+            })()}
 
             <View style={st.card}>
               <Text style={st.h}>Come si sono chiuse</Text>

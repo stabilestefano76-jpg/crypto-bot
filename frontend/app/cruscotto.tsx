@@ -3,7 +3,7 @@ import { ActivityIndicator, Pressable, ScrollView, StyleSheet, Text, TextInput, 
 import { useRouter } from "expo-router";
 import { useSafeAreaInsets } from "react-native-safe-area-context";
 import { Ionicons } from "@expo/vector-icons";
-import { crusApi, Cruscotto, CrusConfronto, CrusPart, CrusPos } from "@/src/api";
+import { crusApi, Cruscotto, CrusConfronto, CrusPart, CrusPos, mngApi, MngConfig, MngSummary, MngView } from "@/src/api";
 
 const BG = "#0B0E11";
 const PANEL = "#12161C";
@@ -99,6 +99,23 @@ function PosCard({ p }: { p: CrusPos }) {
         Movimento {pct(p.move_pct, 2)} · {p.r_now !== null ? `${p.r_now > 0 ? "+" : ""}${p.r_now}R` : ""} · importo {usdp(p.notional)}
         {p.lots_total && p.lots_total > 1 ? ` · lotti ${p.lots_left}/${p.lots_total}${p.tp1_done ? " (1° incassato)" : ""}` : ""} · da {ago(p.opened_ts)}
       </Text>
+      <MngLine m={(p as any).mng} />
+    </View>
+  );
+}
+
+function MngLine({ m }: { m?: MngView }) {
+  if (!m) return null;
+  if (!m.managed) return <Text style={[st.dim, { marginTop: 4 }]}>Gestione automatica: non attiva su questa posizione (viene dal Terminale).</Text>;
+  if (m.danger === null || m.danger === undefined) return <Text style={[st.dim, { marginTop: 4 }]}>Gestione: primo controllo in arrivo (parte dopo 30 minuti dall'apertura).</Text>;
+  const c = m.danger >= 4 ? DOWN : m.danger >= 2 ? WARN : UP;
+  return (
+    <View style={{ marginTop: 6 }}>
+      <Text style={[st.dim, { color: c, fontWeight: "700" }]}>
+        Gestione: {m.danger === 0 ? "tutto come all'apertura" : `${m.danger} segnali di pericolo`} · controllato {ago(m.at ?? undefined)} fa{m.tightened ? " · stop stretto" : ""}
+      </Text>
+      {m.signals.map((x, i) => <Text key={i} style={st.dim}>• {x}</Text>)}
+      {!!m.reason && <Text style={st.dim}>{m.reason}</Text>}
     </View>
   );
 }
@@ -124,6 +141,12 @@ export default function CruscottoScreen() {
   const [krMsg, setKrMsg] = useState("");
   const [krBusy, setKrBusy] = useState(false);
   const [costMsg, setCostMsg] = useState("");
+  const [mg, setMg] = useState<{ config: MngConfig; summary: MngSummary } | null>(null);
+  const [mgMsg, setMgMsg] = useState("");
+  const saveMng = async (b: Partial<MngConfig>, ok: string) => {
+    setMgMsg("");
+    try { await mngApi.set(b); setMg(await mngApi.get()); setMgMsg(ok); } catch (e: any) { setMgMsg(String(e?.message ?? "Errore")); }
+  };
   const [capIn, setCapIn] = useState("");
   const [rrIn, setRrIn] = useState("");
   const [setMsg, setSetMsg] = useState("");
@@ -158,6 +181,7 @@ export default function CruscottoScreen() {
 
   const load = useCallback(async () => {
     try { setD(await crusApi.get()); setErr(""); } catch (e: any) { setErr(String(e?.message ?? "Errore")); }
+    mngApi.get().then(setMg).catch(() => {});
   }, []);
   useEffect(() => {
     load();
@@ -309,6 +333,56 @@ export default function CruscottoScreen() {
             </View>
 
             <View style={st.card}>
+              <Text style={st.h}>Gestione delle posizioni aperte</Text>
+              <Text style={[st.dim, { marginTop: 6 }]}>
+                Ogni {mg?.config.every_min ?? 15} minuti il bot rilegge il grafico di ogni posizione aperta. Se la situazione peggiora può stringere lo stop o chiudere, ma SOLO in guadagno netto, cioè oltre tutti i costi. In perdita non interviene: decide lo stop di sempre. Non vale per le posizioni del Terminale.
+              </Text>
+              {mg && (<>
+                <View style={{ flexDirection: "row", flexWrap: "wrap", marginTop: 10 }}>
+                  {[{ k: true, t: "Acceso" }, { k: false, t: "Spento" }].map((o) => (
+                    <Pressable key={String(o.k)} onPress={() => saveMng({ enabled: o.k }, o.k ? "Gestione accesa." : "Gestione spenta.")} style={[st.chip, mg.config.enabled === o.k && { backgroundColor: WARN }]}>
+                      <Text style={[st.txt, { fontWeight: "700", color: mg.config.enabled === o.k ? "#000" : TXT }]}>{o.t}</Text>
+                    </Pressable>
+                  ))}
+                </View>
+                <View style={{ flexDirection: "row", flexWrap: "wrap" }}>
+                  {[{ k: "chiudi", t: "Stringe o chiude" }, { k: "stringi", t: "Solo stringe lo stop" }, { k: "avvisa", t: "Solo avvisa" }].map((o) => (
+                    <Pressable key={o.k} onPress={() => saveMng({ mode: o.k as any }, "Modalità cambiata.")} style={[st.chip, mg.config.mode === o.k && { backgroundColor: WARN }]}>
+                      <Text style={[st.txt, { fontWeight: "700", color: mg.config.mode === o.k ? "#000" : TXT }]}>{o.t}</Text>
+                    </Pressable>
+                  ))}
+                </View>
+                <Text style={[st.dim, { marginBottom: 6 }]}>Ogni quanti minuti rilegge il grafico:</Text>
+                <View style={{ flexDirection: "row", flexWrap: "wrap" }}>
+                  {[5, 15, 30, 60].map((v) => (
+                    <Pressable key={v} onPress={() => saveMng({ every_min: v }, `Controllo ogni ${v} minuti.`)} style={[st.chip, mg.config.every_min === v && { backgroundColor: WARN }]}>
+                      <Text style={[st.txt, { fontWeight: "700", color: mg.config.every_min === v ? "#000" : TXT }]}>{v} min</Text>
+                    </Pressable>
+                  ))}
+                </View>
+                <Text style={[st.txt, { marginTop: 8, fontWeight: "700" }]}>Ha davvero aiutato?</Text>
+                {mg.summary.n_done + mg.summary.n_pending === 0 ? (
+                  <Text style={[st.dim, { marginTop: 4 }]}>Nessun intervento ancora. Dopo il primo stop stretto o la prima uscita anticipata, qui compare il confronto con "cosa sarebbe successo senza".</Text>
+                ) : (<>
+                  <Text style={[st.txt, { marginTop: 4, color: col(mg.summary.net) }]}>
+                    Effetto totale: {mg.summary.net >= 0 ? "+" : "-"}${Math.abs(mg.summary.net).toFixed(2)} su {mg.summary.n_done} interventi confrontati
+                  </Text>
+                  <Text style={st.dim}>Ha aiutato {mg.summary.helped} volte, ha fatto peggio {mg.summary.hurt} volte, {mg.summary.n_pending} ancora in attesa. Positivo = senza la gestione avresti guadagnato di meno.</Text>
+                  <Text style={st.dim}>Uscite anticipate: {mg.summary.net_uscita >= 0 ? "+" : "-"}${Math.abs(mg.summary.net_uscita).toFixed(2)} ({mg.summary.n_uscita}) · stop stretti: {mg.summary.net_stop >= 0 ? "+" : "-"}${Math.abs(mg.summary.net_stop).toFixed(2)} ({mg.summary.n_stop})</Text>
+                  {mg.summary.items.slice(0, 5).map((it, i) => (
+                    <View key={i} style={[st.rowBetween, { marginTop: 6 }]}>
+                      <Text style={[st.txt, { width: 70 }]}>{it.symbol.replace("USDC", "")}</Text>
+                      <Text style={[st.dim, { flex: 1 }]}>{it.kind === "uscita" ? "uscita anticipata" : "stop stretto"} · {it.status === "done" ? `senza: ${it.shadow !== null ? usd(it.shadow) : "-"} (${it.outcome})` : "in attesa del confronto"}</Text>
+                      <Text style={[st.txt, { fontWeight: "700", color: col(it.delta) }]}>{it.delta === null ? "-" : usd(it.delta)}</Text>
+                    </View>
+                  ))}
+                </>)}
+                <Text style={[st.dim, { marginTop: 6 }]}>Il confronto è una stima: l'operazione "ombra" usa prezzi controllati ogni 30 secondi e non simula il libro ordini.</Text>
+              </>)}
+              {!!mgMsg && <Text style={[st.dim, { color: WARN, marginTop: 8 }]}>{mgMsg}</Text>}
+            </View>
+
+            <View style={st.card}>
               <Text style={st.h}>Posizioni aperte ({d.positions.length})</Text>
               {d.positions.length === 0 && <Text style={[st.dim, { marginTop: 6 }]}>Nessuna posizione aperta.</Text>}
               {d.positions.map((p) => <PosCard key={p.id} p={p} />)}
@@ -343,7 +417,7 @@ export default function CruscottoScreen() {
               {d.recent_closed.map((c, i) => (
                 <View key={i} style={[st.rowBetween, { marginTop: 6 }]}>
                   <Text style={st.txt}>{c.symbol} · {c.side.toUpperCase()}</Text>
-                  <Text style={[st.dim, { flex: 1, textAlign: "center" }]}>{c.reason === "chiusura_manuale" ? "chiusa da te" : c.reason ?? ""}</Text>
+                  <Text style={[st.dim, { flex: 1, textAlign: "center" }]}>{c.reason === "chiusura_manuale" ? "chiusa da te" : c.reason === "uscita_anticipata" ? "uscita anticipata" : c.reason ?? ""}</Text>
                   <Text style={[st.txt, { color: col(c.pnl), fontWeight: "700" }]}>{usd(c.pnl)}</Text>
                 </View>
               ))}
