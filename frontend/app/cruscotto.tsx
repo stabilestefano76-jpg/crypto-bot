@@ -107,7 +107,17 @@ function PosCard({ p }: { p: CrusPos }) {
 function MngLine({ m }: { m?: MngView }) {
   if (!m) return null;
   if (!m.managed) return <Text style={[st.dim, { marginTop: 4 }]}>Gestione automatica: non attiva su questa posizione (viene dal Terminale).</Text>;
-  if (m.danger === null || m.danger === undefined) return <Text style={[st.dim, { marginTop: 4 }]}>Gestione: primo controllo in arrivo (parte dopo 30 minuti dall'apertura).</Text>;
+  const fv = m.fast_verdict;
+  const fc = fv === "inversione" ? DOWN : fv === "ritracciamento" ? UP : WARN;
+  const fast = fv ? (
+    <View style={{ marginTop: 4 }}>
+      <Text style={[st.dim, { color: fc, fontWeight: "700" }]}>
+        Controllo veloce ({ago(m.fast_at ?? undefined)} fa): {fv === "inversione" ? "inversione riconosciuta" : fv === "ritracciamento" ? "sembra solo un ritracciamento, tengo" : "situazione incerta"}
+      </Text>
+      {(m.fast_why ?? []).map((x, i) => <Text key={"f" + i} style={st.dim}>• {x}</Text>)}
+    </View>
+  ) : null;
+  if (m.danger === null || m.danger === undefined) return <View><Text style={[st.dim, { marginTop: 4 }]}>Gestione: primo controllo in arrivo (parte dopo 30 minuti dall'apertura).</Text>{fast}</View>;
   const c = m.danger >= 4 ? DOWN : m.danger >= 2 ? WARN : UP;
   return (
     <View style={{ marginTop: 6 }}>
@@ -116,6 +126,7 @@ function MngLine({ m }: { m?: MngView }) {
       </Text>
       {m.signals.map((x, i) => <Text key={i} style={st.dim}>• {x}</Text>)}
       {!!m.reason && <Text style={st.dim}>{m.reason}</Text>}
+      {fast}
     </View>
   );
 }
@@ -335,7 +346,7 @@ export default function CruscottoScreen() {
             <View style={st.card}>
               <Text style={st.h}>Gestione delle posizioni aperte</Text>
               <Text style={[st.dim, { marginTop: 6 }]}>
-                Ogni {mg?.config.every_min ?? 15} minuti il bot rilegge il grafico di ogni posizione aperta. Se la situazione peggiora può stringere lo stop o chiudere, ma SOLO in guadagno netto, cioè oltre tutti i costi. In perdita non interviene: decide lo stop di sempre. Non vale per le posizioni del Terminale.
+                Ogni {mg?.config.every_min ?? 15} minuti il bot rilegge il grafico a 1 ora di ogni posizione aperta. Se la situazione peggiora può stringere lo stop o chiudere, ma SOLO in guadagno netto, cioè oltre tutti i costi. In perdita non interviene: decide lo stop di sempre. Non vale per le posizioni del Terminale.
               </Text>
               {mg && (<>
                 <View style={{ flexDirection: "row", flexWrap: "wrap", marginTop: 10 }}>
@@ -352,7 +363,23 @@ export default function CruscottoScreen() {
                     </Pressable>
                   ))}
                 </View>
-                <Text style={[st.dim, { marginBottom: 6 }]}>Ogni quanti minuti rilegge il grafico:</Text>
+                <Text style={[st.dim, { marginBottom: 6 }]}>Controllo veloce (ogni minuto, grafici a 5 e 15 minuti): riconosce se una posizione in guadagno sta invertendo o fa solo un ritracciamento.</Text>
+                <View style={{ flexDirection: "row", flexWrap: "wrap" }}>
+                  {[{ k: true, t: "Veloce acceso" }, { k: false, t: "Veloce spento" }].map((o) => (
+                    <Pressable key={String(o.k)} onPress={() => saveMng({ fast: o.k }, o.k ? "Controllo veloce acceso." : "Controllo veloce spento.")} style={[st.chip, mg.config.fast === o.k && { backgroundColor: WARN }]}>
+                      <Text style={[st.txt, { fontWeight: "700", color: mg.config.fast === o.k ? "#000" : TXT }]}>{o.t}</Text>
+                    </Pressable>
+                  ))}
+                </View>
+                <View style={{ flexDirection: "row", flexWrap: "wrap" }}>
+                  {[{ k: "prudente", t: "Prudente" }, { k: "paziente", t: "Paziente" }].map((o) => (
+                    <Pressable key={o.k} onPress={() => saveMng({ stile: o.k as any }, "Stile cambiato.")} style={[st.chip, mg.config.stile === o.k && { backgroundColor: WARN }]}>
+                      <Text style={[st.txt, { fontWeight: "700", color: mg.config.stile === o.k ? "#000" : TXT }]}>{o.t}</Text>
+                    </Pressable>
+                  ))}
+                </View>
+                <Text style={[st.dim, { marginBottom: 6 }]}>Prudente: se non è chiaro, chiude coprendo i costi appena il margine si assottiglia. Paziente: tiene i ritracciamenti e chiude solo se l'inversione è evidente.</Text>
+                <Text style={[st.dim, { marginBottom: 6 }]}>Ogni quanti minuti rilegge il grafico a 1 ora:</Text>
                 <View style={{ flexDirection: "row", flexWrap: "wrap" }}>
                   {[5, 15, 30, 60].map((v) => (
                     <Pressable key={v} onPress={() => saveMng({ every_min: v }, `Controllo ogni ${v} minuti.`)} style={[st.chip, mg.config.every_min === v && { backgroundColor: WARN }]}>

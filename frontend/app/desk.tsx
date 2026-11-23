@@ -199,7 +199,7 @@ export default function DeskScreen() {
             <Text style={styles.btnText}>Salva impostazioni</Text>
           </Pressable>
           {!!saveMsg && <Text style={[styles.msg, { marginTop: 8, color: saveMsg.startsWith("✓") ? colors.success : colors.error }]}>{saveMsg}</Text>}
-          <Text style={styles.note}>Dopo {st.config.streak_pause} perdite di fila il bot si ferma per {st.config.streak_pause_h} ore. Il rischio totale e il limite giornaliero valgono anche se apri tu.</Text>
+          <Text style={styles.note}>Il bot non si ferma più dopo le perdite di fila. Il rischio totale e il limite giornaliero valgono anche se apri tu.</Text>
         </View>
 
         <View style={[styles.card, { borderColor: st.config.scan_enabled ? colors.success : colors.border }]}>

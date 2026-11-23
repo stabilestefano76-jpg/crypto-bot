@@ -240,6 +240,7 @@ def risk_gate(*, capital: float, open_risks: list[float], new_risk: float, max_t
 
 
 def streak_block(recent_pnls_newest_first: list[float], since_last_close_h: Optional[float], n: int, hours: float) -> Optional[str]:
+    return None  # regola tolta su richiesta: nessuna pausa dopo le perdite di fila
     if n <= 0 or len(recent_pnls_newest_first) < n or since_last_close_h is None:
         return None
     if all(x < 0 for x in recent_pnls_newest_first[:n]) and since_last_close_h < hours:
