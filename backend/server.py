@@ -5702,7 +5702,7 @@ async def ma_close_now(pid: str) -> dict[str, Any]:
 # Esce SOLO in guadagno netto, cioe' oltre tutti i costi (commissioni di entrata e uscita, funding maturato, piccolo margine).
 # In perdita non interviene: decide lo stop di sempre. Ogni intervento e' confrontato con l'operazione "ombra" (cosa sarebbe successo senza).
 # ============================================================================
-MNG_DEFAULT: dict[str, Any] = {"enabled": True, "mode": "chiudi", "every_min": 15, "fast": True, "stile": "prudente"}
+MNG_DEFAULT: dict[str, Any] = {"enabled": True, "mode": "chiudi", "every_min": 15, "fast": True, "stile": "prudente", "regime": False, "regime_exit": True}
 MNG_MODES = ("chiudi", "stringi", "avvisa")
 MNG_STILI = ("prudente", "paziente")
 MNG_GRACE_MIN = 30           # controllo lento: nei primi 30 minuti non tocca nulla
@@ -5981,6 +5981,99 @@ async def mng_fast_review(p: dict[str, Any], cfg: Config, mc: dict[str, Any], cu
     await mng_apply(p, cfg, dec, cur, "%s. Motivi: %s" % (dec["reason"], txt), upd, "GESTIONE VELOCE")
 
 
+# ====================================================================
+# FILTRO DEL GIORNO (mercato generale: rialzo / ribasso / incerto)
+# ====================================================================
+RG_SYMBOL = "BTCUSDC"        # il "termometro" del mercato
+RG_BLOCK_SCORE = 3           # da 3 punti in su (su 5) il giorno e' di rialzo/ribasso: niente ingressi contro
+RG_EXIT_SCORE = 4            # da 4 punti in su e' "chiaro": si possono chiudere le posizioni contro
+RG_EXIT_R = -0.25            # chiude con perdita piccola solo se la posizione e' gia' a -0.25R o peggio
+RG_EXIT_HITS = 3             # deve essere vero per 3 controlli di fila (circa 1 minuto)
+RG_GRACE_S = 600             # nei primi 10 minuti di vita di una posizione non tocca nulla
+_rg_cache: dict[str, Any] = {"at": 0.0, "v": None}
+
+
+def regime_calc(c1h: list[list[float]], c4h: list[list[float]], cur: float) -> dict[str, Any]:
+    """Punteggio da -5 (ribasso forte) a +5 (rialzo forte). Candele nel formato [t, apertura, chiusura, massimo, minimo, volume]."""
+    closes = [c[2] for c in c1h]
+    atr1 = DK.atr(c1h)
+    e20, e50 = DK.ema(closes, 20), DK.ema(closes, 50)
+    if not atr1 or atr1 <= 0 or e20 is None or e50 is None or len(closes) < 10:
+        return {"ok": False, "reason": "dati insufficienti"}
+    score, why, mvpts = 0, [], 0
+    mv = (cur - closes[-9]) / atr1                      # movimento delle ultime 8 ore in unita' di mosso orario (in 8 ore un mercato fermo fa gia' ~2.8 unita' per caso)
+    pct = (cur / closes[-9] - 1.0) * 100.0
+    if mv >= 6.2: score += 2; mvpts = 2; why.append("%+.1f%% in 8 ore: rialzo deciso" % pct)
+    elif mv >= 4.2: score += 1; mvpts = 1; why.append("%+.1f%% in 8 ore: sale" % pct)
+    elif mv <= -6.2: score -= 2; mvpts = -2; why.append("%+.1f%% in 8 ore: ribasso deciso" % pct)
+    elif mv <= -4.2: score -= 1; mvpts = -1; why.append("%+.1f%% in 8 ore: scende" % pct)
+    else: why.append("%+.1f%% in 8 ore: movimento piccolo" % pct)
+    if cur > e20: score += 1; why.append("prezzo sopra la media a 1 ora")
+    else: score -= 1; why.append("prezzo sotto la media a 1 ora")
+    if e20 > e50: score += 1; why.append("media veloce sopra quella lenta (1h)")
+    else: score -= 1; why.append("media veloce sotto quella lenta (1h)")
+    c4 = [c[2] for c in c4h]
+    e4 = DK.ema(c4, 20) if len(c4) >= 20 else None
+    if e4 is not None:
+        if c4[-1] > e4: score += 1; why.append("a 4 ore chiude sopra la media")
+        else: score -= 1; why.append("a 4 ore chiude sotto la media")
+    # serve anche un movimento vero nelle ultime 8 ore: senza, tre "sopra la media" messi insieme per caso non bastano
+    label = "rialzo" if (score >= RG_BLOCK_SCORE and mvpts > 0) else "ribasso" if (score <= -RG_BLOCK_SCORE and mvpts < 0) else "incerto"
+    return {"ok": True, "label": label, "score": score, "reasons": why, "symbol": RG_SYMBOL, "price": cur, "at": time.time()}
+
+
+async def regime_read(force: bool = False) -> Optional[dict[str, Any]]:
+    if not force and _rg_cache["v"] is not None and time.time() - float(_rg_cache["at"]) < 60:
+        return _rg_cache["v"]
+    try:
+        c1h = await _desk_candles(RG_SYMBOL, "1h")
+        c4h = await _desk_candles(RG_SYMBOL, "4h")
+        cur = await _desk_price(RG_SYMBOL)
+        if not c1h or cur is None:
+            return None
+        v = regime_calc(c1h, c4h or [], float(cur))
+    except Exception as e:  # noqa: BLE001
+        logger.warning("Filtro del giorno: lettura non riuscita: %s", e)
+        return None
+    if not v.get("ok"):
+        return None
+    _rg_cache["at"], _rg_cache["v"] = time.time(), v
+    return v
+
+
+async def regime_block_why(side: str) -> list[str]:
+    """Motivi per NON aprire (solo aperture automatiche). Lista vuota = via libera."""
+    mc = await mng_cfg()
+    if not mc.get("regime"):
+        return []
+    rg = await regime_read()
+    if not rg:
+        return []
+    if (rg["label"] == "rialzo" and side == "short") or (rg["label"] == "ribasso" and side == "long"):
+        return ["filtro del giorno: oggi il mercato e' in %s (%s, %+d punti su 5): niente %s" % (rg["label"], RG_SYMBOL.replace("USDC", ""), rg["score"], side)]
+    return []
+
+
+async def regime_exit_check(p: dict[str, Any], cfg: Config, cur: float, r_now: float) -> bool:
+    """Chiude con perdita piccola una posizione contro un giorno chiaramente opposto. True = ha chiuso."""
+    rg = await regime_read()
+    against = bool(rg) and abs(rg["score"]) >= RG_EXIT_SCORE and \
+        ((rg["label"] == "rialzo" and p["side"] == "short") or (rg["label"] == "ribasso" and p["side"] == "long"))
+    if not against or r_now > RG_EXIT_R or time.time() - float(p["opened_ts"]) < RG_GRACE_S:
+        if p.get("mng_rg_hits"):
+            await db.desk_positions.update_one({"id": p["id"], "status": "open"}, {"$set": {"mng_rg_hits": 0}})
+        return False
+    hits = int(p.get("mng_rg_hits") or 0) + 1
+    if hits < RG_EXIT_HITS:
+        await db.desk_positions.update_one({"id": p["id"], "status": "open"}, {"$set": {"mng_rg_hits": hits}})
+        return False
+    await db.desk_positions.update_one({"id": p["id"], "status": "open"}, {"$set": {"mng_rg_exit": True, "mng_rg_hits": hits}})
+    await _desk_event(p["symbol"], "FILTRO DEL GIORNO: il mercato e' in %s (%+d punti su 5) e questa posizione %s e' a %.2fR. Chiudo ora con perdita piccola, senza aspettare lo stop. %s"
+                      % (rg["label"], rg["score"], p["side"], r_now, "; ".join(rg["reasons"][:3])))
+    await _desk_close(p, cfg, "uscita_anticipata", cur)
+    return True
+
+
 async def mng_manage(cfg: Config) -> None:
     mc = await mng_cfg()
     if not mc["enabled"]:
@@ -6011,6 +6104,12 @@ async def mng_manage(cfg: Config) -> None:
         pk_px = max(float(pk_px), cur) if sg > 0 else min(float(pk_px), cur)
         if old_peak is None or peak > float(old_peak) + 0.02 or abs(pk_px - float(p.get("mng_peak_px") or 0.0)) > 1e-12:
             await db.desk_positions.update_one({"id": p["id"], "status": "open"}, {"$set": {"mng_peak_r": round(peak, 3), "mng_peak_px": pk_px}})
+        if mc.get("regime") and mc.get("regime_exit"):
+            try:
+                if await regime_exit_check(p, cfg, cur, r_now):
+                    continue
+            except Exception as e:  # noqa: BLE001
+                logger.exception("Filtro del giorno: errore su %s: %s", p.get("symbol"), e)
         now = time.time()
         if mc.get("fast") and now - float(p["opened_ts"]) >= MNG_FAST_GRACE_MIN * 60 and peak >= MNG_FAST_MIN_PEAK \
                 and peak - r_now >= MNG_FAST_MIN_GIVE and now - float(p.get("mng_fast_ts") or 0) >= MNG_FAST_EVERY:
@@ -6044,7 +6143,7 @@ async def mng_shadow_scan() -> None:
             "margin": float(p["margin"]), "notional": float(p["notional"]), "lev": float(p["leverage"]), "stop": orig, "target": float(p["target"]),
             "liq": p.get("liquidation"), "fd": float(p["funding_day_pct"]), "opened_ts": float(p["opened_ts"]),
             "start_price": p.get("close_price"), "partial": float(p.get("realized_partial") or 0.0), "actual": float(p.get("pnl_usdt") or 0.0),
-            "kind": "uscita" if p.get("close_reason") == "uscita_anticipata" else "stop_stretto", "status": "open",
+            "kind": ("regime" if p.get("mng_rg_exit") else "uscita") if p.get("close_reason") == "uscita_anticipata" else "stop_stretto", "status": "open",
             "created_ts": now, "created_at": datetime.now(timezone.utc).isoformat()})
 
 
@@ -6083,6 +6182,7 @@ async def mng_summary() -> dict[str, Any]:
         return round(sum(d["delta"] for d in done if d["kind"] == k), 4)
     return {"n_done": len(done), "n_pending": len([d for d in docs if d.get("status") == "open"]), "helped": len(helped), "hurt": len(hurt),
             "net": round(sum(d["delta"] for d in done), 4), "net_uscita": net("uscita"), "net_stop": net("stop_stretto"),
+            "net_regime": net("regime"), "n_regime": len([d for d in done if d["kind"] == "regime"]),
             "n_uscita": len([d for d in done if d["kind"] == "uscita"]), "n_stop": len([d for d in done if d["kind"] == "stop_stretto"]),
             "items": [{"symbol": d["symbol"], "side": d["side"], "kind": d["kind"], "status": d["status"], "actual": round(d["actual"], 4),
                        "shadow": d.get("shadow_pnl"), "delta": d.get("delta"), "outcome": d.get("outcome"), "at": d.get("created_at")}
@@ -6091,7 +6191,7 @@ async def mng_summary() -> dict[str, Any]:
 
 @api.get("/gestione")
 async def mng_get() -> dict[str, Any]:
-    return {"config": await mng_cfg(True), "summary": await mng_summary()}
+    return {"config": await mng_cfg(True), "summary": await mng_summary(), "regime": await regime_read()}
 
 
 @api.post("/gestione")
@@ -6102,6 +6202,10 @@ async def mng_set(body: dict[str, Any]) -> dict[str, Any]:
         new["enabled"] = bool(body["enabled"])
     if "fast" in body:
         new["fast"] = bool(body["fast"])
+    if "regime" in body:
+        new["regime"] = bool(body["regime"])
+    if "regime_exit" in body:
+        new["regime_exit"] = bool(body["regime_exit"])
     if "mode" in body:
         if body["mode"] not in MNG_MODES:
             raise HTTPException(status_code=400, detail="Modalità non valida.")
@@ -7416,6 +7520,8 @@ async def _desk_open_core(symbol: str, side: str, lev: float, rp: float, force: 
         w = await _desk_wallet()
         if pl["margin"] > w["cash"]:
             why.append("margine %.2f USDC piu' del contante libero %.2f" % (pl["margin"], w["cash"]))
+        if auto:
+            why += await regime_block_why(side)       # filtro del giorno (se acceso)
         # rischio TOTALE (vale anche per le aperture manuali)
         stt = await _desk_day_stats(dc)
         why += DK.risk_gate(capital=float(dc["capital"]), open_risks=stt["open_risks"], new_risk=pl["max_loss"],

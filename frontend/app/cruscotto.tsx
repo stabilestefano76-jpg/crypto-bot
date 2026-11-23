@@ -387,6 +387,27 @@ export default function CruscottoScreen() {
                     </Pressable>
                   ))}
                 </View>
+                <Text style={[st.txt, { marginTop: 10, fontWeight: "700" }]}>Filtro del giorno</Text>
+                <Text style={[st.dim, { marginBottom: 6 }]}>Guarda se oggi il mercato (Bitcoin) sale o scende. Giorno di rialzo: niente nuovi short. Giorno di ribasso: niente nuovi long. Se una posizione è contro un giorno chiaramente opposto e sta già perdendo, la chiude con perdita piccola senza aspettare lo stop.</Text>
+                {mg.regime ? (
+                  <Text style={[st.txt, { marginBottom: 6, color: mg.regime.label === "rialzo" ? UP : mg.regime.label === "ribasso" ? DOWN : TXT }]}>
+                    Oggi: {mg.regime.label} ({mg.regime.score > 0 ? "+" : ""}{mg.regime.score} punti su 5) · {mg.regime.reasons.slice(0, 2).join(", ")}
+                  </Text>
+                ) : (<Text style={[st.dim, { marginBottom: 6 }]}>Oggi: lettura del mercato non disponibile.</Text>)}
+                <View style={{ flexDirection: "row", flexWrap: "wrap" }}>
+                  {[{ k: true, t: "Filtro acceso" }, { k: false, t: "Filtro spento" }].map((o) => (
+                    <Pressable key={String(o.k)} onPress={() => saveMng({ regime: o.k }, o.k ? "Filtro del giorno acceso." : "Filtro del giorno spento.")} style={[st.chip, !!mg.config.regime === o.k && { backgroundColor: WARN }]}>
+                      <Text style={[st.txt, { fontWeight: "700", color: !!mg.config.regime === o.k ? "#000" : TXT }]}>{o.t}</Text>
+                    </Pressable>
+                  ))}
+                </View>
+                <View style={{ flexDirection: "row", flexWrap: "wrap" }}>
+                  {[{ k: true, t: "Chiude con perdita piccola" }, { k: false, t: "Solo blocca gli ingressi" }].map((o) => (
+                    <Pressable key={String(o.k)} onPress={() => saveMng({ regime_exit: o.k }, "Impostazione salvata.")} style={[st.chip, (mg.config.regime_exit !== false) === o.k && { backgroundColor: WARN }]}>
+                      <Text style={[st.txt, { fontWeight: "700", color: (mg.config.regime_exit !== false) === o.k ? "#000" : TXT }]}>{o.t}</Text>
+                    </Pressable>
+                  ))}
+                </View>
                 <Text style={[st.txt, { marginTop: 8, fontWeight: "700" }]}>Ha davvero aiutato?</Text>
                 {mg.summary.n_done + mg.summary.n_pending === 0 ? (
                   <Text style={[st.dim, { marginTop: 4 }]}>Nessun intervento ancora. Dopo il primo stop stretto o la prima uscita anticipata, qui compare il confronto con "cosa sarebbe successo senza".</Text>
@@ -396,10 +417,11 @@ export default function CruscottoScreen() {
                   </Text>
                   <Text style={st.dim}>Ha aiutato {mg.summary.helped} volte, ha fatto peggio {mg.summary.hurt} volte, {mg.summary.n_pending} ancora in attesa. Positivo = senza la gestione avresti guadagnato di meno.</Text>
                   <Text style={st.dim}>Uscite anticipate: {mg.summary.net_uscita >= 0 ? "+" : "-"}${Math.abs(mg.summary.net_uscita).toFixed(2)} ({mg.summary.n_uscita}) · stop stretti: {mg.summary.net_stop >= 0 ? "+" : "-"}${Math.abs(mg.summary.net_stop).toFixed(2)} ({mg.summary.n_stop})</Text>
+                  {!!mg.summary.n_regime && <Text style={st.dim}>Filtro del giorno: {(mg.summary.net_regime ?? 0) >= 0 ? "+" : "-"}${Math.abs(mg.summary.net_regime ?? 0).toFixed(2)} ({mg.summary.n_regime} uscite)</Text>}
                   {mg.summary.items.slice(0, 5).map((it, i) => (
                     <View key={i} style={[st.rowBetween, { marginTop: 6 }]}>
                       <Text style={[st.txt, { width: 70 }]}>{it.symbol.replace("USDC", "")}</Text>
-                      <Text style={[st.dim, { flex: 1 }]}>{it.kind === "uscita" ? "uscita anticipata" : "stop stretto"} · {it.status === "done" ? `senza: ${it.shadow !== null ? usd(it.shadow) : "-"} (${it.outcome})` : "in attesa del confronto"}</Text>
+                      <Text style={[st.dim, { flex: 1 }]}>{it.kind === "uscita" ? "uscita anticipata" : it.kind === "regime" ? "uscita filtro del giorno" : "stop stretto"} · {it.status === "done" ? `senza: ${it.shadow !== null ? usd(it.shadow) : "-"} (${it.outcome})` : "in attesa del confronto"}</Text>
                       <Text style={[st.txt, { fontWeight: "700", color: col(it.delta) }]}>{it.delta === null ? "-" : usd(it.delta)}</Text>
                     </View>
                   ))}
