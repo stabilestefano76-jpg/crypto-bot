@@ -7495,6 +7495,17 @@ async def _desk_day_stats(dc: dict[str, Any]) -> dict[str, Any]:
     return {"today_pnl": today_pnl, "opened_today": opened_today, "open_risks": open_risks, "closed": closed, "since_last_close_h": since}
 
 
+async def same_dir_why(side: str, dc: dict[str, Any], force: bool) -> list[str]:
+    """Troppe posizioni nella stessa direzione: se il mercato gira perdono tutte insieme."""
+    lim = int(dc.get("max_same_dir") or 0)
+    if lim <= 0 or force:
+        return []
+    n = await db.desk_positions.count_documents({"status": "open", "side": side})
+    if n >= lim:
+        return ["gia' %d posizioni %s aperte (massimo %d nella stessa direzione)" % (n, side, lim)]
+    return []
+
+
 async def _desk_open_core(symbol: str, side: str, lev: float, rp: float, force: bool, dc: dict[str, Any], cfg: Config, auto: bool = False) -> dict[str, Any]:
     async with _desk_lock:
         b = await _desk_build(symbol, lev, rp, dc, cfg)
@@ -7522,6 +7533,7 @@ async def _desk_open_core(symbol: str, side: str, lev: float, rp: float, force: 
             why.append("margine %.2f USDC piu' del contante libero %.2f" % (pl["margin"], w["cash"]))
         if auto:
             why += await regime_block_why(side)       # filtro del giorno (se acceso)
+        why += await same_dir_why(side, dc, force)
         # rischio TOTALE (vale anche per le aperture manuali)
         stt = await _desk_day_stats(dc)
         why += DK.risk_gate(capital=float(dc["capital"]), open_risks=stt["open_risks"], new_risk=pl["max_loss"],

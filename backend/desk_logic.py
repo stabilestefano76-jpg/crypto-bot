@@ -11,6 +11,7 @@ DEFAULTS: dict[str, Any] = {
     "max_leverage": 3.0,     # leva massima che il bot ti suggerisce
     "funding_day_pct": 0.03, # costo di tenere aperta una posizione con leva/short, % al giorno (stima)
     "max_open": 3,
+    "max_same_dir": 3,           # massimo di posizioni aperte nella STESSA direzione (long o short)
     # --- apertura automatica e gestione del rischio totale ---
     "auto_enabled": False,       # il bot apre da solo quando tutto e' d'accordo
     "auto_leverage": 1.0,        # leva massima usata dal bot (abbassata da sola se la liquidazione e' troppo vicina)
@@ -31,12 +32,12 @@ DEFAULTS: dict[str, Any] = {
     "scan_min_volume": 100000.0, # volume minimo nelle ultime 24 ore (USDC) per essere considerata
     "scan_every_min": 60,        # ogni quanto rifa' la scansione (minuti)
 }
-CFG_LIMITS = {"risk_pct": (0.1, 3.0), "max_leverage": (1.0, float(MAX_LEVERAGE)), "funding_day_pct": (0.0, 1.0), "max_open": (1, 6),
+CFG_LIMITS = {"risk_pct": (0.1, 3.0), "max_leverage": (1.0, float(MAX_LEVERAGE)), "funding_day_pct": (0.0, 1.0), "max_open": (1, 6), "max_same_dir": (1, 6),
               "auto_leverage": (1.0, float(MAX_LEVERAGE)), "auto_risk_pct": (0.1, 3.0), "max_total_risk_pct": (0.5, 15.0),
               "daily_loss_pct": (0.5, 15.0), "max_trades_day": (1, 20), "cooldown_min": (0, 1440), "lots": (1, 3),
               "tp1_r": (0.3, 3.0), "streak_pause": (1, 10), "streak_pause_h": (1, 48),
               "scan_top": (1, 12), "scan_pool": (10, 80), "scan_min_volume": (1000.0, 1e9), "scan_every_min": (15, 1440)}
-INT_KEYS = ("max_open", "max_trades_day", "cooldown_min", "lots", "streak_pause", "streak_pause_h", "scan_top", "scan_pool", "scan_every_min")
+INT_KEYS = ("max_open", "max_same_dir", "max_trades_day", "cooldown_min", "lots", "streak_pause", "streak_pause_h", "scan_top", "scan_pool", "scan_every_min")
 TF_WEIGHT = {"1d": 2.0, "4h": 1.5, "1h": 1.0}
 
 

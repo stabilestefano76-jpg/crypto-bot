@@ -818,7 +818,7 @@ export type DeskRow = {
   auto?: boolean; lots_total?: number; lots_left?: number; tp1?: number | null; tp1_done?: boolean; realized_partial?: number;
 };
 export type DeskConfig = {
-  symbols: string[]; capital: number; risk_pct: number; max_leverage: number; funding_day_pct: number; max_open: number;
+  symbols: string[]; capital: number; risk_pct: number; max_leverage: number; funding_day_pct: number; max_open: number; max_same_dir?: number;
   auto_enabled: boolean; auto_leverage: number; auto_risk_pct: number; max_total_risk_pct: number; daily_loss_pct: number;
   max_trades_day: number; cooldown_min: number; lots: number; tp1_r: number; be_after_tp1: boolean; streak_pause: number; streak_pause_h: number;
   scan_enabled: boolean; scan_top: number; scan_pool: number; scan_min_volume: number; scan_every_min: number;
