@@ -29,6 +29,19 @@ const ago = (ts?: number) => {
   return m < 60 ? `${Math.round(m)} min` : m < 1440 ? `${(m / 60).toFixed(1)} h` : `${(m / 1440).toFixed(1)} g`;
 };
 
+const orario = (v?: string | number | null) => {
+  if (v === undefined || v === null || v === "") return "-";
+  const dt = new Date(typeof v === "number" ? v * 1000 : v);
+  if (isNaN(dt.getTime())) return "-";
+  return dt.toLocaleString("it-IT", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
+};
+const durata = (a?: string | number | null, b?: string | number | null) => {
+  const t = (v?: string | number | null) => (v === undefined || v === null || v === "" ? NaN : new Date(typeof v === "number" ? v * 1000 : v).getTime());
+  const m = Math.max(0, (t(b) - t(a)) / 60000);
+  if (!isFinite(m)) return "-";
+  return m < 60 ? `${Math.round(m)} min` : m < 1440 ? `${Math.floor(m / 60)} h ${Math.round(m % 60)} min` : `${Math.floor(m / 1440)} g ${Math.round((m % 1440) / 60)} h`;
+};
+
 function Gauge({ label, used, limit, text }: { label: string; used: number; limit: number; text: string }) {
   const r = limit > 0 ? Math.max(0, Math.min(1, used / limit)) : 0;
   const c = r >= 0.9 ? DOWN : r >= 0.6 ? WARN : UP;
@@ -99,6 +112,7 @@ function PosCard({ p }: { p: CrusPos }) {
         Movimento {pct(p.move_pct, 2)} · {p.r_now !== null ? `${p.r_now > 0 ? "+" : ""}${p.r_now}R` : ""} · importo {usdp(p.notional)}
         {p.lots_total && p.lots_total > 1 ? ` · lotti ${p.lots_left}/${p.lots_total}${p.tp1_done ? " (1° incassato)" : ""}` : ""} · da {ago(p.opened_ts)}
       </Text>
+      <Text style={st.dim}>Aperta {orario(p.opened_ts)}</Text>
       <MngLine m={(p as any).mng} />
     </View>
   );

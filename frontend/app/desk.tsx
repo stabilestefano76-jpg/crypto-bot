@@ -14,6 +14,18 @@ const px = (n?: number | null) => {
 };
 const biasText = (b: string) => (b === "long" ? "COMPRARE (long)" : b === "short" ? "VENDERE allo scoperto (short)" : "ASPETTARE");
 const reasonText = (r?: string) => (r === "chiusura_manuale" ? "chiusa da te" : r ?? "");
+const orario = (v?: string | number | null) => {
+  if (v === undefined || v === null || v === "") return "-";
+  const dt = new Date(typeof v === "number" ? v * 1000 : v);
+  if (isNaN(dt.getTime())) return "-";
+  return dt.toLocaleString("it-IT", { day: "2-digit", month: "2-digit", hour: "2-digit", minute: "2-digit" });
+};
+const durata = (a?: string | number | null, b?: string | number | null) => {
+  const t = (v?: string | number | null) => (v === undefined || v === null || v === "" ? NaN : new Date(typeof v === "number" ? v * 1000 : v).getTime());
+  const m = Math.max(0, (t(b) - t(a)) / 60000);
+  if (!isFinite(m)) return "-";
+  return m < 60 ? `${Math.round(m)} min` : m < 1440 ? `${Math.floor(m / 60)} h ${Math.round(m % 60)} min` : `${Math.floor(m / 1440)} g ${Math.round((m % 1440) / 60)} h`;
+};
 
 export default function DeskScreen() {
   const insets = useSafeAreaInsets();
@@ -145,6 +157,9 @@ export default function DeskScreen() {
         <Text style={[styles.big, { color: ((isOpen ? p.floating_pnl : p.pnl_usdt) ?? 0) >= 0 ? colors.success : colors.error }]}>{usd(isOpen ? p.floating_pnl : p.pnl_usdt)}</Text>
       </View>
       <Text style={styles.line}>Entrata {px(p.fill_price)} · importo {usd(p.notional)} · margine {usd(p.margin)}</Text>
+      <Text style={styles.note}>
+        Aperta {orario(p.opened_at)}{isOpen ? ` · da ${durata(p.opened_at, new Date().toISOString())}` : ` · chiusa ${orario(p.closed_at)} · durata ${durata(p.opened_at, p.closed_at)}`}
+      </Text>
       <Text style={styles.note}>Stop {px(p.stop)} · obiettivo {px(p.target)} · liquidazione {px(p.liquidation)}</Text>
       {!!p.lots_total && p.lots_total > 1 && (
         <Text style={styles.note}>Lotti {p.lots_left}/{p.lots_total} · primo lotto a {px(p.tp1)}{p.tp1_done ? ` (fatto, incassato ${usd(p.realized_partial)})` : ""}</Text>
