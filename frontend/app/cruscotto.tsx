@@ -393,6 +393,15 @@ export default function CruscottoScreen() {
                   ))}
                 </View>
                 <Text style={[st.dim, { marginBottom: 6 }]}>Prudente: se non è chiaro, chiude coprendo i costi appena il margine si assottiglia. Paziente: tiene i ritracciamenti e chiude solo se l'inversione è evidente.</Text>
+                <Text style={[st.txt, { marginTop: 10, fontWeight: "700" }]}>Guadagno minimo per uscire in anticipo</Text>
+                <Text style={[st.dim, { marginBottom: 6 }]}>Sotto questo guadagno (in R, cioè multipli del rischio) il bot NON chiude in anticipo e lascia decidere stop e obiettivo. 0 = spento, come prima. Con 1R esce solo se ha già guadagnato almeno quanto rischiava.</Text>
+                <View style={{ flexDirection: "row", flexWrap: "wrap" }}>
+                  {[0, 0.7, 1, 1.5].map((v) => (
+                    <Pressable key={v} onPress={() => saveMng({ exit_min_r: v }, v === 0 ? "Minimo spento." : `Uscita anticipata solo da ${v}R di guadagno.`)} style={[st.chip, (mg.config.exit_min_r ?? 0) === v && { backgroundColor: WARN }]}>
+                      <Text style={[st.txt, { fontWeight: "700", color: (mg.config.exit_min_r ?? 0) === v ? "#000" : TXT }]}>{v === 0 ? "Spento" : `${v}R`}</Text>
+                    </Pressable>
+                  ))}
+                </View>
                 <Text style={[st.dim, { marginBottom: 6 }]}>Ogni quanti minuti rilegge il grafico a 1 ora:</Text>
                 <View style={{ flexDirection: "row", flexWrap: "wrap" }}>
                   {[5, 15, 30, 60].map((v) => (
@@ -431,12 +440,13 @@ export default function CruscottoScreen() {
                   </Text>
                   <Text style={st.dim}>Ha aiutato {mg.summary.helped} volte, ha fatto peggio {mg.summary.hurt} volte, {mg.summary.n_pending} ancora in attesa. Positivo = senza la gestione avresti guadagnato di meno.</Text>
                   <Text style={st.dim}>Uscite anticipate: {mg.summary.net_uscita >= 0 ? "+" : "-"}${Math.abs(mg.summary.net_uscita).toFixed(2)} ({mg.summary.n_uscita}) · stop stretti: {mg.summary.net_stop >= 0 ? "+" : "-"}${Math.abs(mg.summary.net_stop).toFixed(2)} ({mg.summary.n_stop})</Text>
+                  {!!mg.summary.n_prov && <Text style={st.dim}>Provvisorio sulle {mg.summary.n_prov} in attesa (se il prezzo restasse dove è ora): {(mg.summary.prov_net ?? 0) >= 0 ? "+" : "-"}${Math.abs(mg.summary.prov_net ?? 0).toFixed(2)} · ha aiutato {mg.summary.prov_helped ?? 0}, peggio {mg.summary.prov_hurt ?? 0}. Positivo = uscire ha fatto guadagnare di più. Non è definitivo: il prezzo può ancora muoversi.</Text>}
                   {!!mg.summary.n_regime && <Text style={st.dim}>Filtro del giorno: {(mg.summary.net_regime ?? 0) >= 0 ? "+" : "-"}${Math.abs(mg.summary.net_regime ?? 0).toFixed(2)} ({mg.summary.n_regime} uscite)</Text>}
                   {mg.summary.items.slice(0, 5).map((it, i) => (
                     <View key={i} style={[st.rowBetween, { marginTop: 6 }]}>
                       <Text style={[st.txt, { width: 70 }]}>{it.symbol.replace("USDC", "")}</Text>
-                      <Text style={[st.dim, { flex: 1 }]}>{it.kind === "uscita" ? "uscita anticipata" : it.kind === "regime" ? "uscita filtro del giorno" : "stop stretto"} · {it.status === "done" ? `senza: ${it.shadow !== null ? usd(it.shadow) : "-"} (${it.outcome})` : "in attesa del confronto"}</Text>
-                      <Text style={[st.txt, { fontWeight: "700", color: col(it.delta) }]}>{it.delta === null ? "-" : usd(it.delta)}</Text>
+                      <Text style={[st.dim, { flex: 1 }]}>{it.kind === "uscita" ? "uscita anticipata" : it.kind === "regime" ? "uscita filtro del giorno" : "stop stretto"} · {it.status === "done" ? `senza: ${it.shadow !== null ? usd(it.shadow) : "-"} (${it.outcome})` : it.prov_delta !== null && it.prov_delta !== undefined ? "in attesa · provvisorio" : "in attesa del confronto"}</Text>
+                      <Text style={[st.txt, { fontWeight: "700", color: col(it.delta ?? it.prov_delta ?? 0), opacity: it.delta === null ? 0.6 : 1 }]}>{it.delta !== null ? usd(it.delta) : it.prov_delta !== null && it.prov_delta !== undefined ? usd(it.prov_delta) : "-"}</Text>
                     </View>
                   ))}
                 </>)}

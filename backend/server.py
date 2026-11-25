@@ -5702,7 +5702,7 @@ async def ma_close_now(pid: str) -> dict[str, Any]:
 # Esce SOLO in guadagno netto, cioe' oltre tutti i costi (commissioni di entrata e uscita, funding maturato, piccolo margine).
 # In perdita non interviene: decide lo stop di sempre. Ogni intervento e' confrontato con l'operazione "ombra" (cosa sarebbe successo senza).
 # ============================================================================
-MNG_DEFAULT: dict[str, Any] = {"enabled": True, "mode": "chiudi", "every_min": 15, "fast": True, "stile": "prudente", "regime": False, "regime_exit": True}
+MNG_DEFAULT: dict[str, Any] = {"enabled": True, "mode": "chiudi", "every_min": 15, "fast": True, "stile": "prudente", "regime": False, "regime_exit": True, "exit_min_r": 0.0}
 MNG_MODES = ("chiudi", "stringi", "avvisa")
 MNG_STILI = ("prudente", "paziente")
 MNG_GRACE_MIN = 30           # controllo lento: nei primi 30 minuti non tocca nulla
@@ -5922,6 +5922,21 @@ async def mng_apply(p: dict[str, Any], cfg: Config, dec: dict[str, Any], cur: fl
         if r.modified_count:
             await _desk_event(sym, "%s: stop stretto da %.6g a %.6g (guadagno protetto oltre i costi). %s" % (tag, p["stop"], new, why))
         return
+    if dec["action"] == "chiudi":                                 # guadagno minimo per uscire in anticipo (0 = spento)
+        try:
+            mr = float((await mng_cfg()).get("exit_min_r") or 0.0)
+            risk0 = float(p.get("mng_risk0") or 0.0)
+            sg0 = 1.0 if p["side"] == "long" else -1.0
+            r_cur = (cur - float(p["fill_price"])) * sg0 / risk0 if risk0 > 0 else None
+        except Exception:  # noqa: BLE001
+            mr, r_cur = 0.0, None
+        if mr > 0 and r_cur is not None and r_cur < mr:
+            await db.desk_positions.update_one({"id": p["id"], "status": "open"}, {"$set": upd})
+            sig = "min%.2f" % mr
+            if p.get("mng_minr_sig") != sig:
+                await db.desk_positions.update_one({"id": p["id"], "status": "open"}, {"$set": {"mng_minr_sig": sig}})
+                await _desk_event(sym, "%s: avrei chiuso in anticipo, ma il guadagno e' %.2fR, sotto il minimo di %.2fR: lascio decidere stop e obiettivo. %s" % (tag, r_cur, mr, why))
+            return
     await db.desk_positions.update_one({"id": p["id"], "status": "open"}, {"$set": upd})
     if dec["action"] == "chiudi":
         await _desk_event(sym, "%s: chiudo in anticipo in guadagno netto. %s" % (tag, why))
@@ -6173,19 +6188,44 @@ async def mng_shadow_resolve(cfg: Config) -> None:
             "done_at": datetime.now(timezone.utc).isoformat()}})
 
 
+async def mng_prov(docs: list[dict[str, Any]]) -> dict[str, float]:
+    """Confronto PROVVISORIO per le operazioni ombra ancora aperte: cosa varrebbero se si chiudessero adesso al prezzo di ora."""
+    out: dict[str, float] = {}
+    pend = [d for d in docs if d.get("status") == "open"]
+    if not pend:
+        return out
+    cfg = await get_config()
+    for d in pend:
+        try:
+            cur = await _desk_price(d["symbol"])
+            if cur is None:
+                continue
+            days = max(0.0, (time.time() - float(d["opened_ts"])) / 86400.0)
+            carry = d["notional"] * (d["fd"] / 100.0) * days if (d["lev"] > 1.0 or d["side"] == "short") else 0.0
+            rest = DK.pnl(d["side"], d["fill"], float(cur), d["qty"], _desk_fee(cfg), carry, d["margin"])
+            out[d["pos_id"]] = round(float(d["actual"]) - (float(d["partial"]) + rest), 4)
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
 async def mng_summary() -> dict[str, Any]:
     docs = await db.mng_shadow.find({}, {"_id": 0}).sort("created_ts", -1).to_list(500)
     done = [d for d in docs if d.get("status") == "done"]
     helped = [d for d in done if d["delta"] > 0.005]
     hurt = [d for d in done if d["delta"] < -0.005]
+    prov = await mng_prov(docs)
     def net(k: str) -> float:
         return round(sum(d["delta"] for d in done if d["kind"] == k), 4)
     return {"n_done": len(done), "n_pending": len([d for d in docs if d.get("status") == "open"]), "helped": len(helped), "hurt": len(hurt),
             "net": round(sum(d["delta"] for d in done), 4), "net_uscita": net("uscita"), "net_stop": net("stop_stretto"),
             "net_regime": net("regime"), "n_regime": len([d for d in done if d["kind"] == "regime"]),
             "n_uscita": len([d for d in done if d["kind"] == "uscita"]), "n_stop": len([d for d in done if d["kind"] == "stop_stretto"]),
+            "prov_net": round(sum(prov.values()), 4), "n_prov": len(prov),
+            "prov_helped": len([v for v in prov.values() if v > 0.005]), "prov_hurt": len([v for v in prov.values() if v < -0.005]),
             "items": [{"symbol": d["symbol"], "side": d["side"], "kind": d["kind"], "status": d["status"], "actual": round(d["actual"], 4),
-                       "shadow": d.get("shadow_pnl"), "delta": d.get("delta"), "outcome": d.get("outcome"), "at": d.get("created_at")}
+                       "shadow": d.get("shadow_pnl"), "delta": d.get("delta"), "outcome": d.get("outcome"), "at": d.get("created_at"),
+                       "prov_delta": prov.get(d["pos_id"])}
                       for d in docs[:10]]}
 
 
@@ -6202,6 +6242,14 @@ async def mng_set(body: dict[str, Any]) -> dict[str, Any]:
         new["enabled"] = bool(body["enabled"])
     if "fast" in body:
         new["fast"] = bool(body["fast"])
+    if "exit_min_r" in body:
+        try:
+            v = float(body["exit_min_r"])
+        except (TypeError, ValueError):
+            raise HTTPException(status_code=400, detail="Guadagno minimo non valido.")
+        if not (0.0 <= v <= 3.0):
+            raise HTTPException(status_code=400, detail="Guadagno minimo: da 0 a 3 (0 = spento).")
+        new["exit_min_r"] = round(v, 2)
     if "regime" in body:
         new["regime"] = bool(body["regime"])
     if "regime_exit" in body:
